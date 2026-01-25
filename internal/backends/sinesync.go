@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	DefaultSinesyncAPI = "https://api.sinesync.ai/v1"
+	DefaultSinesyncAPI = "https://api.sinesync.ai/api/v1"
 )
 
 // SinesyncProvider stores data in the managed sinesync cloud service
