@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sine~sync Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header with sine wave -->
+        <header class="header">
+            <div class="header-content">
+                <h1 class="logo">
+                    <span class="sine-wave">~</span>
+                    sine<span class="accent">sync</span>
+                </h1>
+                <nav class="nav">
+                    <button class="nav-btn active" data-view="overview">Overview</button>
+                    <button class="nav-btn" data-view="memories">Memories</button>
+                    <button class="nav-btn" data-view="projects">Projects</button>
+                    <button class="nav-btn" data-view="tags">Tags</button>
+                </nav>
+            </div>
+            <canvas id="sine-canvas" class="sine-canvas"></canvas>
+        </header>
+
+        <!-- Main content -->
+        <main class="main">
+            <!-- Overview View -->
+            <section id="view-overview" class="view active">
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">~</div>
+                        <div class="stat-value" id="stat-total">-</div>
+                        <div class="stat-label">Total Memories</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">*</div>
+                        <div class="stat-value" id="stat-starred">-</div>
+                        <div class="stat-label">Starred</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">#</div>
+                        <div class="stat-value" id="stat-tagged">-</div>
+                        <div class="stat-label">Tagged</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">7d</div>
+                        <div class="stat-value" id="stat-recent">-</div>
+                        <div class="stat-label">This Week</div>
+                    </div>
+                </div>
+
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h3>By Type</h3>
+                        <div id="chart-types" class="chart-bars"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>By Project</h3>
+                        <div id="chart-projects" class="chart-bars"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>Classification</h3>
+                        <div id="chart-classification" class="chart-bars"></div>
+                    </div>
+                    <div class="chart-card">
+                        <h3>Vaults</h3>
+                        <div id="chart-vaults" class="vault-list"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Memories View -->
+            <section id="view-memories" class="view">
+                <div class="toolbar">
+                    <div class="search-box">
+                        <input type="text" id="search-input" placeholder="Semantic search...">
+                        <button id="search-btn">Search</button>
+                    </div>
+                    <div class="filters">
+                        <select id="filter-project">
+                            <option value="">All Projects</option>
+                        </select>
+                        <select id="filter-type">
+                            <option value="">All Types</option>
+                        </select>
+                        <select id="filter-classification">
+                            <option value="">All Classifications</option>
+                            <option value="public">Public</option>
+                            <option value="team">Team</option>
+                            <option value="private">Private</option>
+                            <option value="sensitive">Sensitive</option>
+                        </select>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="filter-starred"> Starred only
+                        </label>
+                    </div>
+                </div>
+
+                <div id="memories-list" class="memories-list">
+                    <p class="loading">Loading memories...</p>
+                </div>
+            </section>
+
+            <!-- Projects View -->
+            <section id="view-projects" class="view">
+                <div id="projects-list" class="projects-list">
+                    <p class="loading">Loading projects...</p>
+                </div>
+            </section>
+
+            <!-- Tags View -->
+            <section id="view-tags" class="view">
+                <div id="tags-cloud" class="tags-cloud">
+                    <p class="loading">Loading tags...</p>
+                </div>
+            </section>
+        </main>
+
+        <!-- Detail Modal -->
+        <div id="modal" class="modal hidden">
+            <div class="modal-backdrop"></div>
+            <div class="modal-content">
+                <button class="modal-close">&times;</button>
+                <div id="modal-body"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

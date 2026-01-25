@@ -1,0 +1,106 @@
+package keychain
+
+import (
+	"encoding/base64"
+	"strconv"
+	"time"
+
+	"github.com/zalando/go-keyring"
+)
+
+const serviceName = "sinesync"
+
+// IsAvailable checks if keychain is available
+func IsAvailable() bool {
+	_, err := keyring.Get(serviceName, "test")
+	// If error is not "not found", keychain is not available
+	if err != nil && err != keyring.ErrNotFound {
+		return false
+	}
+	return true
+}
+
+// Session token
+func GetSessionToken() (string, error) {
+	return keyring.Get(serviceName, "session-token")
+}
+
+func SetSessionToken(token string) error {
+	return keyring.Set(serviceName, "session-token", token)
+}
+
+// User salt
+func GetUserSalt() ([]byte, error) {
+	encoded, err := keyring.Get(serviceName, "user-salt")
+	if err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.DecodeString(encoded)
+}
+
+func SetUserSalt(salt []byte) error {
+	encoded := base64.StdEncoding.EncodeToString(salt)
+	return keyring.Set(serviceName, "user-salt", encoded)
+}
+
+// Secret key
+func GetSecretKey() (string, error) {
+	return keyring.Get(serviceName, "secret-key")
+}
+
+func SetSecretKey(key string) error {
+	return keyring.Set(serviceName, "secret-key", key)
+}
+
+// Derived key
+func GetDerivedKey() ([]byte, error) {
+	encoded, err := keyring.Get(serviceName, "derived-key")
+	if err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.DecodeString(encoded)
+}
+
+func SetDerivedKey(key []byte) error {
+	encoded := base64.StdEncoding.EncodeToString(key)
+	return keyring.Set(serviceName, "derived-key", encoded)
+}
+
+func ClearDerivedKey() error {
+	return keyring.Delete(serviceName, "derived-key")
+}
+
+// Last auth timestamp
+func GetLastAuth() (time.Time, error) {
+	ts, err := keyring.Get(serviceName, "last-auth")
+	if err != nil {
+		return time.Time{}, err
+	}
+	epoch, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(epoch, 0), nil
+}
+
+func SetLastAuth(t time.Time) error {
+	return keyring.Set(serviceName, "last-auth", strconv.FormatInt(t.Unix(), 10))
+}
+
+// NeedsReauth checks if re-authentication is needed (24 hours)
+func NeedsReauth() bool {
+	lastAuth, err := GetLastAuth()
+	if err != nil {
+		return true
+	}
+	return time.Since(lastAuth) > 24*time.Hour
+}
+
+// Clear removes all stored credentials
+func Clear() error {
+	keys := []string{"session-token", "user-salt", "secret-key", "derived-key", "last-auth"}
+	for _, key := range keys {
+		keyring.Delete(serviceName, key) // Ignore errors
+	}
+	return nil
+}

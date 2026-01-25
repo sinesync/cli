@@ -32,6 +32,10 @@ coverage/
 *.tfstate.*
 *.tfvars
 
+# Go
+sinesync
+*.exe
+
 # Misc
 *.tgz
 .cache/
