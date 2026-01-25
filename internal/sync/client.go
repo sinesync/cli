@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	DefaultAPIBase = "https://api.sinesync.ai/api/v1"
+	DefaultAPIBase = "https://api.sinesync.ai/v1"
 	AAD            = "sinesync-observation-v1"
 )
 
