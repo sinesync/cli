@@ -263,8 +263,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	// Cloud sync
-	fmt.Println("\nCloud sync: not configured")
-	fmt.Println("  • Run `sinesync login` to enable cloud sync")
+	authCfg, authErr := loadAuthConfig()
+	if authErr == nil && authCfg != nil && authCfg.Token != "" {
+		fmt.Println("\nCloud sync: enabled")
+		fmt.Printf("  • User: %s\n", authCfg.Email)
+		if authCfg.DeviceID != "" {
+			fmt.Printf("  • Device ID: %s\n", authCfg.DeviceID)
+		}
+	} else {
+		fmt.Println("\nCloud sync: not configured")
+		fmt.Println("  • Run `sinesync login` to enable cloud sync")
+	}
 
 	fmt.Println()
 	return nil

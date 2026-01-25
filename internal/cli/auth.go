@@ -5,15 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"os"
 	"runtime"
 	"syscall"
 	"time"
 
-	"github.com/fmitra/srp"
 	"github.com/miclip/sinesync/internal/config"
+	"github.com/miclip/sinesync/internal/srp"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -201,19 +200,9 @@ func runSignup(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Creating account for %s...\n", email)
 
-	// Generate SRP verifier using fmitra/srp (SHA256 + RFC5054 Group4096)
-	srpClient, err := srp.NewDefaultClient(email, password)
-	if err != nil {
-		return fmt.Errorf("failed to create SRP client: %w", err)
-	}
-
-	_, salt, verifierBI, err := srpClient.Enroll()
-	if err != nil {
-		return fmt.Errorf("failed to create SRP verifier: %w", err)
-	}
-
-	// Convert verifier big.Int to hex string (salt is already string)
-	verifier := fmt.Sprintf("%x", verifierBI)
+	// Generate SRP verifier (compatible with js-srp6a)
+	srpClient := srp.NewClient(email, password)
+	salt, verifier := srpClient.ComputeVerifier()
 
 	// Signup with SRP credentials
 	signupResp, err := doSignup(apiBase, email, salt, verifier)
@@ -320,15 +309,11 @@ type deviceResponse struct {
 
 // SRP login flow
 func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
-	// Create SRP client (SHA256 + RFC5054 Group4096)
-	srpClient, err := srp.NewDefaultClient(email, password)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SRP client: %w", err)
-	}
+	// Create SRP client (SHA256 + RFC5054 Group4096, compatible with js-srp6a)
+	srpClient := srp.NewClient(email, password)
 
-	// Get client public key A
-	_, clientPublicBI := srpClient.Auth()
-	clientPublic := fmt.Sprintf("%x", clientPublicBI)
+	// Generate client ephemeral A
+	clientPublic := srpClient.GenerateEphemeral()
 
 	// Step 1: Init - send email to get salt and server public B
 	initBody, _ := json.Marshal(map[string]string{"email": email})
@@ -356,16 +341,11 @@ func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
 		return nil, err
 	}
 
-	// Convert server public B from hex to big.Int
-	serverPublicBI := new(big.Int)
-	serverPublicBI.SetString(initResult.ServerPublic, 16)
-
-	// Step 2: Compute client proof M1 (takes B as *big.Int, salt as string)
-	clientProofBI, err := srpClient.ProveIdentity(serverPublicBI, initResult.Salt)
+	// Step 2: Compute client proof M1
+	clientProof, err := srpClient.ComputeSession(initResult.Salt, initResult.ServerPublic)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute proof: %w", err)
 	}
-	clientProof := fmt.Sprintf("%x", clientProofBI)
 
 	// Step 3: Verify - send client public A and proof M1
 	verifyBody, _ := json.Marshal(map[string]string{
@@ -403,10 +383,8 @@ func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
 		return nil, err
 	}
 
-	// Convert server proof from hex to big.Int and verify
-	serverProofBI := new(big.Int)
-	serverProofBI.SetString(result.ServerProof, 16)
-	if !srpClient.IsProofValid(serverProofBI) {
+	// Verify server's proof
+	if !srpClient.VerifyServer(result.ServerProof) {
 		return nil, fmt.Errorf("server proof verification failed")
 	}
 
