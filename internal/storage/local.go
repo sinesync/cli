@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +11,12 @@ import (
 
 	"github.com/miclip/sinesync/internal/config"
 )
+
+// Checksum calculates SHA256 checksum of data
+func Checksum(data []byte) string {
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
 
 // StoredItem represents an item in local storage
 type StoredItem struct {
@@ -80,6 +88,20 @@ func (s *LocalStorage) Get(itemType, id string) (*StoredItem, error) {
 	}
 
 	return &item, nil
+}
+
+// Exists checks if an item exists by type and ID
+func (s *LocalStorage) Exists(itemType, id string) (bool, error) {
+	dir := filepath.Join(s.baseDir, itemType)
+	path := filepath.Join(dir, id+".json")
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // List returns all items of a type
