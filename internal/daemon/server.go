@@ -34,6 +34,11 @@ type Server struct {
 	embedder     *embeddings.Provider
 	httpServer   *http.Server
 	mode         string // "standalone" or "adapter"
+
+	// Observation cache
+	obsCache      []storage.Observation
+	obsCacheTime  time.Time
+	obsCacheTTL   time.Duration
 }
 
 // NewServer creates a new daemon server
@@ -58,7 +63,25 @@ func NewServer(port int) *Server {
 		config:       cfg,
 		embedder:     embedder,
 		mode:         mode,
+		obsCacheTTL:  30 * time.Second, // Cache for 30 seconds
 	}
+}
+
+// getObservations returns cached observations, refreshing if stale
+func (s *Server) getObservations() []storage.Observation {
+	if time.Since(s.obsCacheTime) > s.obsCacheTTL || s.obsCache == nil {
+		fmt.Fprintf(os.Stderr, "Loading observations into cache...\n")
+		start := time.Now()
+		s.obsCache, _ = s.localStorage.ListObservations()
+		s.obsCacheTime = time.Now()
+		fmt.Fprintf(os.Stderr, "Cached %d observations in %v\n", len(s.obsCache), time.Since(start))
+	}
+	return s.obsCache
+}
+
+// invalidateCache forces a cache refresh on next access
+func (s *Server) invalidateCache() {
+	s.obsCacheTime = time.Time{}
 }
 
 // Run starts the server and blocks until shutdown
@@ -171,7 +194,7 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	project := r.URL.Query().Get("project")
 	limit := 20
 
-	observations, _ := s.localStorage.ListObservations()
+	observations := s.getObservations()
 
 	// Filter by project if specified
 	if project != "" {
@@ -286,6 +309,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to save observation", http.StatusInternalServerError)
 		return
 	}
+	s.invalidateCache()
 
 	writeJSON(w, map[string]interface{}{
 		"status": "captured",
@@ -431,7 +455,7 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 	project := filepath.Base(hookInput.CWD)
 
 	// Get recent observations from this session (last hour as proxy)
-	observations, _ := s.localStorage.ListObservations()
+	observations := s.getObservations()
 	hourAgo := time.Now().Add(-1 * time.Hour)
 
 	var sessionObs []storage.Observation
@@ -517,6 +541,7 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to save summary", http.StatusInternalServerError)
 		return
 	}
+	s.invalidateCache()
 
 	writeJSON(w, map[string]interface{}{
 		"status":           "summarized",
@@ -530,7 +555,7 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 // === Dashboard API endpoints ===
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	observations, _ := s.localStorage.ListObservations()
+	observations := s.getObservations()
 
 	stats := map[string]interface{}{
 		"totalObservations": len(observations),
@@ -564,11 +589,19 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats["recentWeek"] = recentCount
 
+	// Sync status
+	syncManifest := storage.GetSyncManifest()
+	stats["syncedCount"] = syncManifest.GetSyncedCount()
+	lastSync := syncManifest.GetLastSync()
+	if !lastSync.IsZero() {
+		stats["lastSync"] = lastSync.Format(time.RFC3339)
+	}
+
 	writeJSON(w, stats)
 }
 
 func (s *Server) handleObservations(w http.ResponseWriter, r *http.Request) {
-	observations, _ := s.localStorage.ListObservations()
+	observations := s.getObservations()
 	query := r.URL.Query()
 
 	// Apply filters
@@ -662,7 +695,7 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
-	observations, _ := s.localStorage.ListObservations()
+	observations := s.getObservations()
 
 	projects := make(map[string]int)
 	for _, obs := range observations {
@@ -689,7 +722,7 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
-	observations, _ := s.localStorage.ListObservations()
+	observations := s.getObservations()
 
 	tags := make(map[string]int)
 	for _, obs := range observations {
@@ -722,7 +755,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	observations, _ := s.localStorage.ListObservations()
+	observations := s.getObservations()
 
 	var queryEmbedding []float32
 	if s.embedder != nil && s.embedder.IsReady() {

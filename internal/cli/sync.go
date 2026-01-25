@@ -136,26 +136,41 @@ func runSync(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Upload each item and collect confirmations
-		var confirmItems []map[string]interface{}
+		// Upload items in parallel
+		type uploadResult struct {
+			index    int
+			id       string
+			dataSize int
+			checksum string
+			err      error
+		}
+		results := make(chan uploadResult, len(batch))
+
 		for j, item := range batch {
 			if j >= len(urls) {
-				pushErrors++
+				results <- uploadResult{index: j, err: fmt.Errorf("no URL")}
 				continue
 			}
+			go func(idx int, url string, data []byte, id, checksum string) {
+				err := uploadToGCS(url, data)
+				results <- uploadResult{index: idx, id: id, dataSize: len(data), checksum: checksum, err: err}
+			}(j, urls[j].UploadURL, item.data, urls[j].ID, item.checksum)
+		}
 
-			// Upload directly to Cloud Storage
-			if err := uploadToGCS(urls[j].UploadURL, item.data); err != nil {
+		// Collect results
+		var confirmItems []map[string]interface{}
+		for range batch {
+			res := <-results
+			if res.err != nil {
 				pushErrors++
-				lastPushError = fmt.Sprintf("upload %s: %v", item.obs.ID, err)
+				lastPushError = fmt.Sprintf("upload: %v", res.err)
 				continue
 			}
-
 			confirmItems = append(confirmItems, map[string]interface{}{
-				"id":        urls[j].ID,
+				"id":        res.id,
 				"type":      "memory",
-				"sizeBytes": len(item.data),
-				"checksum":  item.checksum,
+				"sizeBytes": res.dataSize,
+				"checksum":  res.checksum,
 			})
 		}
 
@@ -230,11 +245,23 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("\r  Progress: %d/%d (pulled: %d, skipped: %d, errors: %d)\n", len(manifest.Items), len(manifest.Items), pulled, pullSkipped, pullErrors)
 
+	// Update and save sync manifest
+	syncManifest := storage.GetSyncManifest()
+	syncManifest.UpdateFromCloud(cloudItems)
+	// Add newly pushed items
+	for _, item := range pending {
+		syncManifest.MarkSynced(item.obs.ID, item.checksum)
+	}
+	if err := syncManifest.Save(); err != nil {
+		fmt.Printf("  Warning: failed to save sync manifest: %v\n", err)
+	}
+
 	// Summary
 	fmt.Println()
 	fmt.Println("Sync complete:")
 	fmt.Printf("  Pushed: %d (skipped: %d)\n", pushed, pushSkipped)
 	fmt.Printf("  Pulled: %d (skipped: %d)\n", pulled, pullSkipped)
+	fmt.Printf("  Total synced: %d\n", syncManifest.GetSyncedCount())
 	if pushErrors > 0 || pullErrors > 0 {
 		fmt.Printf("  Errors: %d push, %d pull\n", pushErrors, pullErrors)
 		if lastPushError != "" {
@@ -494,16 +521,30 @@ func getCloudManifest(apiBase, token string) (*manifestResponse, error) {
 			u += "&cursor=" + url.QueryEscape(cursor)
 		}
 
-		req, err := http.NewRequest("GET", u, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-
+		var resp *http.Response
+		var err error
 		client := &http.Client{Timeout: 30 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
+
+		// Retry with exponential backoff
+		for retry := 0; retry < 5; retry++ {
+			req, reqErr := http.NewRequest("GET", u, nil)
+			if reqErr != nil {
+				return nil, reqErr
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+
+			resp, err = client.Do(req)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.StatusCode == 429 {
+				resp.Body.Close()
+				backoff := time.Duration(1<<retry) * time.Second
+				time.Sleep(backoff)
+				continue
+			}
+			break
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -567,19 +608,34 @@ func getUploadUrlsBatch(apiBase, token string, items []pendingItem) ([]uploadURL
 
 	body := map[string]interface{}{"items": reqItems}
 	bodyBytes, _ := json.Marshal(body)
-
-	req, err := http.NewRequest("POST", apiBase+"/sync/upload-urls", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+
+	var resp *http.Response
+	var err error
+
+	// Retry with exponential backoff
+	for retry := 0; retry < 5; retry++ {
+		req, reqErr := http.NewRequest("POST", apiBase+"/sync/upload-urls", bytes.NewReader(bodyBytes))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err = client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode == 429 {
+			resp.Body.Close()
+			backoff := time.Duration(1<<retry) * time.Second
+			time.Sleep(backoff)
+			continue
+		}
+		break
 	}
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -622,19 +678,34 @@ func uploadToGCS(uploadURL string, data []byte) error {
 func confirmUploadsBatch(apiBase, token string, items []map[string]interface{}) ([]confirmResult, error) {
 	body := map[string]interface{}{"items": items}
 	bodyBytes, _ := json.Marshal(body)
-
-	req, err := http.NewRequest("POST", apiBase+"/sync/confirm-uploads", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
+
+	var resp *http.Response
+	var err error
+
+	// Retry with exponential backoff
+	for retry := 0; retry < 5; retry++ {
+		req, reqErr := http.NewRequest("POST", apiBase+"/sync/confirm-uploads", bytes.NewReader(bodyBytes))
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err = client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode == 429 {
+			resp.Body.Close()
+			backoff := time.Duration(1<<retry) * time.Second
+			time.Sleep(backoff)
+			continue
+		}
+		break
 	}
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {

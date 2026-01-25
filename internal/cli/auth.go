@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -8,14 +9,18 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/srp"
 	"github.com/spf13/cobra"
+	"github.com/zalando/go-keyring"
 	"golang.org/x/term"
 )
+
+const keyringService = "sinesync"
 
 const DefaultAPIBase = "https://api.sinesync.ai/v1"
 
@@ -92,9 +97,10 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	apiBase := getAPIBase()
 
 	// Get email
-	var email string
 	fmt.Print("Email: ")
-	fmt.Scanln(&email)
+	reader := bufio.NewReader(os.Stdin)
+	email, _ := reader.ReadString('\n')
+	email = strings.TrimSpace(email)
 
 	if email == "" {
 		return fmt.Errorf("email is required")
@@ -165,9 +171,10 @@ func runSignup(cmd *cobra.Command, args []string) error {
 	apiBase := getAPIBase()
 
 	// Get email
-	var email string
 	fmt.Print("Email: ")
-	fmt.Scanln(&email)
+	reader := bufio.NewReader(os.Stdin)
+	email, _ := reader.ReadString('\n')
+	email = strings.TrimSpace(email)
 
 	if email == "" {
 		return fmt.Errorf("email is required")
@@ -471,11 +478,40 @@ func saveAuthConfig(cfg *AuthConfig) error {
 		return err
 	}
 
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	// Store tokens in system keychain
+	if cfg.Token != "" {
+		if err := keyring.Set(keyringService, "token", cfg.Token); err != nil {
+			// Fall back to file storage if keychain unavailable
+			return saveAuthConfigToFile(cfg)
+		}
+	}
+	if cfg.RefreshToken != "" {
+		_ = keyring.Set(keyringService, "refreshToken", cfg.RefreshToken)
+	}
+	if cfg.DeviceToken != "" {
+		_ = keyring.Set(keyringService, "deviceToken", cfg.DeviceToken)
+	}
+
+	// Store non-sensitive data in file
+	fileCfg := AuthConfig{
+		UserID:    cfg.UserID,
+		Email:     cfg.Email,
+		ExpiresAt: cfg.ExpiresAt,
+		DeviceID:  cfg.DeviceID,
+	}
+	data, err := json.MarshalIndent(fileCfg, "", "  ")
 	if err != nil {
 		return err
 	}
 
+	return os.WriteFile(authConfigPath(), data, 0600)
+}
+
+func saveAuthConfigToFile(cfg *AuthConfig) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
 	return os.WriteFile(authConfigPath(), data, 0600)
 }
 
@@ -490,9 +526,25 @@ func loadAuthConfig() (*AuthConfig, error) {
 		return nil, err
 	}
 
+	// Load tokens from keychain
+	if token, err := keyring.Get(keyringService, "token"); err == nil {
+		cfg.Token = token
+	}
+	if refreshToken, err := keyring.Get(keyringService, "refreshToken"); err == nil {
+		cfg.RefreshToken = refreshToken
+	}
+	if deviceToken, err := keyring.Get(keyringService, "deviceToken"); err == nil {
+		cfg.DeviceToken = deviceToken
+	}
+
 	return &cfg, nil
 }
 
 func removeAuthConfig() error {
+	// Remove from keychain
+	_ = keyring.Delete(keyringService, "token")
+	_ = keyring.Delete(keyringService, "refreshToken")
+	_ = keyring.Delete(keyringService, "deviceToken")
+
 	return os.Remove(authConfigPath())
 }
