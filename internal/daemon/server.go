@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/storage"
+	"github.com/zalando/go-keyring"
 )
 
 //go:embed static/*
@@ -34,6 +36,7 @@ type Server struct {
 	embedder     *embeddings.Provider
 	httpServer   *http.Server
 	mode         string // "standalone" or "adapter"
+	syncManager  *SyncManager
 
 	// Observation cache
 	obsCache      []storage.Observation
@@ -56,13 +59,15 @@ func NewServer(port int) *Server {
 	}
 
 	embedder, _ := embeddings.NewProvider()
+	localStorage := storage.NewLocalStorage()
 
 	return &Server{
 		port:         port,
-		localStorage: storage.NewLocalStorage(),
+		localStorage: localStorage,
 		config:       cfg,
 		embedder:     embedder,
 		mode:         mode,
+		syncManager:  NewSyncManager(localStorage),
 		obsCacheTTL:  30 * time.Second, // Cache for 30 seconds
 	}
 }
@@ -104,6 +109,7 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/projects", s.handleProjects)
 	mux.HandleFunc("/api/tags", s.handleTags)
 	mux.HandleFunc("/api/search", s.handleSearch)
+	mux.HandleFunc("/api/sync", s.handleSync)
 
 	// Static files for dashboard
 	staticFS, _ := fs.Sub(staticFiles, "static")
@@ -127,6 +133,9 @@ func (s *Server) Run() error {
 		return fmt.Errorf("failed to write PID file: %w", err)
 	}
 
+	// Start background sync
+	s.syncManager.Start()
+
 	// Handle shutdown signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -134,6 +143,7 @@ func (s *Server) Run() error {
 	go func() {
 		<-sigChan
 		fmt.Fprintln(os.Stderr, "\nsine~sync daemon shutting down...")
+		s.syncManager.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.httpServer.Shutdown(ctx)
@@ -144,6 +154,7 @@ func (s *Server) Run() error {
 	fmt.Fprintf(os.Stderr, "  Mode: %s\n", s.mode)
 	fmt.Fprintf(os.Stderr, "  Dashboard: http://%s\n", addr)
 	fmt.Fprintf(os.Stderr, "  Hook API: http://%s/api/\n", addr)
+	fmt.Fprintf(os.Stderr, "  Cloud sync: every %v\n", SyncInterval)
 
 	return s.httpServer.ListenAndServe()
 }
@@ -221,6 +232,20 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	var sb strings.Builder
 	sb.WriteString("# [sinesync] Recent context\n\n")
 
+	// Check auth status and add sync info
+	syncing, lastSync, syncErr := s.syncManager.Status()
+	authenticated := s.isAuthenticated()
+
+	if !authenticated {
+		sb.WriteString("**Cloud sync disabled** - Run `sinesync login` to enable cross-device sync\n\n")
+	} else if syncErr != "" {
+		sb.WriteString(fmt.Sprintf("**Sync error**: %s\n\n", syncErr))
+	} else if syncing {
+		sb.WriteString("**Syncing** to cloud...\n\n")
+	} else if !lastSync.IsZero() {
+		sb.WriteString(fmt.Sprintf("**Last sync**: %s\n\n", formatRelativeTime(lastSync)))
+	}
+
 	for _, obs := range observations {
 		sb.WriteString(fmt.Sprintf("**%s** (%s)\n", obs.Core.Title, obs.Core.Type))
 		if obs.Core.Summary != "" {
@@ -238,6 +263,50 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// isAuthenticated checks if user has valid auth tokens
+func (s *Server) isAuthenticated() bool {
+	const keyringService = "sinesync"
+
+	// Check keyring first (preferred secure storage)
+	if token, err := keyring.Get(keyringService, "token"); err == nil && token != "" {
+		return true
+	}
+	if deviceToken, err := keyring.Get(keyringService, "deviceToken"); err == nil && deviceToken != "" {
+		return true
+	}
+
+	// Fallback to JSON file
+	authPath := filepath.Join(config.ConfigDir(), "auth.json")
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		return false
+	}
+
+	var auth struct {
+		DeviceToken string `json:"deviceToken"`
+		Token       string `json:"token"`
+	}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return false
+	}
+
+	return auth.DeviceToken != "" || auth.Token != ""
+}
+
+func formatRelativeTime(t time.Time) string {
+	diff := time.Since(t)
+	if diff < time.Minute {
+		return "just now"
+	}
+	if diff < time.Hour {
+		return fmt.Sprintf("%dm ago", int(diff.Minutes()))
+	}
+	if diff < 24*time.Hour {
+		return fmt.Sprintf("%dh ago", int(diff.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(diff.Hours()/24))
+}
+
 func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -247,6 +316,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	// Read hook input
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		log.Printf("[capture] Failed to read body: %v", err)
 		http.Error(w, "Failed to read body", http.StatusBadRequest)
 		return
 	}
@@ -260,9 +330,12 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.Unmarshal(body, &hookInput); err != nil {
+		log.Printf("[capture] Invalid JSON: %v", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[capture] Received: tool=%s session=%s cwd=%s", hookInput.ToolName, hookInput.SessionID, hookInput.CWD)
 
 	// Skip tools that don't produce meaningful observations
 	skipTools := map[string]bool{
@@ -273,6 +346,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if skipTools[hookInput.ToolName] {
+		log.Printf("[capture] Skipped: read-only tool %s", hookInput.ToolName)
 		writeJSON(w, map[string]interface{}{"status": "skipped", "reason": "read-only tool"})
 		return
 	}
@@ -590,14 +664,46 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats["recentWeek"] = recentCount
 
 	// Sync status
+	syncing, lastSync, lastError := s.syncManager.Status()
 	syncManifest := storage.GetSyncManifest()
 	stats["syncedCount"] = syncManifest.GetSyncedCount()
-	lastSync := syncManifest.GetLastSync()
+	stats["syncing"] = syncing
 	if !lastSync.IsZero() {
 		stats["lastSync"] = lastSync.Format(time.RFC3339)
 	}
+	if lastError != "" {
+		stats["syncError"] = lastError
+	}
 
 	writeJSON(w, stats)
+}
+
+func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		// Trigger immediate sync
+		s.syncManager.TriggerSync()
+		writeJSON(w, map[string]interface{}{"status": "triggered"})
+		return
+	}
+
+	// GET - return sync status
+	syncing, lastSync, lastError := s.syncManager.Status()
+	syncManifest := storage.GetSyncManifest()
+	authenticated := s.isAuthenticated()
+
+	status := map[string]interface{}{
+		"syncing":       syncing,
+		"syncedCount":   syncManifest.GetSyncedCount(),
+		"authenticated": authenticated,
+	}
+	if !lastSync.IsZero() {
+		status["lastSync"] = lastSync.Format(time.RFC3339)
+	}
+	if lastError != "" {
+		status["syncError"] = lastError
+	}
+
+	writeJSON(w, status)
 }
 
 func (s *Server) handleObservations(w http.ResponseWriter, r *http.Request) {
@@ -685,13 +791,64 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	switch r.Method {
+	case http.MethodGet:
+		obs, err := s.localStorage.GetObservation(id)
+		if err != nil {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, observationToMap(*obs))
+
+	case http.MethodDelete:
+		s.handleDeleteObservation(w, r, id)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request, id string) {
+	// Get observation first to get project/title for claude-mem deletion
 	obs, err := s.localStorage.GetObservation(id)
 	if err != nil {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
 	}
 
-	writeJSON(w, observationToMap(*obs))
+	// Delete from local sinesync storage
+	if err := s.localStorage.Delete("observations", id); err != nil {
+		http.Error(w, "Failed to delete: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Delete from claude-mem if it exists there
+	if adapters.IsClaudeMemInstalled() {
+		adapter, err := adapters.NewClaudeMemAdapter(false)
+		if err == nil && adapter != nil {
+			defer adapter.Close()
+			ctx := context.Background()
+
+			// Try deleting by source ID first (if it came from claude-mem)
+			if obs.Source.Adapter == adapters.ClaudeMemAdapterName && obs.Source.ID != "" {
+				adapter.DeleteBySourceID(ctx, obs.Source.ID)
+			} else {
+				// Fall back to project+title match
+				adapter.DeleteByProjectAndTitle(ctx, obs.Core.Project, obs.Core.Title)
+			}
+		}
+	}
+
+	// Mark for cloud deletion on next sync (explicit delete, safe to propagate)
+	syncManifest := storage.GetSyncManifest()
+	syncManifest.MarkPendingDelete(id)
+	syncManifest.Save()
+
+	// Clear observation cache to force refresh
+	s.obsCache = nil
+
+	log.Printf("[server] Deleted observation %s (project: %s, title: %s)", id, obs.Core.Project, obs.Core.Title)
+	writeJSON(w, map[string]bool{"success": true})
 }
 
 func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {

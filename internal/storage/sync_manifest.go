@@ -12,9 +12,26 @@ import (
 
 // SyncManifest tracks which observations are synced to cloud
 type SyncManifest struct {
-	LastSync time.Time         `json:"lastSync"`
-	Items    map[string]string `json:"items"` // id -> checksum
-	mu       sync.RWMutex
+	LastSync        time.Time         `json:"lastSync"`
+	Items           map[string]string `json:"items"`           // id -> checksum (current cloud state)
+	SeenIDs         map[string]bool   `json:"seenIds"`         // all IDs ever seen from cloud
+	PendingDeletes  map[string]bool   `json:"pendingDeletes"`  // explicit deletes to sync to cloud
+	ManifestVersion int               `json:"manifestVersion"` // version from server for cache invalidation
+	mu              sync.RWMutex
+}
+
+// GetManifestVersion returns the cached manifest version
+func (m *SyncManifest) GetManifestVersion() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ManifestVersion
+}
+
+// SetManifestVersion updates the cached manifest version
+func (m *SyncManifest) SetManifestVersion(version int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ManifestVersion = version
 }
 
 var (
@@ -30,7 +47,9 @@ func syncManifestPath() string {
 func GetSyncManifest() *SyncManifest {
 	manifestOnce.Do(func() {
 		manifest = &SyncManifest{
-			Items: make(map[string]string),
+			Items:          make(map[string]string),
+			SeenIDs:        make(map[string]bool),
+			PendingDeletes: make(map[string]bool),
 		}
 		manifest.Load()
 	})
@@ -113,4 +132,80 @@ func (m *SyncManifest) GetLastSync() time.Time {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.LastSync
+}
+
+// MarkSeen marks an ID as seen (we've encountered it from cloud)
+func (m *SyncManifest) MarkSeen(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.SeenIDs == nil {
+		m.SeenIDs = make(map[string]bool)
+	}
+	m.SeenIDs[id] = true
+}
+
+// IsSeen checks if we've ever seen this ID from cloud
+func (m *SyncManifest) IsSeen(id string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.SeenIDs == nil {
+		return false
+	}
+	return m.SeenIDs[id]
+}
+
+// MarkSeenBatch marks multiple IDs as seen
+func (m *SyncManifest) MarkSeenBatch(ids []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.SeenIDs == nil {
+		m.SeenIDs = make(map[string]bool)
+	}
+	for _, id := range ids {
+		m.SeenIDs[id] = true
+	}
+}
+
+// RemoveFromSeen removes an ID from seen list (after confirmed cloud deletion)
+func (m *SyncManifest) RemoveFromSeen(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.SeenIDs, id)
+	delete(m.Items, id)
+	delete(m.PendingDeletes, id)
+}
+
+// MarkPendingDelete marks an item for deletion from cloud on next sync
+func (m *SyncManifest) MarkPendingDelete(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.PendingDeletes == nil {
+		m.PendingDeletes = make(map[string]bool)
+	}
+	m.PendingDeletes[id] = true
+}
+
+// GetPendingDeletes returns IDs that should be deleted from cloud
+func (m *SyncManifest) GetPendingDeletes() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make([]string, 0, len(m.PendingDeletes))
+	for id := range m.PendingDeletes {
+		result = append(result, id)
+	}
+	return result
+}
+
+// ClearPendingDelete removes an item from pending deletes after successful deletion
+func (m *SyncManifest) ClearPendingDelete(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.PendingDeletes, id)
 }

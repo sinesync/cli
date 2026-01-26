@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/miclip/sinesync/internal/adapters"
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/miclip/sinesync/internal/storage"
@@ -188,15 +191,49 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		return 0, 0, fmt.Errorf("encryption key not available - please login again")
 	}
 
-	// Get cloud manifest
-	manifest, err := m.getCloudManifest(token)
+	syncManifest := storage.GetSyncManifest()
+
+	// Check if we have pending operations that require manifest
+	hasPendingDeletes := len(syncManifest.GetPendingDeletes()) > 0
+
+	// Check manifest metadata first (cheap - 1 API call)
+	meta, err := m.getManifestMeta(token)
 	if err != nil {
-		return 0, 0, fmt.Errorf("get manifest: %w", err)
+		return 0, 0, fmt.Errorf("get manifest meta: %w", err)
 	}
 
-	cloudItems := make(map[string]string)
-	for _, item := range manifest.Items {
-		cloudItems[item.ID] = item.Checksum
+	// Compare with cached version
+	cachedVersion := syncManifest.GetManifestVersion()
+	manifestChanged := meta.ManifestVersion != cachedVersion
+
+	var manifest *manifestResponse
+	var cloudItems map[string]string
+
+	// Only download full manifest if changed or we need it for operations
+	if manifestChanged || hasPendingDeletes {
+		manifest, err = m.getCloudManifestCached(token)
+		if err != nil {
+			return 0, 0, fmt.Errorf("get manifest: %w", err)
+		}
+
+		cloudItems = make(map[string]string)
+		for _, item := range manifest.Items {
+			cloudItems[item.ID] = item.Checksum
+		}
+
+		// Update cached version
+		syncManifest.SetManifestVersion(meta.ManifestVersion)
+	} else {
+		// No changes - use cached items from local manifest
+		log.Printf("[sync] Manifest unchanged (version %d), using cache", cachedVersion)
+		cloudItems = syncManifest.Items
+		manifest = &manifestResponse{
+			Items:      make([]manifestItem, 0, len(cloudItems)),
+			TotalCount: len(cloudItems),
+		}
+		for id, checksum := range cloudItems {
+			manifest.Items = append(manifest.Items, manifestItem{ID: id, Checksum: checksum})
+		}
 	}
 
 	// Get local observations
@@ -233,12 +270,43 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		}
 	}
 
-	// Find items to pull
+	// syncManifest already obtained at start of sync function
+
+	// Determine what to pull
+	// Only pull items we haven't seen before (new from another device)
 	var toPull []manifestItem
 	for _, item := range manifest.Items {
 		if _, exists := localItems[item.ID]; !exists {
-			toPull = append(toPull, item)
+			// Cloud has it, we don't have it locally
+			if !syncManifest.IsSeen(item.ID) {
+				// Never seen - new from another device, pull it
+				toPull = append(toPull, item)
+			}
+			// If we've seen it before but don't have it locally,
+			// it could be: (1) explicitly deleted via dashboard, or (2) cleared during troubleshooting
+			// We only sync explicit deletes (from pendingDeletes), not inferred deletions
 		}
+	}
+
+	// Get explicit pending deletes (only items deleted through dashboard)
+	toDeleteFromCloud := syncManifest.GetPendingDeletes()
+
+	// Detect items deleted from cloud by other devices
+	// If we have it locally, we've seen it before, but it's no longer in cloud → deleted by another device
+	var toDeleteLocally []string
+	for _, obs := range observations {
+		if _, inCloud := cloudItems[obs.ID]; !inCloud {
+			// Not in cloud - was it ever there?
+			if syncManifest.IsSeen(obs.ID) {
+				// We've seen it in cloud before, now it's gone → deleted by another device
+				toDeleteLocally = append(toDeleteLocally, obs.ID)
+			}
+		}
+	}
+
+	// Mark all current cloud items as seen (for future sync cycles)
+	for _, item := range manifest.Items {
+		syncManifest.MarkSeen(item.ID)
 	}
 
 	// Push in batches
@@ -266,8 +334,37 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		pulled++
 	}
 
-	// Update sync manifest
-	syncManifest := storage.GetSyncManifest()
+	// Delete items from cloud that were explicitly deleted locally (via dashboard)
+	deleted := 0
+	for _, id := range toDeleteFromCloud {
+		if err := m.deleteFromCloud(token, id); err != nil {
+			log.Printf("[sync] Delete error for %s: %v", id, err)
+			continue
+		}
+		// Clear from pending deletes and seen list after successful cloud deletion
+		syncManifest.ClearPendingDelete(id)
+		syncManifest.RemoveFromSeen(id)
+		deleted++
+	}
+	if deleted > 0 {
+		log.Printf("[sync] Deleted %d items from cloud", deleted)
+	}
+
+	// Delete local items that were deleted from cloud by other devices
+	deletedLocal := 0
+	for _, id := range toDeleteLocally {
+		if err := m.deleteLocally(id); err != nil {
+			log.Printf("[sync] Local delete error for %s: %v", id, err)
+			continue
+		}
+		syncManifest.RemoveFromSeen(id)
+		deletedLocal++
+	}
+	if deletedLocal > 0 {
+		log.Printf("[sync] Deleted %d items locally (synced from other devices)", deletedLocal)
+	}
+
+	// Update sync manifest with current cloud state
 	syncManifest.UpdateFromCloud(cloudItems)
 	syncManifest.Save()
 
@@ -349,6 +446,105 @@ type encryptedObsItem struct {
 	obs       storage.Observation
 	encrypted []byte
 	checksum  string
+}
+
+type manifestMeta struct {
+	ItemCount       int    `json:"itemCount"`
+	LastUpdated     string `json:"lastUpdated"`
+	TotalSizeBytes  int64  `json:"totalSizeBytes"`
+	ManifestVersion int    `json:"manifestVersion"`
+}
+
+func (m *SyncManager) getManifestMeta(token string) (*manifestMeta, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("GET", m.apiBase+"/sync/manifest/meta", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var meta manifestMeta
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return nil, err
+	}
+
+	return &meta, nil
+}
+
+func (m *SyncManager) getCloudManifestCached(token string) (*manifestResponse, error) {
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	// Get signed URL for manifest download
+	req, err := http.NewRequest("GET", m.apiBase+"/sync/manifest/download", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get manifest URL failed %d: %s", resp.StatusCode, string(body))
+	}
+
+	var urlResp struct {
+		URL       string `json:"url"`
+		ExpiresAt string `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
+		return nil, err
+	}
+
+	// Download the gzipped manifest
+	dlResp, err := client.Get(urlResp.URL)
+	if err != nil {
+		return nil, fmt.Errorf("download manifest: %w", err)
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("manifest download failed: %d", dlResp.StatusCode)
+	}
+
+	// Decompress gzip
+	gzReader, err := gzip.NewReader(dlResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("gzip reader: %w", err)
+	}
+	defer gzReader.Close()
+
+	// Parse JSON
+	var manifest struct {
+		UserID      string         `json:"userId"`
+		GeneratedAt string         `json:"generatedAt"`
+		ItemCount   int            `json:"itemCount"`
+		Items       []manifestItem `json:"items"`
+	}
+	if err := json.NewDecoder(gzReader).Decode(&manifest); err != nil {
+		return nil, fmt.Errorf("decode manifest: %w", err)
+	}
+
+	return &manifestResponse{
+		Items:      manifest.Items,
+		TotalCount: manifest.ItemCount,
+	}, nil
 }
 
 func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem) (int, error) {
@@ -525,4 +721,61 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, encMgr *encrypt
 	}
 
 	return m.localStorage.SaveObservation(obs)
+}
+
+func (m *SyncManager) deleteFromCloud(token string, id string) error {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("DELETE", m.apiBase+"/sync/item/"+url.PathEscape(id), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete failed: %d - %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+func (m *SyncManager) deleteLocally(id string) error {
+	// Get observation first to get project/title for claude-mem deletion
+	obs, err := m.localStorage.GetObservation(id)
+	if err != nil {
+		// Already deleted or doesn't exist - that's fine
+		return nil
+	}
+
+	// Delete from local sinesync storage
+	if err := m.localStorage.Delete("observations", id); err != nil {
+		return fmt.Errorf("delete from storage: %w", err)
+	}
+
+	// Delete from claude-mem if it exists there
+	if adapters.IsClaudeMemInstalled() {
+		adapter, err := adapters.NewClaudeMemAdapter(false)
+		if err == nil && adapter != nil {
+			defer adapter.Close()
+			ctx := context.Background()
+
+			// Try deleting by source ID first (if it came from claude-mem)
+			if obs.Source.Adapter == adapters.ClaudeMemAdapterName && obs.Source.ID != "" {
+				adapter.DeleteBySourceID(ctx, obs.Source.ID)
+			} else {
+				// Fall back to project+title match
+				adapter.DeleteByProjectAndTitle(ctx, obs.Core.Project, obs.Core.Title)
+			}
+		}
+	}
+
+	log.Printf("[sync] Deleted locally: %s (project: %s)", id, obs.Core.Project)
+	return nil
 }

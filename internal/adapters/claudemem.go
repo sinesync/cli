@@ -343,3 +343,27 @@ func (a *ClaudeMemAdapter) GetObservationCount() (int, error) {
 	err := a.db.QueryRow("SELECT COUNT(*) FROM observations").Scan(&count)
 	return count, err
 }
+
+// DeleteByProjectAndTitle deletes an observation from claude-mem by project and title
+func (a *ClaudeMemAdapter) DeleteByProjectAndTitle(ctx context.Context, project, title string) error {
+	if a.readonly {
+		return fmt.Errorf("adapter is read-only")
+	}
+
+	_, err := a.db.ExecContext(ctx, `
+		DELETE FROM observations WHERE project = ? AND title = ?
+	`, project, title)
+	return err
+}
+
+// DeleteBySourceID deletes an observation from claude-mem by its source ID
+func (a *ClaudeMemAdapter) DeleteBySourceID(ctx context.Context, sourceID string) error {
+	if a.readonly {
+		return fmt.Errorf("adapter is read-only")
+	}
+
+	_, err := a.db.ExecContext(ctx, `
+		DELETE FROM observations WHERE id = ?
+	`, sourceID)
+	return err
+}
