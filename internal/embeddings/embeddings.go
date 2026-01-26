@@ -60,7 +60,11 @@ func modelFilePath() string {
 
 // onnxLibPath returns the path to the ONNX runtime library
 func onnxLibPath() string {
-	return filepath.Join(modelDir(), "lib", "libonnxruntime.so")
+	libName := "libonnxruntime.so"
+	if runtime.GOOS == "darwin" {
+		libName = "libonnxruntime.dylib"
+	}
+	return filepath.Join(modelDir(), "lib", libName)
 }
 
 // detectGPU checks for available GPU acceleration
@@ -313,10 +317,16 @@ func downloadONNXRuntime(useGPU bool, accel Accelerator) error {
 			}
 			outFile.Close()
 
-			// Make symlink for .so if we got .so.X.Y.Z
+			// Make symlink for versioned libraries
+			// Linux: libonnxruntime.so.1.23.2 -> libonnxruntime.so
+			// macOS: libonnxruntime.1.23.2.dylib -> libonnxruntime.dylib
 			if strings.Contains(name, ".so.") {
 				linkPath := filepath.Join(libDir, "libonnxruntime.so")
-				os.Remove(linkPath) // Remove if exists
+				os.Remove(linkPath)
+				os.Symlink(name, linkPath)
+			} else if runtime.GOOS == "darwin" && strings.Contains(name, ".dylib") && name != "libonnxruntime.dylib" {
+				linkPath := filepath.Join(libDir, "libonnxruntime.dylib")
+				os.Remove(linkPath)
 				os.Symlink(name, linkPath)
 			}
 		}
