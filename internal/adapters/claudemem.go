@@ -70,17 +70,58 @@ func (a *ClaudeMemAdapter) IsAvailable() bool {
 	return a.db != nil
 }
 
+// hasColumn checks if a column exists in a table
+func (a *ClaudeMemAdapter) hasColumn(table, column string) bool {
+	rows, err := a.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			continue
+		}
+		if name == column {
+			return true
+		}
+	}
+	return false
+}
+
 // Import reads observations from claude-mem and converts to sinesync format
 func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]storage.Observation, error) {
-	rows, err := a.db.QueryContext(ctx, `
-		SELECT
-			id, sdk_session_id, project, type, title, subtitle, narrative,
-			facts, concepts, files_read, files_modified,
-			created_at, created_at_epoch
-		FROM observations
-		WHERE created_at_epoch > ?
-		ORDER BY created_at_epoch ASC
-	`, sinceEpoch)
+	// Check if sdk_session_id column exists (newer claude-mem versions have it)
+	hasSDKSessionID := a.hasColumn("observations", "sdk_session_id")
+
+	var query string
+	if hasSDKSessionID {
+		query = `
+			SELECT
+				id, sdk_session_id, project, type, title, subtitle, narrative,
+				facts, concepts, files_read, files_modified,
+				created_at, created_at_epoch
+			FROM observations
+			WHERE created_at_epoch > ?
+			ORDER BY created_at_epoch ASC
+		`
+	} else {
+		query = `
+			SELECT
+				id, '' as sdk_session_id, project, type, title, subtitle, narrative,
+				facts, concepts, files_read, files_modified,
+				created_at, created_at_epoch
+			FROM observations
+			WHERE created_at_epoch > ?
+			ORDER BY created_at_epoch ASC
+		`
+	}
+
+	rows, err := a.db.QueryContext(ctx, query, sinceEpoch)
 	if err != nil {
 		return nil, err
 	}

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -63,6 +64,12 @@ func runSync(cmd *cobra.Command, args []string) error {
 		token = authCfg.Token
 	}
 
+	// Get encryption manager
+	encMgr := encryption.GetManager()
+	if !encMgr.HasKey() {
+		return fmt.Errorf("encryption key not available - please login again")
+	}
+
 	apiBase := getAPIBase()
 	localStorage := storage.NewLocalStorage()
 
@@ -85,29 +92,30 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load local observations: %w", err)
 	}
 
+	// Encrypt observations and compute checksums (based on encrypted data)
+	fmt.Println("Encrypting observations...")
+	var pending []pendingItem
 	localItems := make(map[string]string) // id -> checksum
+
 	for _, obs := range observations {
-		obsData, _ := json.Marshal(obs)
-		localItems[obs.ID] = storage.Checksum(obsData)[:16]
+		encrypted, err := encMgr.EncryptObservation(&obs)
+		if err != nil {
+			fmt.Printf("  Warning: failed to encrypt %s: %v\n", obs.ID, err)
+			continue
+		}
+		// Checksum based on encrypted data
+		checksum := storage.Checksum(encrypted)[:16]
+		localItems[obs.ID] = checksum
+
+		// Check if needs pushing
+		if cloudChecksum, exists := cloudItems[obs.ID]; exists && cloudChecksum == checksum {
+			continue
+		}
+		pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum})
 	}
 
 	fmt.Printf("Local: %d items, Cloud: %d items\n", len(localItems), len(cloudItems))
 	fmt.Println()
-
-	// Collect items that need to be pushed
-	var pending []pendingItem
-
-	for _, obs := range observations {
-		obsData, err := json.Marshal(obs)
-		if err != nil {
-			continue
-		}
-		localChecksum := storage.Checksum(obsData)[:16]
-		if cloudChecksum, exists := cloudItems[obs.ID]; exists && cloudChecksum == localChecksum {
-			continue
-		}
-		pending = append(pending, pendingItem{obs: obs, data: obsData, checksum: localChecksum})
-	}
 
 	pushSkipped := len(observations) - len(pending)
 	fmt.Printf("Pushing to cloud: %d items to upload, %d already synced\n", len(pending), pushSkipped)
@@ -126,7 +134,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		batch := pending[i:end]
 
 		// Get upload URLs for batch
-		urls, err := getUploadUrlsBatch(apiBase, token, batch)
+		urls, err := getUploadUrlsBatchEncrypted(apiBase, token, batch)
 		if err != nil {
 			pushErrors += len(batch)
 			lastPushError = fmt.Sprintf("get URLs batch: %v", err)
@@ -209,7 +217,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		data, err := pullFromCloud(apiBase, token, item.ID)
+		encryptedData, err := pullFromCloud(apiBase, token, item.ID)
 		if err != nil {
 			pullErrors++
 			lastPullError = fmt.Sprintf("pull %s: %v", item.ID, err)
@@ -219,17 +227,18 @@ func runSync(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		var obs storage.Observation
-		if err := json.Unmarshal(data, &obs); err != nil {
+		// Decrypt observation
+		obs, err := encMgr.DecryptObservation(encryptedData)
+		if err != nil {
 			pullErrors++
-			lastPullError = fmt.Sprintf("unmarshal %s: %v", item.ID, err)
+			lastPullError = fmt.Sprintf("decrypt %s: %v", item.ID, err)
 			if pullErrors == 1 {
 				fmt.Printf("\n  First error: %s\n", lastPullError)
 			}
 			continue
 		}
 
-		if err := localStorage.SaveObservation(&obs); err != nil {
+		if err := localStorage.SaveObservation(obs); err != nil {
 			pullErrors++
 			lastPullError = fmt.Sprintf("save %s: %v", item.ID, err)
 			if pullErrors == 1 {
@@ -286,6 +295,12 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 		token = authCfg.Token
 	}
 
+	// Get encryption manager
+	encMgr := encryption.GetManager()
+	if !encMgr.HasKey() {
+		return fmt.Errorf("encryption key not available - please login again")
+	}
+
 	apiBase := getAPIBase()
 	localStorage := storage.NewLocalStorage()
 
@@ -320,16 +335,16 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\rProcessing: %d/%d (pushed: %d, skipped: %d, errors: %d)", i+1, len(observations), pushed, skipped, errors)
 		}
 
-		// Serialize observation to JSON
-		obsData, err := json.Marshal(obs)
+		// Encrypt observation
+		encrypted, err := encMgr.EncryptObservation(&obs)
 		if err != nil {
 			errors++
-			lastError = fmt.Sprintf("marshal error: %v", err)
+			lastError = fmt.Sprintf("encrypt error: %v", err)
 			continue
 		}
 
-		// Calculate local checksum
-		localChecksum := storage.Checksum(obsData)[:16]
+		// Calculate checksum of encrypted data
+		localChecksum := storage.Checksum(encrypted)[:16]
 
 		// Check if already in cloud with same checksum
 		if cloudChecksum, exists := cloudItems[obs.ID]; exists && cloudChecksum == localChecksum {
@@ -337,8 +352,8 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Push to cloud
-		err = pushToCloud(apiBase, token, obs.ID, "memory", obsData)
+		// Push encrypted data to cloud
+		err = pushToCloud(apiBase, token, obs.ID, "memory", encrypted)
 		if err != nil {
 			errors++
 			lastError = fmt.Sprintf("push %s: %v", obs.ID, err)
@@ -371,6 +386,12 @@ func runSyncPull(cmd *cobra.Command, args []string) error {
 		token = authCfg.Token
 	}
 
+	// Get encryption manager
+	encMgr := encryption.GetManager()
+	if !encMgr.HasKey() {
+		return fmt.Errorf("encryption key not available - please login again")
+	}
+
 	apiBase := getAPIBase()
 	localStorage := storage.NewLocalStorage()
 
@@ -399,22 +420,22 @@ func runSyncPull(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Pull from cloud
-		data, err := pullFromCloud(apiBase, token, item.ID)
+		// Pull encrypted data from cloud
+		encryptedData, err := pullFromCloud(apiBase, token, item.ID)
 		if err != nil {
 			errors++
 			continue
 		}
 
-		// Parse observation
-		var obs storage.Observation
-		if err := json.Unmarshal(data, &obs); err != nil {
+		// Decrypt observation
+		obs, err := encMgr.DecryptObservation(encryptedData)
+		if err != nil {
 			errors++
 			continue
 		}
 
 		// Save locally
-		if err := localStorage.SaveObservation(&obs); err != nil {
+		if err := localStorage.SaveObservation(obs); err != nil {
 			errors++
 			continue
 		}
@@ -651,6 +672,11 @@ func getUploadUrlsBatch(apiBase, token string, items []pendingItem) ([]uploadURL
 	}
 
 	return result.Items, nil
+}
+
+// getUploadUrlsBatchEncrypted is identical to getUploadUrlsBatch - the pendingItem already contains encrypted data
+func getUploadUrlsBatchEncrypted(apiBase, token string, items []pendingItem) ([]uploadURLResponse, error) {
+	return getUploadUrlsBatch(apiBase, token, items)
 }
 
 func uploadToGCS(uploadURL string, data []byte) error {

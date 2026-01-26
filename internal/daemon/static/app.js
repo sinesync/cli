@@ -13,7 +13,9 @@ document.addEventListener('DOMContentLoaded', () => {
     initNavigation();
     initModal();
     initSearch();
+    initSync();
     loadStats();
+    loadSyncStatus();
     loadObservations();
 });
 
@@ -110,6 +112,80 @@ function openModal(content) {
 
 function closeModal() {
     document.getElementById('modal').classList.add('hidden');
+}
+
+// Sync
+function initSync() {
+    const syncBtn = document.getElementById('sync-now-btn');
+    if (syncBtn) {
+        syncBtn.addEventListener('click', triggerSync);
+    }
+    // Auto-refresh sync status every 30 seconds
+    setInterval(loadSyncStatus, 30000);
+}
+
+async function loadSyncStatus() {
+    try {
+        const response = await fetch('/api/sync');
+        const data = await response.json();
+        renderSyncStatus(data);
+    } catch (e) {
+        console.error('Failed to load sync status:', e);
+    }
+}
+
+async function triggerSync() {
+    const syncBtn = document.getElementById('sync-now-btn');
+    syncBtn.disabled = true;
+
+    try {
+        await fetch('/api/sync', { method: 'POST' });
+        // Poll for status updates
+        setTimeout(loadSyncStatus, 1000);
+        setTimeout(loadSyncStatus, 3000);
+        setTimeout(loadSyncStatus, 5000);
+    } catch (e) {
+        console.error('Failed to trigger sync:', e);
+    } finally {
+        setTimeout(() => { syncBtn.disabled = false; }, 2000);
+    }
+}
+
+function renderSyncStatus(data) {
+    const syncIcon = document.getElementById('sync-icon');
+    const syncCount = document.getElementById('sync-count');
+    const syncLast = document.getElementById('sync-last');
+    const syncError = document.getElementById('sync-error');
+
+    // If any required element is missing, skip updating sync status UI
+    if (!syncIcon || !syncCount || !syncLast || !syncError) {
+        return;
+    }
+
+    // Update icon state
+    syncIcon.classList.remove('syncing', 'error', 'success');
+    if (data.syncing) {
+        syncIcon.classList.add('syncing');
+        syncIcon.innerHTML = '&#8635;'; // Rotating arrow
+    } else if (data.syncError) {
+        syncIcon.classList.add('error');
+        syncIcon.innerHTML = '&#9888;'; // Warning
+    } else {
+        syncIcon.classList.add('success');
+        syncIcon.innerHTML = '&#9729;'; // Cloud
+    }
+
+    // Update stats
+    syncCount.textContent = data.syncedCount || 0;
+    syncLast.textContent = data.lastSync ? formatDate(data.lastSync) : '—';
+
+    // Show/hide error
+    if (data.syncError) {
+        syncError.textContent = data.syncError;
+        syncError.classList.remove('hidden');
+    } else {
+        syncError.classList.add('hidden');
+    }
 }
 
 // Search
@@ -482,11 +558,6 @@ function renderObservationDetail(obs) {
             </div>
         ` : ''}
 
-        <div class="detail-section">
-            <h4>Notes</h4>
-            <textarea id="detail-notes" rows="3" placeholder="Add personal notes...">${escapeHtml(obs.notes || '')}</textarea>
-        </div>
-
         <div class="detail-actions">
             <button class="detail-btn ${obs.starred ? 'starred' : ''}" id="btn-star">
                 ${obs.starred ? '★ Starred' : '☆ Star'}
@@ -534,8 +605,7 @@ function renderObservationDetail(obs) {
 
         await updateObservation(obs.id, {
             tags,
-            classification: document.getElementById('detail-classification').value || null,
-            notes: document.getElementById('detail-notes').value || null
+            classification: document.getElementById('detail-classification').value || null
         });
 
         loadObservationDetail(obs.id);

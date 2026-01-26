@@ -21,6 +21,11 @@ const (
 	// AES-GCM parameters
 	nonceSize = 12
 	tagSize   = 16
+
+	// Secret key format: base32 with dashes
+	// 32 bytes = 256 bits, base32 encodes to ~52 chars, with dashes every 4 = 64 total
+	secretKeyLength      = 64 // 13 groups of 4 chars (52) + 12 dashes = 64
+	secretKeyBase32Chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 )
 
 // DeriveKey derives an encryption key from password and secret key using Argon2id
@@ -153,4 +158,102 @@ func encodeBase32(data []byte) string {
 	}
 
 	return formatted
+}
+
+// ValidateSecretKey validates the format of a secret key
+func ValidateSecretKey(key string) bool {
+	if len(key) != secretKeyLength {
+		return false
+	}
+
+	charIndex := 0
+	for i, c := range key {
+		// Every 5th char (index 4, 9, 14, ...) should be a dash
+		if (i+1)%5 == 0 {
+			if c != '-' {
+				return false
+			}
+		} else {
+			// Must be a valid base32 character
+			if !isValidBase32Char(byte(c)) {
+				return false
+			}
+			charIndex++
+		}
+	}
+
+	return true
+}
+
+// isValidBase32Char checks if a character is in our base32 alphabet
+func isValidBase32Char(c byte) bool {
+	for i := 0; i < len(secretKeyBase32Chars); i++ {
+		if secretKeyBase32Chars[i] == c {
+			return true
+		}
+	}
+	return false
+}
+
+// DecodeSecretKey decodes a formatted secret key to bytes
+func DecodeSecretKey(formatted string) ([]byte, error) {
+	if !ValidateSecretKey(formatted) {
+		return nil, errors.New("invalid secret key format")
+	}
+
+	// Remove dashes
+	clean := ""
+	for _, c := range formatted {
+		if c != '-' {
+			clean += string(c)
+		}
+	}
+
+	return decodeBase32(clean)
+}
+
+// decodeBase32 decodes a base32 string to bytes
+func decodeBase32(data string) ([]byte, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+	charMap := make(map[byte]int)
+	for i := 0; i < len(alphabet); i++ {
+		charMap[alphabet[i]] = i
+	}
+
+	result := make([]byte, 0, len(data)*5/8)
+	buffer := 0
+	bitsLeft := 0
+
+	for i := 0; i < len(data); i++ {
+		val, ok := charMap[data[i]]
+		if !ok {
+			return nil, errors.New("invalid character in secret key")
+		}
+
+		buffer = (buffer << 5) | val
+		bitsLeft += 5
+
+		for bitsLeft >= 8 {
+			bitsLeft -= 8
+			result = append(result, byte((buffer>>bitsLeft)&0xFF))
+		}
+	}
+
+	return result, nil
+}
+
+// NormalizeSecretKey normalizes a secret key by removing spaces and converting to uppercase
+func NormalizeSecretKey(key string) string {
+	result := ""
+	for _, c := range key {
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		if c >= 'a' && c <= 'z' {
+			c = c - 'a' + 'A'
+		}
+		result += string(c)
+	}
+	return result
 }

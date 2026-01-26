@@ -92,15 +92,15 @@ func (c *Client) prepareForUpload(obs *storage.Observation) ([]byte, string, err
 		return nil, "", err
 	}
 
-	// Compute checksum of compressed data
-	hash := sha256.Sum256(compressed.Bytes())
-	checksum := hex.EncodeToString(hash[:8])
-
 	// Encrypt
 	encrypted, err := crypto.Encrypt(compressed.Bytes(), c.encryptionKey, AAD)
 	if err != nil {
 		return nil, "", err
 	}
+
+	// Compute checksum of encrypted data (matches CLI/daemon convention)
+	hash := sha256.Sum256(encrypted)
+	checksum := hex.EncodeToString(hash[:8])
 
 	return encrypted, checksum, nil
 }
@@ -167,7 +167,7 @@ func (c *Client) GetManifest() ([]ManifestItem, error) {
 // Push uploads an observation to the server
 func (c *Client) Push(obs *storage.Observation) error {
 	// Check project filter
-	if c.config != nil && !c.config.ShouldSyncProject(obs.Project) {
+	if c.config != nil && !c.config.ShouldSyncProject(obs.Core.Project) {
 		return nil // Skip excluded project
 	}
 
@@ -185,11 +185,11 @@ func (c *Client) Push(obs *storage.Observation) error {
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Device-ID", c.deviceID)
 	req.Header.Set("X-Item-ID", obs.ID)
-	req.Header.Set("X-Timestamp", obs.UpdatedAt.Format(time.RFC3339))
+	req.Header.Set("X-Timestamp", obs.Core.UpdatedAt.Format(time.RFC3339))
 	req.Header.Set("X-Checksum", checksum)
 	req.Header.Set("X-Size", fmt.Sprintf("%d", len(encrypted)))
-	if obs.Project != "" {
-		req.Header.Set("X-Project", obs.Project)
+	if obs.Core.Project != "" {
+		req.Header.Set("X-Project", obs.Core.Project)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -288,7 +288,7 @@ func (c *Client) Sync(localStorage *storage.LocalStorage) (*SyncResult, error) {
 			}
 
 			// Double-check project filter after decryption
-			if c.config != nil && !c.config.ShouldSyncProject(obs.Project) {
+			if c.config != nil && !c.config.ShouldSyncProject(obs.Core.Project) {
 				result.Skipped++
 				continue
 			}
