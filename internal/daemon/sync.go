@@ -373,31 +373,62 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		return 0, 0, fmt.Errorf("list observations: %w", err)
 	}
 
-	// Encrypt observations and compute checksums
-	var encryptedItems []encryptedObsItem
-
+	// Determine which items need to be pushed
+	// Use cached checksums when observation hasn't changed
 	localItems := make(map[string]string)
-	for _, obs := range observations {
-		encrypted, err := encMgr.EncryptObservation(&obs)
-		if err != nil {
-			log.Printf("[sync] Encrypt error for %s: %v", obs.ID, err)
-			continue
-		}
-		// Checksum is based on encrypted data
-		checksum := storage.Checksum(encrypted)[:16]
-		localItems[obs.ID] = checksum
-		encryptedItems = append(encryptedItems, encryptedObsItem{
-			obs:       obs,
-			encrypted: encrypted,
-			checksum:  checksum,
-		})
-	}
-
-	// Find items to push
 	var toPush []encryptedObsItem
-	for _, item := range encryptedItems {
-		if cloudChecksum, exists := cloudItems[item.obs.ID]; !exists || cloudChecksum != item.checksum {
-			toPush = append(toPush, item)
+
+	for _, obs := range observations {
+		var checksum string
+		var encrypted []byte
+
+		// Check if we have a cached upload state for this item
+		if cached, exists := syncManifest.GetLocalUpload(obs.ID); exists {
+			// Check if observation changed since we last encrypted it
+			if cached.UpdatedAt.Equal(obs.Core.UpdatedAt) {
+				// Unchanged - use cached checksum
+				checksum = cached.Checksum
+				localItems[obs.ID] = checksum
+
+				// Check if cloud has it with same checksum
+				if cloudChecksum, inCloud := cloudItems[obs.ID]; inCloud && cloudChecksum == checksum {
+					// Already synced, skip
+					continue
+				}
+				// Need to re-encrypt for upload (cloud doesn't have it or has different version)
+			}
+		}
+
+		// Need to encrypt (either no cache, changed, or need to upload)
+		if checksum == "" {
+			var err error
+			encrypted, err = encMgr.EncryptObservation(&obs)
+			if err != nil {
+				log.Printf("[sync] Encrypt error for %s: %v", obs.ID, err)
+				continue
+			}
+			checksum = storage.Checksum(encrypted)[:16]
+			localItems[obs.ID] = checksum
+		} else if encrypted == nil {
+			// Have checksum but need encrypted data for upload
+			var err error
+			encrypted, err = encMgr.EncryptObservation(&obs)
+			if err != nil {
+				log.Printf("[sync] Encrypt error for %s: %v", obs.ID, err)
+				continue
+			}
+			// Recalculate checksum since encryption produces different ciphertext
+			checksum = storage.Checksum(encrypted)[:16]
+			localItems[obs.ID] = checksum
+		}
+
+		// Check if needs push
+		if cloudChecksum, exists := cloudItems[obs.ID]; !exists || cloudChecksum != checksum {
+			toPush = append(toPush, encryptedObsItem{
+				obs:       obs,
+				encrypted: encrypted,
+				checksum:  checksum,
+			})
 		}
 	}
 
@@ -449,11 +480,16 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		}
 		batch := toPush[i:end]
 
-		n, err := m.pushBatchEncrypted(token, batch)
+		n, uploadedItems, err := m.pushBatchEncrypted(token, batch)
 		if err != nil {
 			log.Printf("[sync] Push batch error: %v", err)
 		}
 		pushed += n
+
+		// Cache successful uploads
+		for _, item := range uploadedItems {
+			syncManifest.SetLocalUpload(item.id, item.checksum, item.updatedAt)
+		}
 	}
 
 	// Pull items
@@ -678,7 +714,13 @@ func (m *SyncManager) getCloudManifestCached(token string) (*manifestResponse, e
 	}, nil
 }
 
-func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem) (int, error) {
+type uploadedItem struct {
+	id        string
+	checksum  string
+	updatedAt time.Time
+}
+
+func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem) (int, []uploadedItem, error) {
 	// Prepare items for URL request
 	type itemReq struct {
 		ID        string `json:"id"`
@@ -689,6 +731,7 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 
 	items := make([]itemReq, 0, len(batch))
 	itemData := make(map[string][]byte)
+	itemMeta := make(map[string]encryptedObsItem) // Track metadata for cache
 
 	for _, item := range batch {
 		items = append(items, itemReq{
@@ -698,6 +741,7 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 			Checksum:  item.checksum,
 		})
 		itemData[item.obs.ID] = item.encrypted
+		itemMeta[item.obs.ID] = item
 	}
 
 	// Get upload URLs
@@ -711,13 +755,13 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("get URLs failed %d: %s", resp.StatusCode, string(respBody))
+		return 0, nil, fmt.Errorf("get URLs failed %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var urlResp struct {
@@ -727,11 +771,17 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 		} `json:"items"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
-		return 0, fmt.Errorf("decode upload URLs response: %w", err)
+		return 0, nil, fmt.Errorf("decode upload URLs response: %w", err)
 	}
 
 	// Upload encrypted data to GCS
-	var confirmItems []map[string]interface{}
+	type confirmItem struct {
+		id       string
+		checksum string
+	}
+	var confirmItems []confirmItem
+	var confirmBodies []map[string]interface{}
+
 	for _, urlItem := range urlResp.Items {
 		data := itemData[urlItem.ID]
 		if data == nil {
@@ -748,21 +798,23 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 		uploadResp.Body.Close()
 
 		if uploadResp.StatusCode == http.StatusOK || uploadResp.StatusCode == http.StatusCreated {
-			confirmItems = append(confirmItems, map[string]interface{}{
+			checksum := storage.Checksum(data)[:16]
+			confirmItems = append(confirmItems, confirmItem{id: urlItem.ID, checksum: checksum})
+			confirmBodies = append(confirmBodies, map[string]interface{}{
 				"id":        urlItem.ID,
 				"type":      "memory",
 				"sizeBytes": len(data),
-				"checksum":  storage.Checksum(data)[:16],
+				"checksum":  checksum,
 			})
 		}
 	}
 
 	if len(confirmItems) == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 
 	// Confirm uploads
-	confirmBody := map[string]interface{}{"items": confirmItems}
+	confirmBody := map[string]interface{}{"items": confirmBodies}
 	confirmBytes, _ := json.Marshal(confirmBody)
 
 	confirmReq, _ := http.NewRequest("POST", m.apiBase+"/sync/confirm-uploads", bytes.NewReader(confirmBytes))
@@ -771,12 +823,12 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 
 	confirmResp, err := client.Do(confirmReq)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer confirmResp.Body.Close()
 
 	if confirmResp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("confirm failed")
+		return 0, nil, fmt.Errorf("confirm failed")
 	}
 
 	var confirmResult struct {
@@ -785,17 +837,27 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 		} `json:"items"`
 	}
 	if err := json.NewDecoder(confirmResp.Body).Decode(&confirmResult); err != nil {
-		return 0, fmt.Errorf("decode confirm response: %w", err)
+		return 0, nil, fmt.Errorf("decode confirm response: %w", err)
 	}
 
+	// Build list of successfully uploaded items
+	var uploaded []uploadedItem
 	count := 0
-	for _, item := range confirmResult.Items {
-		if item.Success {
+	for i, result := range confirmResult.Items {
+		if result.Success && i < len(confirmItems) {
 			count++
+			ci := confirmItems[i]
+			if meta, ok := itemMeta[ci.id]; ok {
+				uploaded = append(uploaded, uploadedItem{
+					id:        ci.id,
+					checksum:  ci.checksum,
+					updatedAt: meta.obs.Core.UpdatedAt,
+				})
+			}
 		}
 	}
 
-	return count, nil
+	return count, uploaded, nil
 }
 
 func (m *SyncManager) pullItemEncrypted(token string, id string, encMgr *encryption.Manager) error {

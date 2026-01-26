@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,6 +43,7 @@ type Server struct {
 	obsCache      []storage.Observation
 	obsCacheTime  time.Time
 	obsCacheTTL   time.Duration
+	obsCacheMu    sync.Mutex
 }
 
 // NewServer creates a new daemon server
@@ -74,6 +76,9 @@ func NewServer(port int) *Server {
 
 // getObservations returns cached observations, refreshing if stale
 func (s *Server) getObservations() []storage.Observation {
+	s.obsCacheMu.Lock()
+	defer s.obsCacheMu.Unlock()
+
 	if time.Since(s.obsCacheTime) > s.obsCacheTTL || s.obsCache == nil {
 		fmt.Fprintf(os.Stderr, "Loading observations into cache...\n")
 		start := time.Now()
@@ -86,7 +91,9 @@ func (s *Server) getObservations() []storage.Observation {
 
 // invalidateCache forces a cache refresh on next access
 func (s *Server) invalidateCache() {
+	s.obsCacheMu.Lock()
 	s.obsCacheTime = time.Time{}
+	s.obsCacheMu.Unlock()
 }
 
 // Run starts the server and blocks until shutdown

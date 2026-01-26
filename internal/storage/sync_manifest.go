@@ -10,13 +10,20 @@ import (
 	"github.com/miclip/sinesync/internal/config"
 )
 
+// LocalUploadState tracks what we've uploaded for an item
+type LocalUploadState struct {
+	Checksum  string    `json:"checksum"`  // checksum of encrypted data we uploaded
+	UpdatedAt time.Time `json:"updatedAt"` // observation's UpdatedAt when we encrypted
+}
+
 // SyncManifest tracks which observations are synced to cloud
 type SyncManifest struct {
-	LastSync        time.Time         `json:"lastSync"`
-	Items           map[string]string `json:"items"`           // id -> checksum (current cloud state)
-	SeenIDs         map[string]bool   `json:"seenIds"`         // all IDs ever seen from cloud
-	PendingDeletes  map[string]bool   `json:"pendingDeletes"`  // explicit deletes to sync to cloud
-	ManifestVersion int               `json:"manifestVersion"` // version from server for cache invalidation
+	LastSync        time.Time                   `json:"lastSync"`
+	Items           map[string]string           `json:"items"`           // id -> checksum (current cloud state)
+	SeenIDs         map[string]bool             `json:"seenIds"`         // all IDs ever seen from cloud
+	PendingDeletes  map[string]bool             `json:"pendingDeletes"`  // explicit deletes to sync to cloud
+	ManifestVersion int                         `json:"manifestVersion"` // version from server for cache invalidation
+	LocalUploads    map[string]LocalUploadState `json:"localUploads"`    // id -> our uploaded state
 	mu              sync.RWMutex
 }
 
@@ -50,6 +57,7 @@ func GetSyncManifest() *SyncManifest {
 			Items:          make(map[string]string),
 			SeenIDs:        make(map[string]bool),
 			PendingDeletes: make(map[string]bool),
+			LocalUploads:   make(map[string]LocalUploadState),
 		}
 		manifest.Load()
 	})
@@ -177,6 +185,7 @@ func (m *SyncManifest) RemoveFromSeen(id string) {
 	delete(m.SeenIDs, id)
 	delete(m.Items, id)
 	delete(m.PendingDeletes, id)
+	delete(m.LocalUploads, id)
 }
 
 // MarkPendingDelete marks an item for deletion from cloud on next sync
@@ -208,4 +217,38 @@ func (m *SyncManifest) ClearPendingDelete(id string) {
 	defer m.mu.Unlock()
 
 	delete(m.PendingDeletes, id)
+}
+
+// GetLocalUpload returns the cached upload state for an item
+func (m *SyncManifest) GetLocalUpload(id string) (LocalUploadState, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.LocalUploads == nil {
+		return LocalUploadState{}, false
+	}
+	state, exists := m.LocalUploads[id]
+	return state, exists
+}
+
+// SetLocalUpload stores the upload state after successful upload
+func (m *SyncManifest) SetLocalUpload(id string, checksum string, updatedAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.LocalUploads == nil {
+		m.LocalUploads = make(map[string]LocalUploadState)
+	}
+	m.LocalUploads[id] = LocalUploadState{
+		Checksum:  checksum,
+		UpdatedAt: updatedAt,
+	}
+}
+
+// ClearLocalUpload removes local upload state (e.g., after deletion)
+func (m *SyncManifest) ClearLocalUpload(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.LocalUploads, id)
 }
