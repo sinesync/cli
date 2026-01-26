@@ -33,7 +33,7 @@ coverage/
 *.tfvars
 
 # Go
-sinesync
+/sinesync
 *.exe
 
 # Misc
