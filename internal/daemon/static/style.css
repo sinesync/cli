@@ -51,22 +51,23 @@ body {
 }
 
 .logo {
-    font-size: 1.5rem;
-    font-weight: 600;
     display: flex;
     align-items: center;
-    gap: 0.25rem;
+    gap: 0.75rem;
 }
 
-.sine-wave {
+.logo-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    box-shadow: 0 0 10px var(--accent-cyan), 0 0 20px rgba(0, 212, 255, 0.3);
+}
+
+.brand-name {
+    font-size: 1.5rem;
+    font-weight: 700;
     color: var(--accent-cyan);
-    font-size: 2rem;
-    animation: wave 2s ease-in-out infinite;
-}
-
-@keyframes wave {
-    0%, 100% { transform: translateY(0); }
-    50% { transform: translateY(-4px); }
+    text-shadow: 0 0 8px var(--accent-cyan), 0 0 16px var(--accent-cyan);
 }
 
 .accent {
@@ -700,4 +701,104 @@ body {
     color: var(--text-secondary);
     font-size: 0.875rem;
     margin-left: 1rem;
+}
+
+/* Sync Status Card */
+.sync-status-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.5rem;
+    margin-bottom: 2rem;
+}
+
+.sync-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.sync-icon {
+    font-size: 1.25rem;
+    color: var(--accent-cyan);
+}
+
+.sync-icon.syncing {
+    animation: spin 1s linear infinite;
+}
+
+.sync-icon.error {
+    color: var(--accent-red);
+}
+
+.sync-icon.success {
+    color: var(--accent-green);
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.sync-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+}
+
+.sync-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.25rem 0.5rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 1rem;
+    transition: all 0.2s;
+}
+
+.sync-btn:hover {
+    border-color: var(--accent-cyan);
+    color: var(--accent-cyan);
+}
+
+.sync-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.sync-info {
+    display: flex;
+    gap: 2rem;
+}
+
+.sync-stat {
+    display: flex;
+    flex-direction: column;
+}
+
+.sync-stat-value {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.sync-stat-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.sync-error {
+    margin-top: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(255, 68, 68, 0.1);
+    border: 1px solid var(--accent-red);
+    border-radius: 4px;
+    color: var(--accent-red);
+    font-size: 0.875rem;
+}
+
+.sync-error.hidden {
+    display: none;
 }

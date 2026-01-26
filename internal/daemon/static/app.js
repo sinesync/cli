@@ -613,7 +613,7 @@ function renderObservationDetail(obs) {
     });
 
     document.getElementById('btn-delete').addEventListener('click', async () => {
-        if (confirm('Delete this memory? This cannot be undone.')) {
+        if (confirm('Delete this memory? This will remove it from all synced devices and cannot be undone.')) {
             await fetch(`/api/observations/${obs.id}`, { method: 'DELETE' });
             closeModal();
             loadObservations();

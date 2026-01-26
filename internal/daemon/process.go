@@ -271,7 +271,19 @@ func EnsureRunning() (*PIDInfo, error) {
 		return nil, err
 	}
 
+	// Wait for daemon to become healthy (up to 5 seconds)
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if running, info := IsRunning(); running && info != nil {
+			return info, nil
+		}
+	}
+
+	// Return info even if not fully healthy yet
 	_, info := IsRunning()
+	if info == nil {
+		return nil, fmt.Errorf("daemon started but not responding")
+	}
 	return info, nil
 }
 

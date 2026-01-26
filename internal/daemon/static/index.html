@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>sine~sync Dashboard</title>
+    <link rel="icon" type="image/png" href="icon.png">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,10 +12,10 @@
         <!-- Header with sine wave -->
         <header class="header">
             <div class="header-content">
-                <h1 class="logo">
-                    <span class="sine-wave">~</span>
-                    sine<span class="accent">sync</span>
-                </h1>
+                <div class="logo">
+                    <img src="icon.png" alt="sine~sync" class="logo-icon">
+                    <span class="brand-name">sine<span class="accent">~sync</span></span>
+                </div>
                 <nav class="nav">
                     <button class="nav-btn active" data-view="overview">Overview</button>
                     <button class="nav-btn" data-view="memories">Memories</button>
@@ -50,6 +51,26 @@
                         <div class="stat-value" id="stat-recent">-</div>
                         <div class="stat-label">This Week</div>
                     </div>
+                </div>
+
+                <!-- Cloud Sync Status -->
+                <div class="sync-status-card" id="sync-status-card">
+                    <div class="sync-header">
+                        <span class="sync-icon" id="sync-icon">&#9729;</span>
+                        <span class="sync-title">Cloud Sync</span>
+                        <button class="sync-btn" id="sync-now-btn" title="Sync now">&#8635;</button>
+                    </div>
+                    <div class="sync-info">
+                        <div class="sync-stat">
+                            <span class="sync-stat-value" id="sync-count">-</span>
+                            <span class="sync-stat-label">synced</span>
+                        </div>
+                        <div class="sync-stat">
+                            <span class="sync-stat-value" id="sync-last">-</span>
+                            <span class="sync-stat-label">last sync</span>
+                        </div>
+                    </div>
+                    <div class="sync-error hidden" id="sync-error"></div>
                 </div>
 
                 <div class="charts-grid">
