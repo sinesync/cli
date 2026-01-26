@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -129,9 +130,28 @@ func (m *SyncManager) doSync() {
 
 	pushed, pulled, err := m.sync(token)
 	if err != nil {
-		m.setError(err.Error())
-		log.Printf("[sync] Failed: %v", err)
-		return
+		// Check if it's a 401 error - try to refresh token
+		if isUnauthorizedError(err) {
+			log.Printf("[sync] Token expired, attempting refresh...")
+			newToken, refreshErr := m.refreshAccessToken()
+			if refreshErr != nil {
+				m.setError(fmt.Sprintf("token refresh failed: %v", refreshErr))
+				log.Printf("[sync] Token refresh failed: %v", refreshErr)
+				return
+			}
+
+			// Retry sync with new token
+			pushed, pulled, err = m.sync(newToken)
+			if err != nil {
+				m.setError(err.Error())
+				log.Printf("[sync] Failed after token refresh: %v", err)
+				return
+			}
+		} else {
+			m.setError(err.Error())
+			log.Printf("[sync] Failed: %v", err)
+			return
+		}
 	}
 
 	m.mu.Lock()
@@ -140,6 +160,14 @@ func (m *SyncManager) doSync() {
 	m.mu.Unlock()
 
 	log.Printf("[sync] Complete: pushed=%d, pulled=%d, duration=%v", pushed, pulled, time.Since(start))
+}
+
+func isUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "401") || strings.Contains(errStr, "unauthorized") || strings.Contains(errStr, "Unauthorized")
 }
 
 func (m *SyncManager) setError(err string) {
@@ -182,6 +210,109 @@ func (m *SyncManager) getAuthToken() (string, error) {
 	}
 
 	return "", fmt.Errorf("no token found")
+}
+
+func (m *SyncManager) getRefreshToken() (string, error) {
+	const keyringService = "sinesync"
+
+	// Check keyring first
+	if refreshToken, err := keyring.Get(keyringService, "refreshToken"); err == nil && refreshToken != "" {
+		return refreshToken, nil
+	}
+
+	// Fallback to JSON file
+	authPath := filepath.Join(config.ConfigDir(), "auth.json")
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		return "", fmt.Errorf("no refresh token found")
+	}
+
+	var auth struct {
+		RefreshToken string `json:"refreshToken"`
+	}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return "", err
+	}
+
+	if auth.RefreshToken != "" {
+		return auth.RefreshToken, nil
+	}
+
+	return "", fmt.Errorf("no refresh token found")
+}
+
+func (m *SyncManager) refreshAccessToken() (string, error) {
+	refreshToken, err := m.getRefreshToken()
+	if err != nil {
+		return "", fmt.Errorf("no refresh token: %w", err)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	reqBody, _ := json.Marshal(map[string]string{
+		"refreshToken": refreshToken,
+	})
+
+	req, err := http.NewRequest("POST", m.apiBase+"/auth/refresh", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("refresh failed: %d - %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode refresh response: %w", err)
+	}
+
+	// Store new token in keyring
+	const keyringService = "sinesync"
+	if err := keyring.Set(keyringService, "token", result.Token); err != nil {
+		// Also update auth.json as fallback
+		m.updateStoredToken(result.Token)
+	}
+
+	log.Printf("[sync] Token refreshed successfully")
+	return result.Token, nil
+}
+
+func (m *SyncManager) updateStoredToken(token string) {
+	authPath := filepath.Join(config.ConfigDir(), "auth.json")
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		return
+	}
+
+	var auth map[string]interface{}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return
+	}
+
+	// Update the token (could be "token" or "deviceToken" depending on auth method)
+	if _, ok := auth["deviceToken"]; ok {
+		auth["deviceToken"] = token
+	} else {
+		auth["token"] = token
+	}
+
+	newData, err := json.MarshalIndent(auth, "", "  ")
+	if err != nil {
+		return
+	}
+
+	os.WriteFile(authPath, newData, 0600)
 }
 
 func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
