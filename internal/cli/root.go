@@ -38,7 +38,6 @@ func init() {
 	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(exportCmd)
 	rootCmd.AddCommand(reembedCmd)
-	rootCmd.AddCommand(vaultCmd)
 	rootCmd.AddCommand(dashboardCmd)
 	rootCmd.AddCommand(daemonCmd)
 	rootCmd.AddCommand(debugEmbedCmd)
@@ -237,31 +236,6 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  • Excluded: %v\n", cfg.Sync.ExcludeProjects)
 	}
 
-	// Vaults
-	vaults := cfg.ListVaults()
-	if len(vaults) > 0 {
-		fmt.Printf("\nVaults: %d configured\n", len(vaults))
-		for _, v := range vaults {
-			backendType := "sinesync"
-			if v.Backend != nil {
-				backendType = v.Backend.Type
-			}
-			defaultMark := ""
-			if v.ID == cfg.DefaultVault {
-				defaultMark = " (default)"
-			}
-			fmt.Printf("  • %s [%s]%s\n", v.ID, backendType, defaultMark)
-		}
-	}
-
-	// Routes
-	if len(cfg.Routes) > 0 {
-		fmt.Printf("\nProject routes: %d configured\n", len(cfg.Routes))
-		for project, vault := range cfg.Routes {
-			fmt.Printf("  • %s → %s\n", project, vault)
-		}
-	}
-
 	// Cloud sync
 	authCfg, authErr := loadAuthConfig()
 	if authErr == nil && authCfg != nil && authCfg.Token != "" {
@@ -319,6 +293,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	fmt.Println("Connecting to claude-mem...")
 	adapter, err := adapters.NewClaudeMemAdapter(true)
 	if err != nil || adapter == nil {
 		return fmt.Errorf("failed to connect to claude-mem: %w", err)
@@ -329,24 +304,43 @@ func runImport(cmd *cobra.Command, args []string) error {
 	localStorage := storage.NewLocalStorage()
 
 	// Initialize embedder
+	fmt.Println("Initializing embedding model...")
 	embedder, _ := embeddings.NewProvider()
+	if embedder != nil && embedder.IsReady() {
+		fmt.Println("  Using ONNX model for embeddings")
+	} else {
+		fmt.Println("  Using fallback embeddings (ONNX model not available)")
+	}
 
 	// Import all observations from adapter (returns canonical format)
+	fmt.Println("Loading observations from claude-mem...")
 	observations, err := adapter.Import(ctx, 0)
 	if err != nil {
 		return fmt.Errorf("failed to import observations: %w", err)
 	}
+	total := len(observations)
+	fmt.Printf("Found %d observations to process\n", total)
 
 	imported := 0
-	for _, obs := range observations {
+	skipped := 0
+	filtered := 0
+
+	for i, obs := range observations {
+		// Progress every 100 observations
+		if (i+1)%100 == 0 || i+1 == total {
+			fmt.Printf("\rProcessing: %d/%d (imported: %d, skipped: %d, filtered: %d)", i+1, total, imported, skipped, filtered)
+		}
+
 		// Check project filter
 		if cfg != nil && cfg.Sync != nil && !cfg.ShouldSyncProject(obs.Core.Project) {
+			filtered++
 			continue
 		}
 
 		// Check if already imported (by source adapter + ID)
 		exists, _ := localStorage.ExistsBySource(obs.Source.Adapter, obs.Source.ID)
 		if exists {
+			skipped++
 			continue
 		}
 
@@ -370,9 +364,14 @@ func runImport(cmd *cobra.Command, args []string) error {
 		imported++
 	}
 
-	// Only output if something was imported (avoid noise in hook output)
-	if imported > 0 {
-		fmt.Fprintf(os.Stderr, "sine~sync: Imported %d observations at session end\n", imported)
+	// Final summary
+	fmt.Println() // New line after progress
+	fmt.Println()
+	fmt.Println("Import complete:")
+	fmt.Printf("  Imported: %d\n", imported)
+	fmt.Printf("  Skipped (already exists): %d\n", skipped)
+	if filtered > 0 {
+		fmt.Printf("  Filtered (project rules): %d\n", filtered)
 	}
 
 	return nil

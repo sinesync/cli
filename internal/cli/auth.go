@@ -157,7 +157,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		// New device - need secret key from user
 		fmt.Println()
 		fmt.Println("This is a new device. To decrypt your data, you need your Secret Key.")
-		fmt.Println("You can find it in your Emergency Kit from when you signed up.")
+		fmt.Println("This was shown when you signed up - check your password manager or saved notes.")
 		fmt.Println()
 
 		secretKey, err := promptSecretKey()
@@ -645,9 +645,9 @@ func removeAuthConfig() error {
 func displayEmergencyKit(email, secretKey string) {
 	fmt.Println()
 	fmt.Println("╔═══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║                        EMERGENCY KIT                              ║")
+	fmt.Println("║                     SAVE YOUR SECRET KEY                          ║")
 	fmt.Println("║                                                                   ║")
-	fmt.Println("║  SAVE THIS INFORMATION - YOU WILL ONLY SEE IT ONCE!              ║")
+	fmt.Println("║  YOU WILL ONLY SEE THIS ONCE!                                     ║")
 	fmt.Println("╠═══════════════════════════════════════════════════════════════════╣")
 	fmt.Printf("║  Email: %-57s║\n", email)
 	fmt.Println("║                                                                   ║")
@@ -657,14 +657,14 @@ func displayEmergencyKit(email, secretKey string) {
 	fmt.Println("╠═══════════════════════════════════════════════════════════════════╣")
 	fmt.Println("║  You need your Secret Key + Password to:                          ║")
 	fmt.Println("║    - Sign in on a new device                                      ║")
-	fmt.Println("║    - Recover your data if you lose access                         ║")
+	fmt.Println("║    - Decrypt your data                                            ║")
 	fmt.Println("║                                                                   ║")
 	fmt.Println("║  Store it safely:                                                 ║")
-	fmt.Println("║    - Print this page and keep in a safe place                     ║")
 	fmt.Println("║    - Save to a password manager                                   ║")
+	fmt.Println("║    - Print and keep in a safe place                               ║")
 	fmt.Println("║    - Store in an encrypted notes app                              ║")
 	fmt.Println("║                                                                   ║")
-	fmt.Println("║  WITHOUT YOUR SECRET KEY, YOUR DATA CANNOT BE RECOVERED!          ║")
+	fmt.Println("║  WITHOUT YOUR SECRET KEY, YOUR DATA CANNOT BE DECRYPTED!          ║")
 	fmt.Println("╚═══════════════════════════════════════════════════════════════════╝")
 	fmt.Println()
 }
