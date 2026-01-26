@@ -1,427 +1,787 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/miclip/sinesync/internal/config"
+	"github.com/miclip/sinesync/internal/crypto"
+	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/spf13/cobra"
+	kr "github.com/zalando/go-keyring"
 )
+
+// Vault types matching backend
+type Vault struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	OwnerID   string `json:"ownerId"`
+	IsDefault bool   `json:"isDefault"`
+	CreatedAt string `json:"createdAt"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+type VaultWithRole struct {
+	Vault
+	Role        string `json:"role"`
+	MemberCount int    `json:"memberCount"`
+}
+
+type VaultProject struct {
+	ID          string `json:"id"`
+	VaultID     string `json:"vaultId"`
+	ProjectName string `json:"projectName"`
+	CreatedAt   string `json:"createdAt"`
+}
+
+type VaultMember struct {
+	ID                string `json:"id"`
+	VaultID           string `json:"vaultId"`
+	UserID            string `json:"userId"`
+	EncryptedVaultKey string `json:"encryptedVaultKey"`
+	Role              string `json:"role"`
+	JoinedAt          string `json:"joinedAt"`
+}
+
+// Local vault config stored on device
+type LocalVaultConfig struct {
+	Vaults []LocalVault `json:"vaults"`
+}
+
+type LocalVault struct {
+	VaultID           string   `json:"vaultId"`
+	Name              string   `json:"name"`
+	EncryptedVaultKey string   `json:"encryptedVaultKey"`
+	Projects          []string `json:"projects"`
+	IsDefault         bool     `json:"isDefault"`
+}
 
 var vaultCmd = &cobra.Command{
 	Use:   "vault",
-	Short: "Manage sync vaults (like 1Password vaults)",
-	Long: `Vaults are encrypted storage destinations for your memories.
+	Short: "Manage vaults",
+	Long: `Vaults are encrypted containers for your AI memories.
 
-By default, you have a "personal" vault. You can create additional vaults
-for teams or projects, each with its own encryption key and storage backend.
+By default, you have a "Personal" vault. You can create additional vaults
+and assign projects to them. Shared vaults allow team collaboration.
 
 Examples:
-  sinesync vault list                    # List all vaults
-  sinesync vault create team-acme        # Create a new vault
-  sinesync vault route conductor team-acme  # Route a project to vault
-  sinesync vault set-backend team-acme s3   # Use S3 for storage`,
-}
-
-func init() {
-	vaultCmd.AddCommand(vaultListCmd)
-	vaultCmd.AddCommand(vaultCreateCmd)
-	vaultCmd.AddCommand(vaultDeleteCmd)
-	vaultCmd.AddCommand(vaultRouteCmd)
-	vaultCmd.AddCommand(vaultUnrouteCmd)
-	vaultCmd.AddCommand(vaultRoutesCmd)
-	vaultCmd.AddCommand(vaultSetBackendCmd)
-	vaultCmd.AddCommand(vaultInfoCmd)
+  sinesync vault list                          # List all vaults
+  sinesync vault create "Work Projects"        # Create a new vault
+  sinesync vault add-project <id> myproject    # Add project to vault
+  sinesync vault sync                          # Sync vault keys from server`,
 }
 
 var vaultListCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List all vaults",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-
-		fmt.Println("\nVaults")
-		fmt.Println("─────────────────────────────────────────────────────")
-
-		if len(cfg.Vaults) == 0 {
-			fmt.Println("\n  No vaults configured")
-			fmt.Println()
-			return nil
-		}
-
-		fmt.Printf("\n  %-15s %-10s %-12s %s\n", "ID", "Type", "Backend", "Routes")
-		fmt.Printf("  %s %s %s %s\n",
-			strings.Repeat("-", 15),
-			strings.Repeat("-", 10),
-			strings.Repeat("-", 12),
-			strings.Repeat("-", 20))
-
-		for _, vault := range cfg.Vaults {
-			// Count routes to this vault
-			routeCount := 0
-			for _, v := range cfg.Routes {
-				if v == vault.ID {
-					routeCount++
-				}
-			}
-
-			backendType := "sinesync"
-			if vault.Backend != nil {
-				backendType = vault.Backend.Type
-			}
-
-			defaultMark := ""
-			if vault.ID == cfg.DefaultVault {
-				defaultMark = " (default)"
-			}
-
-			fmt.Printf("  %-15s %-10s %-12s %d projects%s\n",
-				vault.ID, vault.Type, backendType, routeCount, defaultMark)
-		}
-
-		fmt.Println()
-		return nil
-	},
+	Short: "List your vaults",
+	RunE:  runVaultList,
 }
 
 var vaultCreateCmd = &cobra.Command{
-	Use:   "create <vault-id>",
+	Use:   "create <name>",
 	Short: "Create a new vault",
 	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		vaultID := args[0]
-		vaultType, _ := cmd.Flags().GetString("type")
-		backendType, _ := cmd.Flags().GetString("backend")
-
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-
-		// Check if vault already exists
-		if cfg.GetVault(vaultID) != nil {
-			return fmt.Errorf("vault %q already exists", vaultID)
-		}
-
-		vault := &config.Vault{
-			ID:   vaultID,
-			Name: vaultID,
-			Type: vaultType,
-			Backend: &config.Backend{
-				Type: backendType,
-			},
-		}
-
-		cfg.AddVault(vault)
-
-		if err := config.Save(cfg); err != nil {
-			return err
-		}
-
-		fmt.Printf("✓ Created vault %q\n", vaultID)
-		fmt.Println()
-		fmt.Println("Next steps:")
-		fmt.Printf("  1. Generate encryption key: sinesync vault keygen %s\n", vaultID)
-		if backendType != "sinesync" {
-			fmt.Printf("  2. Configure backend: sinesync vault set-backend %s %s --bucket <bucket>\n", vaultID, backendType)
-		}
-		fmt.Printf("  3. Route projects: sinesync vault route <project> %s\n", vaultID)
-
-		return nil
-	},
-}
-
-func init() {
-	vaultCreateCmd.Flags().String("type", "personal", "Vault type: personal or shared")
-	vaultCreateCmd.Flags().String("backend", "sinesync", "Backend type: sinesync, s3, azure, local")
+	RunE:  runVaultCreate,
 }
 
 var vaultDeleteCmd = &cobra.Command{
 	Use:   "delete <vault-id>",
 	Short: "Delete a vault",
 	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		vaultID := args[0]
-		force, _ := cmd.Flags().GetBool("force")
-
-		if vaultID == "personal" && !force {
-			return fmt.Errorf("cannot delete personal vault (use --force to override)")
-		}
-
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-
-		if cfg.GetVault(vaultID) == nil {
-			return fmt.Errorf("vault %q not found", vaultID)
-		}
-
-		cfg.RemoveVault(vaultID)
-
-		if err := config.Save(cfg); err != nil {
-			return err
-		}
-
-		fmt.Printf("✓ Deleted vault %q\n", vaultID)
-		return nil
-	},
+	RunE:  runVaultDelete,
 }
 
-func init() {
-	vaultDeleteCmd.Flags().Bool("force", false, "Force deletion")
+var vaultProjectsCmd = &cobra.Command{
+	Use:   "projects <vault-id>",
+	Short: "List projects in a vault",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runVaultProjects,
 }
 
-var vaultRouteCmd = &cobra.Command{
-	Use:   "route <project> <vault-id>",
-	Short: "Route a project to a specific vault",
+var vaultAddProjectCmd = &cobra.Command{
+	Use:   "add-project <vault-id> <project-name>",
+	Short: "Add a project to a vault",
 	Args:  cobra.ExactArgs(2),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		project := args[0]
-		vaultID := args[1]
-
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-
-		if cfg.GetVault(vaultID) == nil {
-			return fmt.Errorf("vault %q not found", vaultID)
-		}
-
-		cfg.SetRoute(project, vaultID)
-
-		if err := config.Save(cfg); err != nil {
-			return err
-		}
-
-		fmt.Printf("✓ Project %q will sync to vault %q\n", project, vaultID)
-		return nil
-	},
+	RunE:  runVaultAddProject,
 }
 
-var vaultUnrouteCmd = &cobra.Command{
-	Use:   "unroute <project>",
-	Short: "Remove project routing (use default vault)",
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		project := args[0]
-
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-
-		cfg.ClearRoute(project)
-
-		if err := config.Save(cfg); err != nil {
-			return err
-		}
-
-		fmt.Printf("✓ Project %q will now use default vault (%s)\n", project, cfg.DefaultVault)
-		return nil
-	},
+var vaultRemoveProjectCmd = &cobra.Command{
+	Use:   "remove-project <vault-id> <project-name>",
+	Short: "Remove a project from a vault",
+	Args:  cobra.ExactArgs(2),
+	RunE:  runVaultRemoveProject,
 }
 
-var vaultRoutesCmd = &cobra.Command{
-	Use:   "routes",
-	Short: "Show all project-to-vault routes",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-
-		fmt.Println("\nProject Routes")
-		fmt.Println("─────────────────────────────────────────────────────")
-
-		if len(cfg.Routes) == 0 {
-			fmt.Printf("\n  No explicit routes. All projects → %s (default)\n", cfg.DefaultVault)
-			fmt.Println()
-			return nil
-		}
-
-		fmt.Printf("\n  %-30s → %s\n", "Project", "Vault")
-		fmt.Printf("  %s   %s\n",
-			strings.Repeat("-", 30),
-			strings.Repeat("-", 15))
-
-		for project, vault := range cfg.Routes {
-			fmt.Printf("  %-30s → %s\n", project, vault)
-		}
-
-		fmt.Printf("\n  (unrouted projects → %s)\n", cfg.DefaultVault)
-		fmt.Println()
-		return nil
-	},
-}
-
-var vaultSetBackendCmd = &cobra.Command{
-	Use:   "set-backend <vault-id> <backend-type>",
-	Short: "Configure storage backend for a vault",
-	Long: `Configure where a vault stores its encrypted data.
-
-Backend types:
-  sinesync  - Managed sinesync cloud (default)
-  s3        - S3-compatible (AWS, MinIO, Backblaze B2, R2)
-  azure     - Azure Blob Storage
-  local     - Local filesystem (for testing or NAS)
-
-Examples:
-  # Use AWS S3
-  sinesync vault set-backend team-acme s3 \
-    --bucket my-bucket \
-    --region us-west-2
-
-  # Use MinIO
-  sinesync vault set-backend team-acme s3 \
-    --endpoint http://minio.local:9000 \
-    --bucket memories \
-    --access-key mykey \
-    --secret-key mysecret
-
-  # Use local filesystem
-  sinesync vault set-backend test local --path /mnt/nas/sinesync`,
-	Args: cobra.ExactArgs(2),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		vaultID := args[0]
-		backendType := args[1]
-
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
-
-		vault := cfg.GetVault(vaultID)
-		if vault == nil {
-			return fmt.Errorf("vault %q not found", vaultID)
-		}
-
-		backend := &config.Backend{Type: backendType}
-
-		// S3 options
-		if bucket, _ := cmd.Flags().GetString("bucket"); bucket != "" {
-			backend.Bucket = bucket
-		}
-		if region, _ := cmd.Flags().GetString("region"); region != "" {
-			backend.Region = region
-		}
-		if endpoint, _ := cmd.Flags().GetString("endpoint"); endpoint != "" {
-			backend.Endpoint = endpoint
-		}
-		if accessKey, _ := cmd.Flags().GetString("access-key"); accessKey != "" {
-			backend.AccessKey = accessKey
-		}
-		if secretKey, _ := cmd.Flags().GetString("secret-key"); secretKey != "" {
-			backend.SecretKey = secretKey
-		}
-
-		// Azure options
-		if container, _ := cmd.Flags().GetString("container"); container != "" {
-			backend.Container = container
-		}
-		if accountName, _ := cmd.Flags().GetString("account-name"); accountName != "" {
-			backend.AccountName = accountName
-		}
-
-		// Local options
-		if path, _ := cmd.Flags().GetString("path"); path != "" {
-			backend.Path = path
-		}
-
-		vault.Backend = backend
-
-		if err := config.Save(cfg); err != nil {
-			return err
-		}
-
-		fmt.Printf("✓ Vault %q now uses %s backend\n", vaultID, backendType)
-		return nil
-	},
+var vaultSyncCmd = &cobra.Command{
+	Use:   "sync",
+	Short: "Sync vault keys from server",
+	Long:  `Fetch and store encrypted vault keys from the server.`,
+	RunE:  runVaultSync,
 }
 
 func init() {
-	// S3 flags
-	vaultSetBackendCmd.Flags().String("bucket", "", "S3 bucket name")
-	vaultSetBackendCmd.Flags().String("region", "", "AWS region")
-	vaultSetBackendCmd.Flags().String("endpoint", "", "Custom S3 endpoint (for MinIO, R2, etc.)")
-	vaultSetBackendCmd.Flags().String("access-key", "", "Access key ID")
-	vaultSetBackendCmd.Flags().String("secret-key", "", "Secret access key")
-
-	// Azure flags
-	vaultSetBackendCmd.Flags().String("container", "", "Azure container name")
-	vaultSetBackendCmd.Flags().String("account-name", "", "Azure account name")
-
-	// Local flags
-	vaultSetBackendCmd.Flags().String("path", "", "Local filesystem path")
+	rootCmd.AddCommand(vaultCmd)
+	vaultCmd.AddCommand(vaultListCmd)
+	vaultCmd.AddCommand(vaultCreateCmd)
+	vaultCmd.AddCommand(vaultDeleteCmd)
+	vaultCmd.AddCommand(vaultProjectsCmd)
+	vaultCmd.AddCommand(vaultAddProjectCmd)
+	vaultCmd.AddCommand(vaultRemoveProjectCmd)
+	vaultCmd.AddCommand(vaultSyncCmd)
 }
 
-var vaultInfoCmd = &cobra.Command{
-	Use:   "info <vault-id>",
-	Short: "Show vault details",
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		vaultID := args[0]
+func runVaultList(cmd *cobra.Command, args []string) error {
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
 
-		cfg, err := config.Load()
-		if err != nil {
-			return err
-		}
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
 
-		vault := cfg.GetVault(vaultID)
-		if vault == nil {
-			return fmt.Errorf("vault %q not found", vaultID)
-		}
+	req, err := http.NewRequest("GET", apiBase+"/vaults", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 
-		fmt.Printf("\nVault: %s\n", vault.ID)
-		fmt.Println("─────────────────────────────────────────────────────")
-		fmt.Printf("  Name:     %s\n", vault.Name)
-		fmt.Printf("  Type:     %s\n", vault.Type)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch vaults: %w", err)
+	}
+	defer resp.Body.Close()
 
-		if vault.Backend != nil {
-			fmt.Printf("\n  Backend:  %s\n", vault.Backend.Type)
-			switch vault.Backend.Type {
-			case "s3":
-				if vault.Backend.Endpoint != "" {
-					fmt.Printf("  Endpoint: %s\n", vault.Backend.Endpoint)
-				}
-				fmt.Printf("  Bucket:   %s\n", vault.Backend.Bucket)
-				if vault.Backend.Region != "" {
-					fmt.Printf("  Region:   %s\n", vault.Backend.Region)
-				}
-			case "azure":
-				fmt.Printf("  Container: %s\n", vault.Backend.Container)
-				fmt.Printf("  Account:   %s\n", vault.Backend.AccountName)
-			case "local":
-				fmt.Printf("  Path:     %s\n", vault.Backend.Path)
-			}
-		}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(body))
+	}
 
-		if vault.TeamID != "" {
-			fmt.Printf("\n  Team:     %s\n", vault.TeamName)
-			if len(vault.Members) > 0 {
-				fmt.Printf("  Members:  %d\n", len(vault.Members))
-			}
-		}
+	var result struct {
+		Vaults []VaultWithRole `json:"vaults"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
 
-		// Show routes to this vault
-		routedProjects := []string{}
-		for project, v := range cfg.Routes {
-			if v == vaultID {
-				routedProjects = append(routedProjects, project)
-			}
-		}
-		if len(routedProjects) > 0 {
-			fmt.Printf("\n  Routed projects:\n")
-			for _, p := range routedProjects {
-				fmt.Printf("    • %s\n", p)
-			}
-		}
-
-		fmt.Println()
+	if len(result.Vaults) == 0 {
+		fmt.Println("No vaults found.")
 		return nil
-	},
+	}
+
+	fmt.Println("Your vaults:")
+	fmt.Println()
+	for _, v := range result.Vaults {
+		defaultMarker := ""
+		if v.IsDefault {
+			defaultMarker = " (default)"
+		}
+		fmt.Printf("  %s%s\n", v.Name, defaultMarker)
+		fmt.Printf("    ID: %s\n", v.ID)
+		fmt.Printf("    Role: %s\n", v.Role)
+		fmt.Printf("    Members: %d\n", v.MemberCount)
+		fmt.Println()
+	}
+
+	return nil
+}
+
+func runVaultCreate(cmd *cobra.Command, args []string) error {
+	name := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Create vault on server
+	body, err := json.Marshal(map[string]string{"name": name})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	req, err := http.NewRequest("POST", apiBase+"/vaults", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create vault: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(respBody))
+	}
+
+	var vault Vault
+	if err := json.NewDecoder(resp.Body).Decode(&vault); err != nil {
+		return err
+	}
+
+	fmt.Printf("✓ Created vault: %s\n", vault.Name)
+	fmt.Printf("  ID: %s\n", vault.ID)
+
+	// Generate vault key and add self as member
+	fmt.Println("Setting up encryption...")
+	if err := setupVaultKey(token, vault.ID, vault.Name); err != nil {
+		return fmt.Errorf("failed to setup vault key: %w", err)
+	}
+
+	fmt.Println("✓ Vault ready to use")
+	return nil
+}
+
+func runVaultDelete(cmd *cobra.Command, args []string) error {
+	vaultID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	// Confirm deletion
+	fmt.Printf("Are you sure you want to delete vault %s? This cannot be undone.\n", vaultID)
+	fmt.Print("Type 'yes' to confirm: ")
+	reader := bufio.NewReader(os.Stdin)
+	confirm, _ := reader.ReadString('\n')
+	if strings.TrimSpace(confirm) != "yes" {
+		fmt.Println("Cancelled.")
+		return nil
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("DELETE", apiBase+"/vaults/"+vaultID, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete vault: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(body))
+	}
+
+	// Remove from local config
+	removeLocalVault(vaultID)
+
+	fmt.Println("✓ Vault deleted")
+	return nil
+}
+
+func runVaultProjects(cmd *cobra.Command, args []string) error {
+	vaultID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("GET", apiBase+"/vaults/"+vaultID+"/projects", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch projects: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(body))
+	}
+
+	var result struct {
+		Projects []VaultProject `json:"projects"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	if len(result.Projects) == 0 {
+		fmt.Println("No projects in this vault.")
+		return nil
+	}
+
+	fmt.Println("Projects in vault:")
+	for _, p := range result.Projects {
+		fmt.Printf("  - %s\n", p.ProjectName)
+	}
+
+	return nil
+}
+
+func runVaultAddProject(cmd *cobra.Command, args []string) error {
+	vaultID := args[0]
+	projectName := args[1]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	body, err := json.Marshal(map[string]string{"projectName": projectName})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	req, err := http.NewRequest("POST", apiBase+"/vaults/"+vaultID+"/projects", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to add project: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(respBody))
+	}
+
+	// Update local config
+	addProjectToLocalVault(vaultID, projectName)
+
+	fmt.Printf("✓ Added project '%s' to vault\n", projectName)
+	return nil
+}
+
+func runVaultRemoveProject(cmd *cobra.Command, args []string) error {
+	vaultID := args[0]
+	projectName := args[1]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("DELETE", apiBase+"/vaults/"+vaultID+"/projects/"+url.PathEscape(projectName), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to remove project: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(body))
+	}
+
+	// Update local config
+	removeProjectFromLocalVault(vaultID, projectName)
+
+	fmt.Printf("✓ Removed project '%s' from vault\n", projectName)
+	return nil
+}
+
+func runVaultSync(cmd *cobra.Command, args []string) error {
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	fmt.Println("Syncing vault keys...")
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Get all vaults
+	req, err := http.NewRequest("GET", apiBase+"/vaults", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch vaults: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(body))
+	}
+
+	var result struct {
+		Vaults []VaultWithRole `json:"vaults"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	// For each vault, get the encrypted key and projects
+	localConfig := LocalVaultConfig{Vaults: make([]LocalVault, 0)}
+
+	for _, v := range result.Vaults {
+		// Get encrypted vault key
+		keyReq, err := http.NewRequest("GET", apiBase+"/vaults/"+v.ID+"/key", nil)
+		if err != nil {
+			fmt.Printf("  Warning: failed to create key request for vault %s: %v\n", v.Name, err)
+			continue
+		}
+		keyReq.Header.Set("Authorization", "Bearer "+token)
+
+		keyResp, err := client.Do(keyReq)
+		if err != nil {
+			fmt.Printf("  Warning: failed to get key for vault %s: %v\n", v.Name, err)
+			continue
+		}
+
+		var keyResult struct {
+			EncryptedVaultKey string `json:"encryptedVaultKey"`
+		}
+		if keyResp.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(keyResp.Body).Decode(&keyResult); err != nil {
+				fmt.Printf("  Warning: failed to decode key response for vault %s: %v\n", v.Name, err)
+			}
+		} else {
+			fmt.Printf("  Warning: key fetch returned status %d for vault %s\n", keyResp.StatusCode, v.Name)
+		}
+		keyResp.Body.Close()
+
+		// Get projects
+		projReq, err := http.NewRequest("GET", apiBase+"/vaults/"+v.ID+"/projects", nil)
+		var projects []string
+		if err == nil {
+			projReq.Header.Set("Authorization", "Bearer "+token)
+			projResp, err := client.Do(projReq)
+			if err == nil && projResp.StatusCode == http.StatusOK {
+				var projResult struct {
+					Projects []VaultProject `json:"projects"`
+				}
+				if err := json.NewDecoder(projResp.Body).Decode(&projResult); err == nil {
+					for _, p := range projResult.Projects {
+						projects = append(projects, p.ProjectName)
+					}
+				}
+				projResp.Body.Close()
+			} else if projResp != nil {
+				projResp.Body.Close()
+			}
+		}
+
+		localConfig.Vaults = append(localConfig.Vaults, LocalVault{
+			VaultID:           v.ID,
+			Name:              v.Name,
+			EncryptedVaultKey: keyResult.EncryptedVaultKey,
+			Projects:          projects,
+			IsDefault:         v.IsDefault,
+		})
+
+		fmt.Printf("  ✓ %s (%d projects)\n", v.Name, len(projects))
+	}
+
+	// Save local config
+	if err := saveLocalVaultConfig(&localConfig); err != nil {
+		return fmt.Errorf("failed to save vault config: %w", err)
+	}
+
+	fmt.Printf("\n✓ Synced %d vaults\n", len(localConfig.Vaults))
+	return nil
+}
+
+// Helper functions
+
+func getAuthTokenForVault() (string, error) {
+	// Check keyring
+	if token, err := kr.Get(keyringService, "deviceToken"); err == nil && token != "" {
+		return token, nil
+	}
+	if token, err := kr.Get(keyringService, "token"); err == nil && token != "" {
+		return token, nil
+	}
+
+	// Fallback to file
+	authCfg, err := loadAuthConfig()
+	if err != nil {
+		return "", err
+	}
+	if authCfg.DeviceToken != "" {
+		return authCfg.DeviceToken, nil
+	}
+	if authCfg.Token != "" {
+		return authCfg.Token, nil
+	}
+
+	return "", fmt.Errorf("no auth token found")
+}
+
+func setupVaultKey(token, vaultID, vaultName string) error {
+	// Generate a new vault key (256-bit)
+	vaultKey, err := crypto.GenerateKey(32)
+	if err != nil {
+		return fmt.Errorf("failed to generate vault key: %w", err)
+	}
+
+	// Encrypt vault key with user's derived key
+	encMgr := encryption.GetManager()
+	if !encMgr.HasKey() {
+		return fmt.Errorf("encryption key not available")
+	}
+
+	encryptedVaultKey, err := encMgr.EncryptVaultKey(vaultKey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt vault key: %w", err)
+	}
+
+	// Add self as member with encrypted key
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	body, err := json.Marshal(map[string]string{
+		"encryptedVaultKey": encryptedVaultKey,
+		"role":              "owner",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	req, err := http.NewRequest("POST", apiBase+"/vaults/"+vaultID+"/members", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to add member: %s", string(respBody))
+	}
+
+	// Store locally with vault name
+	addLocalVault(vaultID, vaultName, encryptedVaultKey, false)
+
+	return nil
+}
+
+func localVaultConfigPath() string {
+	return filepath.Join(config.ConfigDir(), "vaults.json")
+}
+
+func loadLocalVaultConfig() (*LocalVaultConfig, error) {
+	data, err := os.ReadFile(localVaultConfigPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &LocalVaultConfig{Vaults: make([]LocalVault, 0)}, nil
+		}
+		return nil, err
+	}
+
+	var cfg LocalVaultConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}
+
+func saveLocalVaultConfig(cfg *LocalVaultConfig) error {
+	if err := os.MkdirAll(config.ConfigDir(), 0700); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(localVaultConfigPath(), data, 0600)
+}
+
+func addLocalVault(vaultID, name, encryptedKey string, isDefault bool) {
+	cfg, _ := loadLocalVaultConfig()
+	if cfg == nil {
+		cfg = &LocalVaultConfig{Vaults: make([]LocalVault, 0)}
+	}
+
+	// Check if already exists
+	for i, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			cfg.Vaults[i].EncryptedVaultKey = encryptedKey
+			if name != "" {
+				cfg.Vaults[i].Name = name
+			}
+			saveLocalVaultConfig(cfg)
+			return
+		}
+	}
+
+	cfg.Vaults = append(cfg.Vaults, LocalVault{
+		VaultID:           vaultID,
+		Name:              name,
+		EncryptedVaultKey: encryptedKey,
+		Projects:          make([]string, 0),
+		IsDefault:         isDefault,
+	})
+	saveLocalVaultConfig(cfg)
+}
+
+func removeLocalVault(vaultID string) {
+	cfg, _ := loadLocalVaultConfig()
+	if cfg == nil {
+		return
+	}
+
+	newVaults := make([]LocalVault, 0)
+	for _, v := range cfg.Vaults {
+		if v.VaultID != vaultID {
+			newVaults = append(newVaults, v)
+		}
+	}
+	cfg.Vaults = newVaults
+	saveLocalVaultConfig(cfg)
+}
+
+func addProjectToLocalVault(vaultID, projectName string) {
+	cfg, _ := loadLocalVaultConfig()
+	if cfg == nil {
+		return
+	}
+
+	for i, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			// Check if already exists
+			for _, p := range v.Projects {
+				if p == projectName {
+					return
+				}
+			}
+			cfg.Vaults[i].Projects = append(cfg.Vaults[i].Projects, projectName)
+			saveLocalVaultConfig(cfg)
+			return
+		}
+	}
+}
+
+func removeProjectFromLocalVault(vaultID, projectName string) {
+	cfg, _ := loadLocalVaultConfig()
+	if cfg == nil {
+		return
+	}
+
+	for i, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			newProjects := make([]string, 0)
+			for _, p := range v.Projects {
+				if p != projectName {
+					newProjects = append(newProjects, p)
+				}
+			}
+			cfg.Vaults[i].Projects = newProjects
+			saveLocalVaultConfig(cfg)
+			return
+		}
+	}
+}
+
+// GetVaultForProject returns the vault ID for a given project
+func GetVaultForProject(projectName string) (string, error) {
+	cfg, err := loadLocalVaultConfig()
+	if err != nil {
+		return "", err
+	}
+
+	// Check if project is explicitly assigned to a vault
+	for _, v := range cfg.Vaults {
+		for _, p := range v.Projects {
+			if p == projectName {
+				return v.VaultID, nil
+			}
+		}
+	}
+
+	// Return default vault
+	for _, v := range cfg.Vaults {
+		if v.IsDefault {
+			return v.VaultID, nil
+		}
+	}
+
+	// No default vault found
+	return "", nil
+}
+
+// GetVaultKey returns the decrypted vault key for a given vault ID
+func GetVaultKey(vaultID string) ([]byte, error) {
+	cfg, err := loadLocalVaultConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			if v.EncryptedVaultKey == "" {
+				return nil, fmt.Errorf("no vault key found")
+			}
+
+			encMgr := encryption.GetManager()
+			return encMgr.DecryptVaultKey(v.EncryptedVaultKey)
+		}
+	}
+
+	return nil, fmt.Errorf("vault not found: %s", vaultID)
+}
+
+// GetDefaultVaultID returns the default vault ID
+func GetDefaultVaultID() (string, error) {
+	cfg, err := loadLocalVaultConfig()
+	if err != nil {
+		return "", err
+	}
+
+	for _, v := range cfg.Vaults {
+		if v.IsDefault {
+			return v.VaultID, nil
+		}
+	}
+
+	return "", fmt.Errorf("no default vault configured")
 }

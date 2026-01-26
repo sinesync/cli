@@ -132,9 +132,9 @@ func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]stor
 	for rows.Next() {
 		var (
 			id                                               int64
-			sdkSessionID                                     string
-			project, obsType, title                          string
-			subtitle, narrative                              sql.NullString
+			sdkSessionID                                     sql.NullString
+			project, obsType                                 sql.NullString
+			title, subtitle, narrative                       sql.NullString
 			factsJSON, conceptsJSON                          sql.NullString
 			filesReadJSON, filesModifiedJSON                 sql.NullString
 			createdAt                                        string
@@ -148,6 +148,11 @@ func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]stor
 			&createdAt, &createdAtEpoch,
 		)
 		if err != nil {
+			continue
+		}
+
+		// Skip observations with no title (can't be meaningfully indexed)
+		if !title.Valid || title.String == "" {
 			continue
 		}
 
@@ -172,11 +177,11 @@ func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]stor
 		obs := storage.Observation{
 			ID: uuid.New().String(),
 			Core: storage.Core{
-				Title:     title,
+				Title:     title.String,
 				Summary:   subtitle.String,
 				Content:   narrative.String,
-				Type:      obsType,
-				Project:   project,
+				Type:      obsType.String,
+				Project:   project.String,
 				CreatedAt: parsedTime,
 				UpdatedAt: time.Now(),
 			},
@@ -198,7 +203,7 @@ func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]stor
 		// Preserve claude-mem specific data for round-trip
 		obs.SetExtension(ClaudeMemAdapterName, ClaudeMemExtension{
 			Narrative:    narrative.String,
-			SDKSessionID: sdkSessionID,
+			SDKSessionID: sdkSessionID.String,
 			Subtitle:     subtitle.String,
 		})
 

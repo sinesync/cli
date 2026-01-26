@@ -331,3 +331,43 @@ func HasSaltInKeychain() bool {
 	salt, err := keychain.GetUserSalt()
 	return err == nil && len(salt) > 0
 }
+
+// AAD for vault key encryption
+const AADVaultKey = "sinesync-vault-key-v1"
+
+// EncryptVaultKey encrypts a vault key with the user's derived key
+// Returns base64-encoded encrypted vault key
+func (m *Manager) EncryptVaultKey(vaultKey []byte) (string, error) {
+	key, err := m.GetKey()
+	if err != nil {
+		return "", err
+	}
+
+	encrypted, err := crypto.Encrypt(vaultKey, key, AADVaultKey)
+	if err != nil {
+		return "", fmt.Errorf("encrypt vault key: %w", err)
+	}
+
+	return crypto.EncodeBase64(encrypted), nil
+}
+
+// DecryptVaultKey decrypts a vault key using the user's derived key
+// Takes base64-encoded encrypted vault key, returns raw vault key bytes
+func (m *Manager) DecryptVaultKey(encryptedVaultKey string) ([]byte, error) {
+	key, err := m.GetKey()
+	if err != nil {
+		return nil, err
+	}
+
+	encrypted, err := crypto.DecodeBase64(encryptedVaultKey)
+	if err != nil {
+		return nil, fmt.Errorf("decode vault key: %w", err)
+	}
+
+	vaultKey, err := crypto.Decrypt(encrypted, key, AADVaultKey)
+	if err != nil {
+		return nil, ErrDecryptFailed
+	}
+
+	return vaultKey, nil
+}

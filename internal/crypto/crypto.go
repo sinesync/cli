@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"io"
 
@@ -256,4 +257,23 @@ func NormalizeSecretKey(key string) string {
 		result += string(c)
 	}
 	return result
+}
+
+// EncodeBase64 encodes bytes to standard base64 string
+func EncodeBase64(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+// DecodeBase64 decodes a standard base64 string to bytes
+func DecodeBase64(data string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(data)
+}
+
+// GenerateKey generates a random key of the specified length
+func GenerateKey(length int) ([]byte, error) {
+	key := make([]byte, length)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, err
+	}
+	return key, nil
 }

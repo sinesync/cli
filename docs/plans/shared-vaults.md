@@ -1,8 +1,36 @@
-# Shared Vaults Plan
+# Vaults Plan
 
 ## Overview
 
+**Core principle: Everything is a vault.**
+
+Every user's data lives in vaults from day one. A vault is simply an encrypted container with one or more members. "Personal" storage is just a vault with one member. This architecture means:
+
+- Sharing later = add member to existing vault (no re-encryption needed)
+- Consistent encryption model throughout
+- Users can organize projects across multiple vaults
+- Corporate/team tiers are the same model, just different provisioning
+
 Shared vaults enable teams to sync AI memories (context, decisions, bugs, learnings) for collaborative projects. Data remains end-to-end encrypted using a vault key that's securely shared via a two-channel invitation system.
+
+## Pricing Tiers (Internal - Not Public)
+
+> **Note:** This is internal pricing strategy. Website shows "Contact us" for team/enterprise.
+
+| Tier | Vaults | Sharing | Members | SAML |
+|------|--------|---------|---------|------|
+| Free | 2 | No | 1 | No |
+| Pro | Unlimited | No | 1 | No |
+| Team S | Unlimited | Yes | Up to 5 | No |
+| Team M | Unlimited | Yes | Up to 20 | No |
+| Team L | Unlimited | Yes | Up to 100 | No |
+| Corp S | Unlimited | Yes | Up to 1,000 | Yes |
+| Corp L | Unlimited | Yes | Up to 10,000 | Yes |
+
+- Vaults are cheap (just a GUID + metadata)
+- Value is in sharing/collaboration features
+- SAML is enterprise-only (common B2B SaaS pattern)
+- Corporate tier required for IdP integration
 
 ## Security Model
 
@@ -42,10 +70,18 @@ Private Key encrypted with: Argon2id(emailCode || inviteCode, salt)
 interface Vault {
   id: string;
   name: string;
-  projectName: string;           // e.g., "rapidink"
   ownerId: string;               // creator's userId
+  isDefault: boolean;            // true for user's initial vault
   createdAt: string;
   updatedAt: string;
+}
+
+// vaultProjects collection - which projects belong to which vault
+interface VaultProject {
+  id: string;
+  vaultId: string;
+  projectName: string;           // e.g., "rapidink", "sinesync"
+  createdAt: string;
 }
 
 // vaultMembers collection
@@ -307,6 +343,40 @@ interface VaultInvite {
 - "Invite 3 friends → 1 month free"
 - "Team discount: 20% off when 3+ members"
 - "Founder's referral: both get 1 month free"
+
+## Signup Flow Changes
+
+### New User Signup
+
+```
+1. User signs up (existing 2SKD flow)
+2. Generate X25519 key pair, encrypt with derived key
+3. Create default vault "Personal"
+4. Generate vault key, encrypt with user's derived key
+5. User is sole member of default vault
+6. All observations go to default vault unless assigned elsewhere
+```
+
+### Observation Storage
+
+Observations now belong to vaults, not users directly:
+
+```typescript
+// GCS path changes from:
+//   users/{userId}/observations/{obsId}.enc
+// to:
+//   vaults/{vaultId}/observations/{obsId}.enc
+
+// Manifest changes from user-level to vault-level:
+//   vaults/{vaultId}/manifest.json.gz
+```
+
+### Project Assignment
+
+- User assigns projects to vaults (CLI or dashboard)
+- Unassigned projects go to default vault
+- One project → one vault (no overlap)
+- Moving project to different vault = re-encrypt + re-upload
 
 ## Migration Path
 
