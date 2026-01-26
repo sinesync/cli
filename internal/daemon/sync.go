@@ -482,6 +482,12 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 
 		n, uploadedItems, err := m.pushBatchEncrypted(token, batch)
 		if err != nil {
+			// If 401, return immediately so doSync can refresh token and retry
+			if isUnauthorizedError(err) {
+				// Save what we have so far
+				syncManifest.Save()
+				return pushed, pulled, err
+			}
 			log.Printf("[sync] Push batch error: %v", err)
 		}
 		pushed += n
@@ -495,6 +501,10 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 	// Pull items
 	for _, item := range toPull {
 		if err := m.pullItemEncrypted(token, item.ID, encMgr); err != nil {
+			if isUnauthorizedError(err) {
+				syncManifest.Save()
+				return pushed, pulled, err
+			}
 			log.Printf("[sync] Pull error for %s: %v", item.ID, err)
 			continue
 		}
@@ -505,6 +515,10 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 	deleted := 0
 	for _, id := range toDeleteFromCloud {
 		if err := m.deleteFromCloud(token, id); err != nil {
+			if isUnauthorizedError(err) {
+				syncManifest.Save()
+				return pushed, pulled, err
+			}
 			log.Printf("[sync] Delete error for %s: %v", id, err)
 			continue
 		}
@@ -744,25 +758,40 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 		itemMeta[item.obs.ID] = item
 	}
 
-	// Get upload URLs
+	// Get upload URLs with retry for rate limiting
 	body := map[string]interface{}{"items": items}
 	bodyBytes, _ := json.Marshal(body)
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	req, _ := http.NewRequest("POST", m.apiBase+"/sync/upload-urls", bytes.NewReader(bodyBytes))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, err
+	var resp *http.Response
+	var err error
+	for retries := 0; retries < 3; retries++ {
+		req, _ := http.NewRequest("POST", m.apiBase+"/sync/upload-urls", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err = client.Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+
+		if resp.StatusCode == 429 {
+			resp.Body.Close()
+			backoff := time.Duration(1<<retries) * time.Second // 1s, 2s, 4s
+			log.Printf("[sync] Rate limited, waiting %v...", backoff)
+			time.Sleep(backoff)
+			continue
+		}
+		break
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		return 0, nil, fmt.Errorf("get URLs failed %d: %s", resp.StatusCode, string(respBody))
 	}
+	defer resp.Body.Close()
 
 	var urlResp struct {
 		Items []struct {

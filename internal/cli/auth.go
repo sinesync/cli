@@ -201,12 +201,13 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	fmt.Println("✓ Device registered")
 
 	// Save auth config
+	// Use device tokens for both access and refresh (device-specific auth)
 	authCfg := &AuthConfig{
 		UserID:       loginResp.User.ID,
 		Email:        loginResp.User.Email,
-		Token:        loginResp.Token,
-		RefreshToken: loginResp.RefreshToken,
-		ExpiresAt:    loginResp.ExpiresAt,
+		Token:        deviceResp.Token,         // Device access token
+		RefreshToken: deviceResp.RefreshToken,  // Device refresh token
+		ExpiresAt:    deviceResp.ExpiresAt,
 		DeviceID:     deviceResp.Device.ID,
 		DeviceToken:  deviceResp.Token,
 	}
@@ -314,12 +315,13 @@ func runSignup(cmd *cobra.Command, args []string) error {
 	fmt.Println("✓ Device registered")
 
 	// Save auth config
+	// Use device tokens for both access and refresh (device-specific auth)
 	authCfg := &AuthConfig{
 		UserID:       signupResp.User.ID,
 		Email:        signupResp.User.Email,
-		Token:        signupResp.Token,
-		RefreshToken: signupResp.RefreshToken,
-		ExpiresAt:    signupResp.ExpiresAt,
+		Token:        deviceResp.Token,         // Device access token
+		RefreshToken: deviceResp.RefreshToken,  // Device refresh token
+		ExpiresAt:    deviceResp.ExpiresAt,
 		DeviceID:     deviceResp.Device.ID,
 		DeviceToken:  deviceResp.Token,
 	}
