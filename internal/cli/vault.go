@@ -145,14 +145,20 @@ var vaultMigrateProjectCmd = &cobra.Command{
 	Short: "Migrate a project's observations to a different vault",
 	Long: `Migrate all observations for a project to a new vault.
 
-This re-encrypts all observations with the new vault's key and uploads
-them to the new vault. The project is then moved to the new vault.
+This uploads all observations to the target vault. The project is
+then moved to the new vault.
+
+Use --force to upload observations even if the project is already
+in the target vault (useful for initial sync after adding a project).
 
 Example:
-  sinesync vault migrate-project myproject abc123-def456`,
+  sinesync vault migrate-project myproject abc123-def456
+  sinesync vault migrate-project myproject abc123 --force`,
 	Args: cobra.ExactArgs(2),
 	RunE: runVaultMigrateProject,
 }
+
+var migrateForce bool
 
 var vaultSyncCmd = &cobra.Command{
 	Use:   "sync",
@@ -217,6 +223,7 @@ func init() {
 	vaultCmd.AddCommand(vaultAddProjectCmd)
 	vaultCmd.AddCommand(vaultRemoveProjectCmd)
 	vaultCmd.AddCommand(vaultMigrateProjectCmd)
+	vaultMigrateProjectCmd.Flags().BoolVarP(&migrateForce, "force", "f", false, "Upload observations even if project is already in target vault")
 	vaultCmd.AddCommand(vaultSyncCmd)
 	vaultCmd.AddCommand(vaultShareCmd)
 	vaultCmd.AddCommand(vaultInvitesCmd)
@@ -521,8 +528,8 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("project '%s' is not in any vault - use 'vault add-project' first", projectName)
 	}
 
-	if fromVaultID == toVaultID {
-		return fmt.Errorf("project is already in vault %s", toVaultID)
+	if fromVaultID == toVaultID && !migrateForce {
+		return fmt.Errorf("project is already in vault %s (use --force to upload observations anyway)", toVaultID)
 	}
 
 	// Verify target vault exists
@@ -663,24 +670,28 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 		fmt.Println() // newline after progress
 	}
 
-	// Update server: remove from old vault, add to new vault
-	// Remove from old vault
-	delReq, _ := http.NewRequest("DELETE", apiBase+"/vaults/"+fromVaultID+"/projects/"+url.PathEscape(projectName), nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
-	client.Do(delReq)
+	// Update server: remove from old vault, add to new vault (only if different vaults)
+	if fromVaultID != toVaultID {
+		// Remove from old vault
+		delReq, _ := http.NewRequest("DELETE", apiBase+"/vaults/"+fromVaultID+"/projects/"+url.PathEscape(projectName), nil)
+		delReq.Header.Set("Authorization", "Bearer "+token)
+		client.Do(delReq)
 
-	// Add to new vault
-	addBody, _ := json.Marshal(map[string]string{"projectName": projectName})
-	addReq, _ := http.NewRequest("POST", apiBase+"/vaults/"+toVaultID+"/projects", bytes.NewReader(addBody))
-	addReq.Header.Set("Content-Type", "application/json")
-	addReq.Header.Set("Authorization", "Bearer "+token)
-	client.Do(addReq)
+		// Add to new vault
+		addBody, _ := json.Marshal(map[string]string{"projectName": projectName})
+		addReq, _ := http.NewRequest("POST", apiBase+"/vaults/"+toVaultID+"/projects", bytes.NewReader(addBody))
+		addReq.Header.Set("Content-Type", "application/json")
+		addReq.Header.Set("Authorization", "Bearer "+token)
+		client.Do(addReq)
 
-	// Update local config
-	removeProjectFromLocalVault(fromVaultID, projectName)
-	addProjectToLocalVault(toVaultID, projectName)
+		// Update local config
+		removeProjectFromLocalVault(fromVaultID, projectName)
+		addProjectToLocalVault(toVaultID, projectName)
 
-	fmt.Printf("✓ Migrated project '%s' to vault '%s'\n", projectName, targetVaultName)
+		fmt.Printf("✓ Migrated project '%s' to vault '%s'\n", projectName, targetVaultName)
+	} else {
+		fmt.Printf("✓ Uploaded observations for project '%s' to vault '%s'\n", projectName, targetVaultName)
+	}
 	if len(matching) > 0 {
 		fmt.Printf("  %d observations migrated", migrated)
 		if errors > 0 {
