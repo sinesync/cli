@@ -1142,8 +1142,8 @@ func runVaultShare(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get vault key: %w", err)
 	}
 
-	// Check if invitee is an existing user
-	fmt.Printf("Checking if %s has an account...\n", shareEmail)
+	// Check if invitee has a public key (don't reveal result to avoid user enumeration)
+	fmt.Println("Preparing invite...")
 
 	pubKeyReq, err := http.NewRequest("GET", apiBase+"/users/public-key?email="+url.QueryEscape(shareEmail), nil)
 	if err != nil {
@@ -1160,22 +1160,26 @@ func runVaultShare(cmd *cobra.Command, args []string) error {
 	var inviteType, encryptedVaultKey string
 	var emailCode, inviteCode, salt, emailCodeHash, inviteCodeHash, encryptedTempPrivKey, tempPubKey string
 
-	if pubKeyResp.StatusCode == http.StatusOK {
-		// Existing user - encrypt vault key with their public key
-		var pubKeyResult struct {
-			PublicKey string `json:"publicKey"`
-		}
-		if err := json.NewDecoder(pubKeyResp.Body).Decode(&pubKeyResult); err != nil {
-			return fmt.Errorf("failed to decode public key: %w", err)
-		}
+	if pubKeyResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(pubKeyResp.Body)
+		return fmt.Errorf("failed to check user: %s", string(body))
+	}
 
+	// Parse response - publicKey will be null if user doesn't exist or has no keypair
+	var pubKeyResult struct {
+		PublicKey *string `json:"publicKey"`
+	}
+	if err := json.NewDecoder(pubKeyResp.Body).Decode(&pubKeyResult); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if pubKeyResult.PublicKey != nil && *pubKeyResult.PublicKey != "" {
+		// User has a public key - encrypt vault key directly
 		inviteType = "direct"
-		encryptedVaultKey, err = crypto.X25519Seal(vaultKey, pubKeyResult.PublicKey)
+		encryptedVaultKey, err = crypto.X25519Seal(vaultKey, *pubKeyResult.PublicKey)
 		if err != nil {
 			return fmt.Errorf("failed to encrypt vault key: %w", err)
 		}
-
-		fmt.Println("✓ User found")
 	} else {
 		// New user - generate temp keypair and two codes
 		inviteType = "new_user"
