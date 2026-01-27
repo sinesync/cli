@@ -70,8 +70,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("encryption key not available - please login again")
 	}
 
-	// Get default vault ID
-	vaultID, err := GetDefaultVaultID()
+	// Get default vault ID (fallback for projects not assigned to a vault)
+	defaultVaultID, err := GetDefaultVaultID()
 	if err != nil {
 		return fmt.Errorf("no vault configured - run 'sinesync vault sync' first: %w", err)
 	}
@@ -126,7 +126,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 					fmt.Printf("  Warning: failed to encrypt %s: %v\n", obs.ID, err)
 					continue
 				}
-				pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID})
+				// Route to project's vault or default
+				obsVaultID := getVaultIDForObservation(obs.Core.Project, defaultVaultID)
+				pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: obsVaultID})
 				continue
 			}
 		}
@@ -145,7 +147,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 		if cloudChecksum, ok := cloudItems[obs.ID]; ok && cloudChecksum == checksum {
 			continue
 		}
-		pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID})
+		// Route to project's vault or default
+		obsVaultID := getVaultIDForObservation(obs.Core.Project, defaultVaultID)
+		pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: obsVaultID})
 	}
 
 	fmt.Printf("Local: %d items, Cloud: %d items\n", len(localItems), len(cloudItems))
@@ -338,8 +342,8 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("encryption key not available - please login again")
 	}
 
-	// Get default vault ID
-	vaultID, err := GetDefaultVaultID()
+	// Get default vault ID (fallback for projects not assigned to a vault)
+	defaultVaultID, err := GetDefaultVaultID()
 	if err != nil {
 		return fmt.Errorf("no vault configured - run 'sinesync vault sync' first: %w", err)
 	}
@@ -395,8 +399,11 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
+		// Route to project's vault or default
+		obsVaultID := getVaultIDForObservation(obs.Core.Project, defaultVaultID)
+
 		// Push encrypted data to cloud
-		err = pushToCloud(apiBase, token, obs.ID, "memory", vaultID, encrypted)
+		err = pushToCloud(apiBase, token, obs.ID, "memory", obsVaultID, encrypted)
 		if err != nil {
 			errors++
 			lastError = fmt.Sprintf("push %s: %v", obs.ID, err)
@@ -947,4 +954,18 @@ func pullFromCloud(apiBase, token, id string) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// getVaultIDForObservation returns the vault ID for an observation based on its project
+// Falls back to defaultVaultID if project is not assigned to a vault
+func getVaultIDForObservation(project string, defaultVaultID string) string {
+	if project == "" {
+		return defaultVaultID
+	}
+
+	vaultID, err := GetVaultForProject(project)
+	if err != nil || vaultID == "" {
+		return defaultVaultID
+	}
+	return vaultID
 }
