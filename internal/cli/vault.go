@@ -37,13 +37,6 @@ type VaultWithRole struct {
 	MemberCount int    `json:"memberCount"`
 }
 
-type VaultProject struct {
-	ID          string `json:"id"`
-	VaultID     string `json:"vaultId"`
-	ProjectName string `json:"projectName"`
-	CreatedAt   string `json:"createdAt"`
-}
-
 type VaultMember struct {
 	ID                string `json:"id"`
 	VaultID           string `json:"vaultId"`
@@ -435,46 +428,32 @@ func runVaultDelete(cmd *cobra.Command, args []string) error {
 func runVaultProjects(cmd *cobra.Command, args []string) error {
 	vaultID := args[0]
 
-	token, err := getAuthTokenForVault()
+	cfg, err := loadLocalVaultConfig()
 	if err != nil {
-		return fmt.Errorf("not logged in: %w", err)
+		return fmt.Errorf("failed to load vault config: %w", err)
 	}
 
-	apiBase := getAPIBase()
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	req, err := http.NewRequest("GET", apiBase+"/vaults/"+vaultID+"/projects", nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to fetch projects: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server error: %s", string(body))
+	var vault *LocalVault
+	for i := range cfg.Vaults {
+		if cfg.Vaults[i].VaultID == vaultID {
+			vault = &cfg.Vaults[i]
+			break
+		}
 	}
 
-	var result struct {
-		Projects []VaultProject `json:"projects"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
+	if vault == nil {
+		return fmt.Errorf("vault not found - run 'sinesync vault sync' first")
 	}
 
-	if len(result.Projects) == 0 {
-		fmt.Println("No projects in this vault.")
+	if len(vault.Projects) == 0 {
+		fmt.Printf("No projects assigned to vault '%s'.\n", vault.Name)
+		fmt.Println("Use 'sinesync vault add-project' to assign projects.")
 		return nil
 	}
 
-	fmt.Println("Projects in vault:")
-	for _, p := range result.Projects {
-		fmt.Printf("  - %s\n", p.ProjectName)
+	fmt.Printf("Projects in vault '%s':\n", vault.Name)
+	for _, p := range vault.Projects {
+		fmt.Printf("  - %s\n", p)
 	}
 
 	return nil
@@ -484,43 +463,34 @@ func runVaultAddProject(cmd *cobra.Command, args []string) error {
 	vaultID := args[0]
 	projectName := args[1]
 
-	token, err := getAuthTokenForVault()
+	// Verify vault exists locally
+	cfg, err := loadLocalVaultConfig()
 	if err != nil {
-		return fmt.Errorf("not logged in: %w", err)
+		return fmt.Errorf("failed to load vault config: %w", err)
 	}
 
-	apiBase := getAPIBase()
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	body, err := json.Marshal(map[string]string{"projectName": projectName})
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
+	var vaultName string
+	for _, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			vaultName = v.Name
+			break
+		}
 	}
-	req, err := http.NewRequest("POST", apiBase+"/vaults/"+vaultID+"/projects", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to add project: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server error: %s", string(respBody))
+	if vaultName == "" {
+		return fmt.Errorf("vault not found - run 'sinesync vault sync' first")
 	}
 
-	// Update local config
+	// Update local config only (project mappings are client-side)
 	addProjectToLocalVault(vaultID, projectName)
 
-	fmt.Printf("✓ Added project '%s' to vault\n", projectName)
+	fmt.Printf("✓ Added project '%s' to vault '%s'\n", projectName, vaultName)
 
 	// Migrate observations if requested
 	if addProjectMigrate {
+		token, err := getAuthTokenForVault()
+		if err != nil {
+			return fmt.Errorf("not logged in: %w", err)
+		}
 		fmt.Println()
 		if err := migrateProjectObservations(projectName, vaultID, token); err != nil {
 			fmt.Printf("Warning: migration failed: %v\n", err)
@@ -535,35 +505,27 @@ func runVaultRemoveProject(cmd *cobra.Command, args []string) error {
 	vaultID := args[0]
 	projectName := args[1]
 
-	token, err := getAuthTokenForVault()
+	// Verify vault exists locally
+	cfg, err := loadLocalVaultConfig()
 	if err != nil {
-		return fmt.Errorf("not logged in: %w", err)
+		return fmt.Errorf("failed to load vault config: %w", err)
 	}
 
-	apiBase := getAPIBase()
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	req, err := http.NewRequest("DELETE", apiBase+"/vaults/"+vaultID+"/projects/"+url.PathEscape(projectName), nil)
-	if err != nil {
-		return err
+	var vaultName string
+	for _, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			vaultName = v.Name
+			break
+		}
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to remove project: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server error: %s", string(body))
+	if vaultName == "" {
+		return fmt.Errorf("vault not found - run 'sinesync vault sync' first")
 	}
 
-	// Update local config
+	// Update local config only (project mappings are client-side)
 	removeProjectFromLocalVault(vaultID, projectName)
 
-	fmt.Printf("✓ Removed project '%s' from vault\n", projectName)
+	fmt.Printf("✓ Removed project '%s' from vault '%s'\n", projectName, vaultName)
 	return nil
 }
 
@@ -944,6 +906,15 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Syncing vault keys...")
 
+	// Load existing local config to preserve project mappings
+	existingConfig, _ := loadLocalVaultConfig()
+	existingProjects := make(map[string][]string)
+	if existingConfig != nil {
+		for _, v := range existingConfig.Vaults {
+			existingProjects[v.VaultID] = v.Projects
+		}
+	}
+
 	apiBase := getAPIBase()
 	client := &http.Client{Timeout: 30 * time.Second}
 
@@ -972,7 +943,7 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// For each vault, get the encrypted key and projects
+	// For each vault, get the encrypted key (projects are local-only)
 	localConfig := LocalVaultConfig{Vaults: make([]LocalVault, 0)}
 
 	for _, v := range result.Vaults {
@@ -1002,25 +973,10 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 		}
 		keyResp.Body.Close()
 
-		// Get projects
-		projReq, err := http.NewRequest("GET", apiBase+"/vaults/"+v.ID+"/projects", nil)
-		var projects []string
-		if err == nil {
-			projReq.Header.Set("Authorization", "Bearer "+token)
-			projResp, err := client.Do(projReq)
-			if err == nil && projResp.StatusCode == http.StatusOK {
-				var projResult struct {
-					Projects []VaultProject `json:"projects"`
-				}
-				if err := json.NewDecoder(projResp.Body).Decode(&projResult); err == nil {
-					for _, p := range projResult.Projects {
-						projects = append(projects, p.ProjectName)
-					}
-				}
-				projResp.Body.Close()
-			} else if projResp != nil {
-				projResp.Body.Close()
-			}
+		// Preserve existing local project mappings
+		projects := existingProjects[v.ID]
+		if projects == nil {
+			projects = []string{}
 		}
 
 		localConfig.Vaults = append(localConfig.Vaults, LocalVault{
@@ -1031,7 +987,7 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 			IsDefault:         v.IsDefault,
 		})
 
-		fmt.Printf("  ✓ %s (%d projects)\n", v.Name, len(projects))
+		fmt.Printf("  ✓ %s (%d local projects)\n", v.Name, len(projects))
 	}
 
 	// Save local config
