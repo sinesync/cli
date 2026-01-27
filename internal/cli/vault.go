@@ -222,6 +222,16 @@ var vaultPendingCmd = &cobra.Command{
 	RunE:  runVaultPending,
 }
 
+var vaultSetupKeyCmd = &cobra.Command{
+	Use:   "setup-key <vault-id>",
+	Short: "Generate and upload encryption key for a vault",
+	Long: `Generate a new encryption key for a vault and upload it to the server.
+
+Use this to enable sharing for vaults created before vault key encryption was implemented.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runVaultSetupKey,
+}
+
 var shareEmail string
 
 func init() {
@@ -241,6 +251,7 @@ func init() {
 	vaultCmd.AddCommand(vaultCancelInviteCmd)
 	vaultCmd.AddCommand(vaultAcceptCmd)
 	vaultCmd.AddCommand(vaultPendingCmd)
+	vaultCmd.AddCommand(vaultSetupKeyCmd)
 
 	// Share command flags
 	vaultShareCmd.Flags().StringVarP(&shareEmail, "email", "e", "", "Email address of the invitee (required)")
@@ -859,6 +870,51 @@ func setupVaultKey(token, vaultID, vaultName string) error {
 	// Store locally with vault name
 	addLocalVault(vaultID, vaultName, encryptedVaultKey, false)
 
+	return nil
+}
+
+func runVaultSetupKey(cmd *cobra.Command, args []string) error {
+	vaultID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	// Get vault info to verify ownership and get name
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("GET", apiBase+"/vaults/"+vaultID, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get vault: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("vault not found or access denied")
+	}
+
+	var vault Vault
+	if err := json.NewDecoder(resp.Body).Decode(&vault); err != nil {
+		return fmt.Errorf("failed to decode vault: %w", err)
+	}
+
+	fmt.Printf("Setting up encryption key for vault: %s\n", vault.Name)
+
+	if err := setupVaultKey(token, vaultID, vault.Name); err != nil {
+		return fmt.Errorf("failed to setup vault key: %w", err)
+	}
+
+	fmt.Println("✓ Vault key set up successfully")
+	fmt.Println("\nNote: Existing data is encrypted with your user key.")
+	fmt.Println("To re-encrypt for sharing, use: sinesync vault migrate-project")
 	return nil
 }
 
