@@ -98,23 +98,51 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load local observations: %w", err)
 	}
 
-	// Encrypt observations and compute checksums (based on encrypted data)
-	fmt.Println("Encrypting observations...")
+	// Check which observations need pushing (using cached checksums when possible)
+	fmt.Println("Checking observations...")
 	var pending []pendingItem
 	localItems := make(map[string]string) // id -> checksum
+	syncManifest := storage.GetSyncManifest()
 
 	for _, obs := range observations {
-		encrypted, err := encMgr.EncryptObservation(&obs)
+		var checksum string
+		var encrypted []byte
+
+		// Check if we have a cached upload state for this observation
+		if cached, exists := syncManifest.GetLocalUpload(obs.ID); exists {
+			// Use cached checksum if observation hasn't changed
+			obsUpdatedAt := obs.Core.UpdatedAt
+			if !obsUpdatedAt.After(cached.UpdatedAt) {
+				checksum = cached.Checksum
+				localItems[obs.ID] = checksum
+				// Check if cloud has same checksum - skip if synced
+				if cloudChecksum, ok := cloudItems[obs.ID]; ok && cloudChecksum == checksum {
+					continue
+				}
+				// Need to re-encrypt for push (cloud doesn't have it or checksum differs)
+				var err error
+				encrypted, err = encMgr.EncryptObservation(&obs)
+				if err != nil {
+					fmt.Printf("  Warning: failed to encrypt %s: %v\n", obs.ID, err)
+					continue
+				}
+				pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID, project: obs.Core.Project})
+				continue
+			}
+		}
+
+		// No cache or observation changed - encrypt and compute new checksum
+		var err error
+		encrypted, err = encMgr.EncryptObservation(&obs)
 		if err != nil {
 			fmt.Printf("  Warning: failed to encrypt %s: %v\n", obs.ID, err)
 			continue
 		}
-		// Checksum based on encrypted data
-		checksum := storage.Checksum(encrypted)[:16]
+		checksum = storage.Checksum(encrypted)[:16]
 		localItems[obs.ID] = checksum
 
 		// Check if needs pushing
-		if cloudChecksum, exists := cloudItems[obs.ID]; exists && cloudChecksum == checksum {
+		if cloudChecksum, ok := cloudItems[obs.ID]; ok && cloudChecksum == checksum {
 			continue
 		}
 		pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID, project: obs.Core.Project})
@@ -268,11 +296,11 @@ func runSync(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\r  Progress: %d/%d (pulled: %d, skipped: %d, errors: %d)\n", len(manifest.Items), len(manifest.Items), pulled, pullSkipped, pullErrors)
 
 	// Update and save sync manifest
-	syncManifest := storage.GetSyncManifest()
 	syncManifest.UpdateFromCloud(cloudItems)
-	// Add newly pushed items
+	// Add newly pushed items and cache their upload state
 	for _, item := range pending {
 		syncManifest.MarkSynced(item.obs.ID, item.checksum)
+		syncManifest.SetLocalUpload(item.obs.ID, item.checksum, item.obs.Core.UpdatedAt)
 	}
 	if err := syncManifest.Save(); err != nil {
 		fmt.Printf("  Warning: failed to save sync manifest: %v\n", err)
