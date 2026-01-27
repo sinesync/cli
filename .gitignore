@@ -39,3 +39,9 @@ coverage/
 # Misc
 *.tgz
 .cache/
+
+# Backup/reference directories
+web-old/
+
+# Claude Code context files
+CLAUDE.md
