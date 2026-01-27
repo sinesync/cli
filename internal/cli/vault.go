@@ -52,6 +52,24 @@ type VaultMember struct {
 	JoinedAt          string `json:"joinedAt"`
 }
 
+type VaultInvite struct {
+	ID                      string `json:"id"`
+	VaultID                 string `json:"vaultId"`
+	InviterUserID           string `json:"inviterUserId"`
+	InviteeEmail            string `json:"inviteeEmail"`
+	InviteType              string `json:"inviteType"`
+	EncryptedVaultKey       string `json:"encryptedVaultKey"`
+	EncryptedTempPrivateKey string `json:"encryptedTempPrivateKey,omitempty"`
+	TempPublicKey           string `json:"tempPublicKey,omitempty"`
+	EmailCodeHash           string `json:"emailCodeHash,omitempty"`
+	InviteCodeHash          string `json:"inviteCodeHash,omitempty"`
+	Salt                    string `json:"salt,omitempty"`
+	Status                  string `json:"status"`
+	ExpiresAt               string `json:"expiresAt"`
+	CreatedAt               string `json:"createdAt"`
+	VaultName               string `json:"vaultName,omitempty"` // Enriched field
+}
+
 // Local vault config stored on device
 type LocalVaultConfig struct {
 	Vaults []LocalVault `json:"vaults"`
@@ -128,6 +146,53 @@ var vaultSyncCmd = &cobra.Command{
 	RunE:  runVaultSync,
 }
 
+var vaultShareCmd = &cobra.Command{
+	Use:   "share <vault-id>",
+	Short: "Share a vault with another user",
+	Long: `Invite another user to access a vault.
+
+For existing users, they'll receive a simple notification.
+For new users, you'll get an invite code to share with them.
+
+Examples:
+  sinesync vault share abc123 --email alice@example.com`,
+	Args: cobra.ExactArgs(1),
+	RunE: runVaultShare,
+}
+
+var vaultInvitesCmd = &cobra.Command{
+	Use:   "invites <vault-id>",
+	Short: "List pending invites for a vault",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runVaultInvites,
+}
+
+var vaultCancelInviteCmd = &cobra.Command{
+	Use:   "cancel-invite <invite-id>",
+	Short: "Cancel a pending invite",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runVaultCancelInvite,
+}
+
+var vaultAcceptCmd = &cobra.Command{
+	Use:   "accept <invite-id>",
+	Short: "Accept a vault invite",
+	Long: `Accept an invitation to join a shared vault.
+
+For invites from existing users, you just need the invite ID.
+For invites from new users, you'll need both codes.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runVaultAccept,
+}
+
+var vaultPendingCmd = &cobra.Command{
+	Use:   "pending",
+	Short: "List your pending vault invites",
+	RunE:  runVaultPending,
+}
+
+var shareEmail string
+
 func init() {
 	rootCmd.AddCommand(vaultCmd)
 	vaultCmd.AddCommand(vaultListCmd)
@@ -137,6 +202,15 @@ func init() {
 	vaultCmd.AddCommand(vaultAddProjectCmd)
 	vaultCmd.AddCommand(vaultRemoveProjectCmd)
 	vaultCmd.AddCommand(vaultSyncCmd)
+	vaultCmd.AddCommand(vaultShareCmd)
+	vaultCmd.AddCommand(vaultInvitesCmd)
+	vaultCmd.AddCommand(vaultCancelInviteCmd)
+	vaultCmd.AddCommand(vaultAcceptCmd)
+	vaultCmd.AddCommand(vaultPendingCmd)
+
+	// Share command flags
+	vaultShareCmd.Flags().StringVarP(&shareEmail, "email", "e", "", "Email address of the invitee (required)")
+	vaultShareCmd.MarkFlagRequired("email")
 }
 
 func runVaultList(cmd *cobra.Command, args []string) error {
@@ -784,4 +858,614 @@ func GetDefaultVaultID() (string, error) {
 	}
 
 	return "", fmt.Errorf("no default vault configured")
+}
+
+// === Vault Sharing Commands ===
+
+func runVaultShare(cmd *cobra.Command, args []string) error {
+	vaultID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Get the vault key from local storage
+	vaultKey, err := GetVaultKey(vaultID)
+	if err != nil {
+		return fmt.Errorf("failed to get vault key: %w", err)
+	}
+
+	// Check if invitee is an existing user
+	fmt.Printf("Checking if %s has an account...\n", shareEmail)
+
+	pubKeyReq, err := http.NewRequest("GET", apiBase+"/users/public-key?email="+url.QueryEscape(shareEmail), nil)
+	if err != nil {
+		return err
+	}
+	pubKeyReq.Header.Set("Authorization", "Bearer "+token)
+
+	pubKeyResp, err := client.Do(pubKeyReq)
+	if err != nil {
+		return fmt.Errorf("failed to check user: %w", err)
+	}
+	defer pubKeyResp.Body.Close()
+
+	var inviteType, encryptedVaultKey string
+	var emailCode, inviteCode, salt, emailCodeHash, inviteCodeHash, encryptedTempPrivKey, tempPubKey string
+
+	if pubKeyResp.StatusCode == http.StatusOK {
+		// Existing user - encrypt vault key with their public key
+		var pubKeyResult struct {
+			PublicKey string `json:"publicKey"`
+		}
+		if err := json.NewDecoder(pubKeyResp.Body).Decode(&pubKeyResult); err != nil {
+			return fmt.Errorf("failed to decode public key: %w", err)
+		}
+
+		inviteType = "direct"
+		encryptedVaultKey, err = crypto.X25519Seal(vaultKey, pubKeyResult.PublicKey)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt vault key: %w", err)
+		}
+
+		fmt.Println("✓ User found")
+	} else {
+		// New user - generate temp keypair and two codes
+		inviteType = "new_user"
+
+		// Generate codes
+		emailCode, err = crypto.GenerateInviteCode()
+		if err != nil {
+			return fmt.Errorf("failed to generate email code: %w", err)
+		}
+		inviteCode, err = crypto.GenerateInviteCode()
+		if err != nil {
+			return fmt.Errorf("failed to generate invite code: %w", err)
+		}
+
+		// Generate salt
+		saltBytes, err := crypto.GenerateSalt()
+		if err != nil {
+			return fmt.Errorf("failed to generate salt: %w", err)
+		}
+		salt = crypto.EncodeBase64(saltBytes)
+
+		// Generate temp keypair
+		tempPubKey, tempPrivKey, err := crypto.GenerateX25519Keypair()
+		if err != nil {
+			return fmt.Errorf("failed to generate temp keypair: %w", err)
+		}
+
+		// Derive key from both codes
+		codeKey := crypto.DeriveInviteKey(emailCode, inviteCode, saltBytes)
+
+		// Encrypt temp private key with code-derived key
+		tempPrivKeyBytes, err := crypto.DecodeBase64(tempPrivKey)
+		if err != nil {
+			return fmt.Errorf("failed to decode temp private key: %w", err)
+		}
+		encryptedTempPrivKeyBytes, err := crypto.Encrypt(tempPrivKeyBytes, codeKey, "sinesync-invite-key-v1")
+		if err != nil {
+			return fmt.Errorf("failed to encrypt temp private key: %w", err)
+		}
+		encryptedTempPrivKey = crypto.EncodeBase64(encryptedTempPrivKeyBytes)
+
+		// Encrypt vault key with temp public key
+		encryptedVaultKey, err = crypto.X25519Seal(vaultKey, tempPubKey)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt vault key: %w", err)
+		}
+
+		// Hash codes for server storage
+		emailCodeHash = crypto.HashCode(emailCode)
+		inviteCodeHash = crypto.HashCode(inviteCode)
+
+		fmt.Println("✓ New user - generating invite codes")
+	}
+
+	// Create invite on server
+	inviteBody := map[string]interface{}{
+		"email":             shareEmail,
+		"inviteType":        inviteType,
+		"encryptedVaultKey": encryptedVaultKey,
+	}
+
+	if inviteType == "new_user" {
+		inviteBody["encryptedTempPrivateKey"] = encryptedTempPrivKey
+		inviteBody["tempPublicKey"] = tempPubKey
+		inviteBody["emailCodeHash"] = emailCodeHash
+		inviteBody["inviteCodeHash"] = inviteCodeHash
+		inviteBody["salt"] = salt
+		inviteBody["emailCode"] = emailCode // Sent to server for email, not stored
+	}
+
+	bodyBytes, err := json.Marshal(inviteBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal invite body: %w", err)
+	}
+	inviteReq, err := http.NewRequest("POST", apiBase+"/vaults/"+vaultID+"/invites", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	inviteReq.Header.Set("Content-Type", "application/json")
+	inviteReq.Header.Set("Authorization", "Bearer "+token)
+
+	inviteResp, err := client.Do(inviteReq)
+	if err != nil {
+		return fmt.Errorf("failed to create invite: %w", err)
+	}
+	defer inviteResp.Body.Close()
+
+	if inviteResp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(inviteResp.Body)
+		return fmt.Errorf("server error: %s", string(respBody))
+	}
+
+	var invite VaultInvite
+	if err := json.NewDecoder(inviteResp.Body).Decode(&invite); err != nil {
+		return err
+	}
+
+	fmt.Println()
+	if inviteType == "direct" {
+		fmt.Printf("✓ Invite sent! %s will see this in their account.\n", shareEmail)
+	} else {
+		fmt.Printf("✓ Invite created for %s\n", shareEmail)
+		fmt.Println()
+		fmt.Println("╔═══════════════════════════════════════════════════════════════════╗")
+		fmt.Println("║                     SHARE THIS CODE                               ║")
+		fmt.Println("╠═══════════════════════════════════════════════════════════════════╣")
+		fmt.Printf("║  Invite Code: %-52s║\n", inviteCode)
+		fmt.Println("║                                                                   ║")
+		fmt.Println("║  Share this code with the invitee via a DIFFERENT channel        ║")
+		fmt.Println("║  (SMS, Slack, in-person) - NOT the same as the email.            ║")
+		fmt.Println("║                                                                   ║")
+		fmt.Println("║  They will receive an email with a separate code.                ║")
+		fmt.Println("║  Both codes are needed to access the vault.                      ║")
+		fmt.Println("╚═══════════════════════════════════════════════════════════════════╝")
+	}
+
+	return nil
+}
+
+func runVaultInvites(cmd *cobra.Command, args []string) error {
+	vaultID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("GET", apiBase+"/vaults/"+vaultID+"/invites", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch invites: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(body))
+	}
+
+	var result struct {
+		Invites []VaultInvite `json:"invites"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	if len(result.Invites) == 0 {
+		fmt.Println("No pending invites.")
+		return nil
+	}
+
+	fmt.Println("Pending invites:")
+	fmt.Println()
+	for _, inv := range result.Invites {
+		inviteType := "direct"
+		if inv.InviteType == "new_user" {
+			inviteType = "new user (needs codes)"
+		}
+		fmt.Printf("  %s\n", inv.InviteeEmail)
+		fmt.Printf("    ID: %s\n", inv.ID)
+		fmt.Printf("    Type: %s\n", inviteType)
+		fmt.Printf("    Expires: %s\n", inv.ExpiresAt)
+		fmt.Println()
+	}
+
+	return nil
+}
+
+func runVaultCancelInvite(cmd *cobra.Command, args []string) error {
+	inviteID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	// First, get the invite details to find the vault ID
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Get invite to find vault ID
+	inviteReq, err := http.NewRequest("GET", apiBase+"/invites/"+inviteID, nil)
+	if err != nil {
+		return err
+	}
+	inviteReq.Header.Set("Authorization", "Bearer "+token)
+
+	inviteResp, err := client.Do(inviteReq)
+	if err != nil {
+		return fmt.Errorf("failed to fetch invite: %w", err)
+	}
+	defer inviteResp.Body.Close()
+
+	if inviteResp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("invite not found")
+	}
+
+	if inviteResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(inviteResp.Body)
+		return fmt.Errorf("failed to fetch invite: %s", string(body))
+	}
+
+	// We need to get vaultId from somewhere - the invite details endpoint
+	// doesn't return it in the public response, so we need to search our vaults
+	fmt.Println("Searching for invite in your vaults...")
+
+	// Get all vaults
+	vaultsReq, err := http.NewRequest("GET", apiBase+"/vaults", nil)
+	if err != nil {
+		return err
+	}
+	vaultsReq.Header.Set("Authorization", "Bearer "+token)
+
+	vaultsResp, err := client.Do(vaultsReq)
+	if err != nil {
+		return fmt.Errorf("failed to fetch vaults: %w", err)
+	}
+	defer vaultsResp.Body.Close()
+
+	var vaultsResult struct {
+		Vaults []VaultWithRole `json:"vaults"`
+	}
+	if err := json.NewDecoder(vaultsResp.Body).Decode(&vaultsResult); err != nil {
+		return err
+	}
+
+	// Search each vault for the invite
+	var foundVaultID string
+	for _, vault := range vaultsResult.Vaults {
+		if vault.Role != "owner" {
+			continue // Only owners can see invites
+		}
+
+		invitesReq, err := http.NewRequest("GET", apiBase+"/vaults/"+vault.ID+"/invites", nil)
+		if err != nil {
+			continue
+		}
+		invitesReq.Header.Set("Authorization", "Bearer "+token)
+
+		invitesResp, err := client.Do(invitesReq)
+		if err != nil || invitesResp.StatusCode != http.StatusOK {
+			if invitesResp != nil {
+				invitesResp.Body.Close()
+			}
+			continue
+		}
+
+		var invitesResult struct {
+			Invites []VaultInvite `json:"invites"`
+		}
+		if err := json.NewDecoder(invitesResp.Body).Decode(&invitesResult); err != nil {
+			invitesResp.Body.Close()
+			continue
+		}
+		invitesResp.Body.Close()
+
+		for _, inv := range invitesResult.Invites {
+			if inv.ID == inviteID {
+				foundVaultID = vault.ID
+				break
+			}
+		}
+
+		if foundVaultID != "" {
+			break
+		}
+	}
+
+	if foundVaultID == "" {
+		return fmt.Errorf("invite not found in any of your owned vaults")
+	}
+
+	// Cancel the invite
+	cancelReq, err := http.NewRequest("DELETE", apiBase+"/vaults/"+foundVaultID+"/invites/"+inviteID, nil)
+	if err != nil {
+		return err
+	}
+	cancelReq.Header.Set("Authorization", "Bearer "+token)
+
+	cancelResp, err := client.Do(cancelReq)
+	if err != nil {
+		return fmt.Errorf("failed to cancel invite: %w", err)
+	}
+	defer cancelResp.Body.Close()
+
+	if cancelResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(cancelResp.Body)
+		return fmt.Errorf("server error: %s", string(body))
+	}
+
+	fmt.Println("Invite cancelled successfully.")
+	return nil
+}
+
+func runVaultAccept(cmd *cobra.Command, args []string) error {
+	inviteID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Get invite details
+	fmt.Println("Fetching invite details...")
+	inviteReq, err := http.NewRequest("GET", apiBase+"/invites/"+inviteID, nil)
+	if err != nil {
+		return err
+	}
+	inviteReq.Header.Set("Authorization", "Bearer "+token)
+
+	inviteResp, err := client.Do(inviteReq)
+	if err != nil {
+		return fmt.Errorf("failed to fetch invite: %w", err)
+	}
+	defer inviteResp.Body.Close()
+
+	if inviteResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(inviteResp.Body)
+		return fmt.Errorf("invite error: %s", string(body))
+	}
+
+	var inviteDetails struct {
+		ID                      string `json:"id"`
+		VaultName               string `json:"vaultName"`
+		InviterEmail            string `json:"inviterEmail"`
+		InviteeEmail            string `json:"inviteeEmail"`
+		InviteType              string `json:"inviteType"`
+		EncryptedVaultKey       string `json:"encryptedVaultKey"`
+		EncryptedTempPrivateKey string `json:"encryptedTempPrivateKey,omitempty"`
+		TempPublicKey           string `json:"tempPublicKey,omitempty"`
+		Salt                    string `json:"salt,omitempty"`
+	}
+	if err := json.NewDecoder(inviteResp.Body).Decode(&inviteDetails); err != nil {
+		return fmt.Errorf("failed to decode invite: %w", err)
+	}
+
+	fmt.Printf("Vault: %s\n", inviteDetails.VaultName)
+	fmt.Printf("From: %s\n", inviteDetails.InviterEmail)
+	fmt.Println()
+
+	var vaultKey []byte
+	var userEncryptedVaultKey string
+	acceptBody := make(map[string]string)
+
+	encMgr := encryption.GetManager()
+	if !encMgr.HasKey() {
+		return fmt.Errorf("encryption key not available - please login first")
+	}
+
+	if inviteDetails.InviteType == "direct" {
+		// Direct invite - decrypt with our private key
+		// Get our encrypted private key from server
+		privKeyReq, err := http.NewRequest("GET", apiBase+"/users/keypair", nil)
+		if err != nil {
+			return err
+		}
+		privKeyReq.Header.Set("Authorization", "Bearer "+token)
+
+		privKeyResp, err := client.Do(privKeyReq)
+		if err != nil {
+			return fmt.Errorf("failed to get private key: %w", err)
+		}
+		defer privKeyResp.Body.Close()
+
+		if privKeyResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(privKeyResp.Body)
+			return fmt.Errorf("failed to get keypair: %s", string(body))
+		}
+
+		var keypairResult struct {
+			EncryptedPrivateKey string `json:"encryptedPrivateKey"`
+		}
+		if err := json.NewDecoder(privKeyResp.Body).Decode(&keypairResult); err != nil {
+			return fmt.Errorf("failed to decode keypair: %w", err)
+		}
+
+		// Decrypt our private key
+		privateKey, err := encMgr.DecryptUserPrivateKey(keypairResult.EncryptedPrivateKey)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt private key: %w", err)
+		}
+
+		// Decrypt vault key with our private key
+		vaultKey, err = crypto.X25519Open(inviteDetails.EncryptedVaultKey, privateKey)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt vault key: %w", err)
+		}
+
+		fmt.Println("✓ Decrypted vault key")
+
+	} else {
+		// New user invite - need both codes
+		reader := bufio.NewReader(os.Stdin)
+
+		fmt.Print("Email code (from email): ")
+		emailCode, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("failed to read email code: %w", err)
+		}
+		emailCode = strings.TrimSpace(emailCode)
+
+		fmt.Print("Invite code (from inviter): ")
+		inviteCode, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("failed to read invite code: %w", err)
+		}
+		inviteCode = strings.TrimSpace(inviteCode)
+
+		// Derive key from codes
+		saltBytes, err := crypto.DecodeBase64(inviteDetails.Salt)
+		if err != nil {
+			return fmt.Errorf("invalid salt: %w", err)
+		}
+		codeKey := crypto.DeriveInviteKey(emailCode, inviteCode, saltBytes)
+
+		// Decrypt temp private key
+		encTempPrivKey, err := crypto.DecodeBase64(inviteDetails.EncryptedTempPrivateKey)
+		if err != nil {
+			return fmt.Errorf("invalid encrypted temp key: %w", err)
+		}
+		tempPrivKeyBytes, err := crypto.Decrypt(encTempPrivKey, codeKey, "sinesync-invite-key-v1")
+		if err != nil {
+			return fmt.Errorf("failed to decrypt temp key - check your codes: %w", err)
+		}
+		tempPrivKey := crypto.EncodeBase64(tempPrivKeyBytes)
+
+		// Decrypt vault key with temp private key
+		vaultKey, err = crypto.X25519Open(inviteDetails.EncryptedVaultKey, tempPrivKey)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt vault key: %w", err)
+		}
+
+		fmt.Println("✓ Codes verified and vault key decrypted")
+
+		// Add codes to accept body for server verification
+		acceptBody["emailCode"] = emailCode
+		acceptBody["inviteCode"] = inviteCode
+	}
+
+	// Re-encrypt vault key with our derived key
+	userEncryptedVaultKey, err = encMgr.EncryptVaultKey(vaultKey)
+	if err != nil {
+		return fmt.Errorf("failed to re-encrypt vault key: %w", err)
+	}
+
+	acceptBody["userEncryptedVaultKey"] = userEncryptedVaultKey
+
+	// Accept the invite
+	acceptBodyBytes, err := json.Marshal(acceptBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal accept body: %w", err)
+	}
+	acceptReq, err := http.NewRequest("POST", apiBase+"/invites/"+inviteID+"/accept", bytes.NewReader(acceptBodyBytes))
+	if err != nil {
+		return err
+	}
+	acceptReq.Header.Set("Content-Type", "application/json")
+	acceptReq.Header.Set("Authorization", "Bearer "+token)
+
+	acceptResp, err := client.Do(acceptReq)
+	if err != nil {
+		return fmt.Errorf("failed to accept invite: %w", err)
+	}
+	defer acceptResp.Body.Close()
+
+	if acceptResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(acceptResp.Body)
+		return fmt.Errorf("accept failed: %s", string(body))
+	}
+
+	// Add vault to local config
+	// First get the vault ID from the accept response
+	var acceptResult struct {
+		Member struct {
+			VaultID string `json:"vaultId"`
+		} `json:"member"`
+	}
+	if err := json.NewDecoder(acceptResp.Body).Decode(&acceptResult); err != nil {
+		return fmt.Errorf("failed to decode accept response: %w", err)
+	}
+
+	addLocalVault(acceptResult.Member.VaultID, inviteDetails.VaultName, userEncryptedVaultKey, false)
+
+	fmt.Println()
+	fmt.Printf("✓ Successfully joined vault: %s\n", inviteDetails.VaultName)
+	fmt.Println("  Run 'sinesync vault sync' to sync all vault keys.")
+
+	return nil
+}
+
+func runVaultPending(cmd *cobra.Command, args []string) error {
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("GET", apiBase+"/invites/", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch pending invites: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(body))
+	}
+
+	var result struct {
+		Invites []VaultInvite `json:"invites"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	if len(result.Invites) == 0 {
+		fmt.Println("No pending vault invites.")
+		return nil
+	}
+
+	fmt.Println("Your pending vault invites:")
+	fmt.Println()
+	for _, inv := range result.Invites {
+		inviteType := "direct"
+		if inv.InviteType == "new_user" {
+			inviteType = "requires codes"
+		}
+		fmt.Printf("  %s\n", inv.VaultName)
+		fmt.Printf("    Invite ID: %s\n", inv.ID)
+		fmt.Printf("    Type: %s\n", inviteType)
+		fmt.Printf("    Expires: %s\n", inv.ExpiresAt)
+		fmt.Printf("    Accept: sinesync vault accept %s\n", inv.ID)
+		fmt.Println()
+	}
+
+	return nil
 }

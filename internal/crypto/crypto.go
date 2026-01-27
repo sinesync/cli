@@ -6,10 +6,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/nacl/box"
 )
 
 const (
@@ -276,4 +279,153 @@ func GenerateKey(length int) ([]byte, error) {
 		return nil, err
 	}
 	return key, nil
+}
+
+// X25519 Key Exchange and Encryption Functions
+
+// GenerateX25519Keypair generates a new X25519 keypair for vault sharing
+// Returns public key and private key as base64-encoded strings
+func GenerateX25519Keypair() (publicKey, privateKey string, err error) {
+	pubKey, privKey, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("generate keypair: %w", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(pubKey[:]),
+		base64.StdEncoding.EncodeToString(privKey[:]),
+		nil
+}
+
+// X25519Seal encrypts plaintext using the recipient's public key
+// Uses NaCl box which combines X25519 + XSalsa20-Poly1305
+// The sender's ephemeral keypair is generated internally
+func X25519Seal(plaintext []byte, recipientPublicKey string) (string, error) {
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(recipientPublicKey)
+	if err != nil {
+		return "", fmt.Errorf("decode public key: %w", err)
+	}
+	if len(pubKeyBytes) != 32 {
+		return "", errors.New("invalid public key length")
+	}
+
+	var recipientPubKey [32]byte
+	copy(recipientPubKey[:], pubKeyBytes)
+
+	// Generate ephemeral keypair for this encryption
+	ephemeralPubKey, ephemeralPrivKey, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", fmt.Errorf("generate ephemeral key: %w", err)
+	}
+
+	// Generate random nonce
+	var nonce [24]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return "", fmt.Errorf("generate nonce: %w", err)
+	}
+
+	// Seal the plaintext
+	// Output format: ephemeral_pubkey (32) + nonce (24) + ciphertext
+	sealed := box.Seal(nil, plaintext, &nonce, &recipientPubKey, ephemeralPrivKey)
+
+	// Prepend ephemeral public key and nonce
+	result := make([]byte, 32+24+len(sealed))
+	copy(result[:32], ephemeralPubKey[:])
+	copy(result[32:56], nonce[:])
+	copy(result[56:], sealed)
+
+	return base64.StdEncoding.EncodeToString(result), nil
+}
+
+// X25519Open decrypts ciphertext using the recipient's private key
+func X25519Open(ciphertext string, privateKey string) ([]byte, error) {
+	privKeyBytes, err := base64.StdEncoding.DecodeString(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("decode private key: %w", err)
+	}
+	if len(privKeyBytes) != 32 {
+		return nil, errors.New("invalid private key length")
+	}
+
+	ciphertextBytes, err := base64.StdEncoding.DecodeString(ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("decode ciphertext: %w", err)
+	}
+
+	// Minimum length: ephemeral_pubkey (32) + nonce (24) + auth_tag (16)
+	if len(ciphertextBytes) < 32+24+16 {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	// Extract components
+	var senderPubKey [32]byte
+	var nonce [24]byte
+	var recipientPrivKey [32]byte
+
+	copy(senderPubKey[:], ciphertextBytes[:32])
+	copy(nonce[:], ciphertextBytes[32:56])
+	copy(recipientPrivKey[:], privKeyBytes)
+
+	sealed := ciphertextBytes[56:]
+
+	// Open the box
+	plaintext, ok := box.Open(nil, sealed, &nonce, &senderPubKey, &recipientPrivKey)
+	if !ok {
+		return nil, errors.New("decryption failed: ciphertext may be corrupted or encrypted with a different key")
+	}
+
+	return plaintext, nil
+}
+
+// Invite Code Functions
+
+// GenerateInviteCode generates a random invite code with high entropy.
+// Format: XXXX-XXXX-XXXX-XXXX (16 characters = ~80 bits from base32)
+// Uses 12 bytes of random data for 96 bits of input entropy.
+func GenerateInviteCode() (string, error) {
+	// Generate 12 random bytes (96 bits of entropy)
+	bytes := make([]byte, 12)
+	if _, err := io.ReadFull(rand.Reader, bytes); err != nil {
+		return "", err
+	}
+
+	// Encode to base32
+	encoded := encodeBase32(bytes)
+	// Remove dashes and take first 16 characters
+	clean := ""
+	for _, c := range encoded {
+		if c != '-' {
+			clean += string(c)
+		}
+		if len(clean) >= 16 {
+			break
+		}
+	}
+
+	// Ensure we have exactly 16 characters
+	if len(clean) < 16 {
+		return "", fmt.Errorf("failed to generate invite code: insufficient characters")
+	}
+
+	// Format as XXXX-XXXX-XXXX-XXXX
+	return clean[:4] + "-" + clean[4:8] + "-" + clean[8:12] + "-" + clean[12:16], nil
+}
+
+// DeriveInviteKey derives an encryption key from email code and invite code
+// Uses Argon2id with the provided salt
+func DeriveInviteKey(emailCode, inviteCode string, salt []byte) []byte {
+	combined := emailCode + ":" + inviteCode
+	return argon2.IDKey(
+		[]byte(combined),
+		salt,
+		argonTime,
+		argonMemory,
+		argonThreads,
+		keyLength,
+	)
+}
+
+// HashCode computes SHA256 hash of a code and returns hex-encoded string
+func HashCode(code string) string {
+	h := sha256.Sum256([]byte(code))
+	return hex.EncodeToString(h[:])
 }

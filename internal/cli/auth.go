@@ -273,14 +273,6 @@ func runSignup(cmd *cobra.Command, args []string) error {
 	srpClient := srp.NewClient(email, password)
 	srpSalt, verifier := srpClient.ComputeVerifier()
 
-	// Signup with SRP credentials
-	signupResp, err := doSignup(apiBase, email, srpSalt, verifier)
-	if err != nil {
-		return fmt.Errorf("signup failed: %w", err)
-	}
-
-	fmt.Println("✓ Account created")
-
 	// Setup client-side encryption (2SKD)
 	fmt.Println("Setting up end-to-end encryption...")
 	encMgr := encryption.GetManager()
@@ -288,6 +280,27 @@ func runSignup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("encryption setup failed: %w", err)
 	}
+
+	// Generate X25519 keypair for vault sharing
+	fmt.Println("Generating vault sharing keys...")
+	publicKey, privateKey, err := crypto.GenerateX25519Keypair()
+	if err != nil {
+		return fmt.Errorf("keypair generation failed: %w", err)
+	}
+
+	// Encrypt private key with user's derived key
+	encryptedPrivateKey, err := encMgr.EncryptUserPrivateKey([]byte(privateKey))
+	if err != nil {
+		return fmt.Errorf("failed to encrypt private key: %w", err)
+	}
+
+	// Signup with SRP credentials and keypair
+	signupResp, err := doSignupWithKeypair(apiBase, email, srpSalt, verifier, publicKey, encryptedPrivateKey)
+	if err != nil {
+		return fmt.Errorf("signup failed: %w", err)
+	}
+
+	fmt.Println("✓ Account created")
 
 	// Store encryption salt on server
 	if err := storeSalt(apiBase, signupResp.Token, encSalt); err != nil {
@@ -497,6 +510,39 @@ func doSignup(apiBase, email, srpSalt, srpVerifier string) (*authResponse, error
 		"email":       email,
 		"srpSalt":     srpSalt,
 		"srpVerifier": srpVerifier,
+	})
+
+	req, err := http.NewRequest("POST", apiBase+"/auth/signup", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := authHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result authResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func doSignupWithKeypair(apiBase, email, srpSalt, srpVerifier, publicKey, encryptedPrivateKey string) (*authResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"email":               email,
+		"srpSalt":             srpSalt,
+		"srpVerifier":         srpVerifier,
+		"publicKey":           publicKey,
+		"encryptedPrivateKey": encryptedPrivateKey,
 	})
 
 	req, err := http.NewRequest("POST", apiBase+"/auth/signup", bytes.NewReader(body))

@@ -371,3 +371,43 @@ func (m *Manager) DecryptVaultKey(encryptedVaultKey string) ([]byte, error) {
 
 	return vaultKey, nil
 }
+
+// AAD for user private key encryption
+const AADUserPrivateKey = "sinesync-user-private-key-v1"
+
+// EncryptUserPrivateKey encrypts the user's X25519 private key with their derived key
+// Returns base64-encoded encrypted private key
+func (m *Manager) EncryptUserPrivateKey(privateKey []byte) (string, error) {
+	key, err := m.GetKey()
+	if err != nil {
+		return "", err
+	}
+
+	encrypted, err := crypto.Encrypt(privateKey, key, AADUserPrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("encrypt private key: %w", err)
+	}
+
+	return crypto.EncodeBase64(encrypted), nil
+}
+
+// DecryptUserPrivateKey decrypts the user's X25519 private key
+// Takes base64-encoded encrypted private key, returns raw private key string
+func (m *Manager) DecryptUserPrivateKey(encryptedPrivateKey string) (string, error) {
+	key, err := m.GetKey()
+	if err != nil {
+		return "", err
+	}
+
+	encrypted, err := crypto.DecodeBase64(encryptedPrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("decode private key: %w", err)
+	}
+
+	privateKey, err := crypto.Decrypt(encrypted, key, AADUserPrivateKey)
+	if err != nil {
+		return "", ErrDecryptFailed
+	}
+
+	return string(privateKey), nil
+}
