@@ -28,6 +28,55 @@ const (
 	DefaultAPIBase  = "https://api.sinesync.ai/v1"
 )
 
+// LocalVaultConfig stores vault configuration locally
+type localVaultConfig struct {
+	Vaults []localVault `json:"vaults"`
+}
+
+type localVault struct {
+	VaultID           string   `json:"vaultId"`
+	Name              string   `json:"name"`
+	EncryptedVaultKey string   `json:"encryptedVaultKey"`
+	Projects          []string `json:"projects"`
+	IsDefault         bool     `json:"isDefault"`
+}
+
+func localVaultConfigPath() string {
+	return filepath.Join(config.ConfigDir(), "vaults.json")
+}
+
+func loadLocalVaultConfig() (*localVaultConfig, error) {
+	data, err := os.ReadFile(localVaultConfigPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &localVaultConfig{Vaults: make([]localVault, 0)}, nil
+		}
+		return nil, err
+	}
+
+	var cfg localVaultConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}
+
+func getDefaultVaultID() (string, error) {
+	cfg, err := loadLocalVaultConfig()
+	if err != nil {
+		return "", err
+	}
+
+	for _, v := range cfg.Vaults {
+		if v.IsDefault {
+			return v.VaultID, nil
+		}
+	}
+
+	return "", fmt.Errorf("no default vault configured")
+}
+
 // SyncManager handles background cloud sync
 type SyncManager struct {
 	localStorage *storage.LocalStorage
@@ -322,6 +371,12 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		return 0, 0, fmt.Errorf("encryption key not available - please login again")
 	}
 
+	// Get default vault ID
+	vaultID, err := getDefaultVaultID()
+	if err != nil {
+		return 0, 0, fmt.Errorf("no vault configured - run 'sinesync vault sync' first: %w", err)
+	}
+
 	syncManifest := storage.GetSyncManifest()
 
 	// Check if we have pending operations that require manifest
@@ -480,7 +535,7 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		}
 		batch := toPush[i:end]
 
-		n, uploadedItems, err := m.pushBatchEncrypted(token, batch)
+		n, uploadedItems, err := m.pushBatchEncrypted(token, vaultID, batch)
 		if err != nil {
 			// If 401, return immediately so doSync can refresh token and retry
 			if isUnauthorizedError(err) {
@@ -734,10 +789,11 @@ type uploadedItem struct {
 	updatedAt time.Time
 }
 
-func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem) (int, []uploadedItem, error) {
+func (m *SyncManager) pushBatchEncrypted(token, vaultID string, batch []encryptedObsItem) (int, []uploadedItem, error) {
 	// Prepare items for URL request
 	type itemReq struct {
 		ID        string `json:"id"`
+		VaultID   string `json:"vaultId"`
 		Type      string `json:"type"`
 		SizeBytes int    `json:"sizeBytes"`
 		Checksum  string `json:"checksum"`
@@ -750,6 +806,7 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 	for _, item := range batch {
 		items = append(items, itemReq{
 			ID:        item.obs.ID,
+			VaultID:   vaultID,
 			Type:      "memory",
 			SizeBytes: len(item.encrypted),
 			Checksum:  item.checksum,
@@ -831,6 +888,7 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 			confirmItems = append(confirmItems, confirmItem{id: urlItem.ID, checksum: checksum})
 			confirmBodies = append(confirmBodies, map[string]interface{}{
 				"id":        urlItem.ID,
+				"vaultId":   vaultID,
 				"type":      "memory",
 				"sizeBytes": len(data),
 				"checksum":  checksum,
