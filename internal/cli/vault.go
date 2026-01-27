@@ -232,6 +232,26 @@ Use this to enable sharing for vaults created before vault key encryption was im
 	RunE: runVaultSetupKey,
 }
 
+var vaultReencryptCmd = &cobra.Command{
+	Use:   "reencrypt <vault-id>",
+	Short: "Re-encrypt vault observations with the vault key",
+	Long: `Re-encrypt all observations in a vault using the vault's encryption key.
+
+This is required for sharing vaults with other users. Observations encrypted
+with your personal key cannot be decrypted by others - they must be re-encrypted
+with the shared vault key.
+
+Use --project to re-encrypt only observations for a specific project.
+
+Example:
+  sinesync vault reencrypt abc123-def456
+  sinesync vault reencrypt abc123-def456 --project myproject`,
+	Args: cobra.ExactArgs(1),
+	RunE: runVaultReencrypt,
+}
+
+var reencryptProject string
+
 var shareEmail string
 
 func init() {
@@ -252,6 +272,8 @@ func init() {
 	vaultCmd.AddCommand(vaultAcceptCmd)
 	vaultCmd.AddCommand(vaultPendingCmd)
 	vaultCmd.AddCommand(vaultSetupKeyCmd)
+	vaultCmd.AddCommand(vaultReencryptCmd)
+	vaultReencryptCmd.Flags().StringVarP(&reencryptProject, "project", "p", "", "Only re-encrypt observations for this project")
 
 	// Share command flags
 	vaultShareCmd.Flags().StringVarP(&shareEmail, "email", "e", "", "Email address of the invitee (required)")
@@ -561,10 +583,10 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 	}
 
 	if fromVaultID == toVaultID && !migrateForce {
-		return fmt.Errorf("project is already in vault %s (use --force to upload observations anyway)", toVaultID)
+		return fmt.Errorf("project is already in vault %s (use --force to re-encrypt observations)", toVaultID)
 	}
 
-	// Verify target vault exists
+	// Verify target vault exists and get vault key
 	cfg, _ := loadLocalVaultConfig()
 	if cfg == nil {
 		return fmt.Errorf("no vault configuration - run 'sinesync vault sync' first")
@@ -578,6 +600,12 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 	}
 	if targetVaultName == "" {
 		return fmt.Errorf("vault %s not found - run 'sinesync vault sync' first", toVaultID)
+	}
+
+	// Get the vault key for encryption
+	vaultKey, err := GetVaultKey(toVaultID)
+	if err != nil {
+		return fmt.Errorf("failed to get vault key: %w\nRun 'sinesync vault setup-key %s' if the vault has no encryption key", err, toVaultID)
 	}
 
 	// Get encryption manager
@@ -595,62 +623,30 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load observations: %w", err)
 	}
 
-	var itemIds []string
+	var projectObs []storage.Observation
 	for _, obs := range observations {
 		if obs.Core.Project == projectName {
-			itemIds = append(itemIds, obs.ID)
+			projectObs = append(projectObs, obs)
 		}
 	}
 
-	if len(itemIds) == 0 {
+	if len(projectObs) == 0 {
 		fmt.Printf("No local observations for project '%s'\n", projectName)
 	} else {
-		fmt.Printf("Found %d observations to migrate\n", len(itemIds))
+		fmt.Printf("Found %d observations to re-encrypt and upload\n", len(projectObs))
 	}
 
 	apiBase := getAPIBase()
-	client := &http.Client{Timeout: 300 * time.Second} // 5 min timeout for large migrations
+	client := &http.Client{Timeout: 300 * time.Second}
 
-	// Use server-side migration API
-	var migrated, errors int
-	if len(itemIds) > 0 {
-		fmt.Println("Migrating observations (server-side)...")
+	// Re-encrypt and upload observations
+	var uploaded, errors int
+	if len(projectObs) > 0 {
+		fmt.Println("Re-encrypting with vault key and uploading...")
 
-		migrateReq := map[string]interface{}{
-			"itemIds":     itemIds,
-			"fromVaultId": fromVaultID,
-			"toVaultId":   toVaultID,
-		}
-		reqBody, _ := json.Marshal(migrateReq)
-		req, _ := http.NewRequest("POST", apiBase+"/sync/migrate", bytes.NewReader(reqBody))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		resp, err := client.Do(req)
+		uploaded, errors, err = reencryptAndUploadObservations(projectObs, vaultKey, toVaultID, token, apiBase, client, encMgr)
 		if err != nil {
-			return fmt.Errorf("migration request failed: %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("migration failed: %s", string(body))
-		}
-
-		var result struct {
-			Migrated     int      `json:"migrated"`
-			Errors       int      `json:"errors"`
-			ErrorDetails []string `json:"errorDetails"`
-		}
-		json.NewDecoder(resp.Body).Decode(&result)
-		migrated = result.Migrated
-		errors = result.Errors
-
-		if len(result.ErrorDetails) > 0 {
-			fmt.Println("  Some items had errors:")
-			for _, e := range result.ErrorDetails {
-				fmt.Printf("    - %s\n", e)
-			}
+			return fmt.Errorf("re-encryption failed: %w", err)
 		}
 	}
 
@@ -674,10 +670,10 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("✓ Migrated project '%s' to vault '%s'\n", projectName, targetVaultName)
 	} else {
-		fmt.Printf("✓ Uploaded observations for project '%s' to vault '%s'\n", projectName, targetVaultName)
+		fmt.Printf("✓ Re-encrypted observations for project '%s' in vault '%s'\n", projectName, targetVaultName)
 	}
-	if len(itemIds) > 0 {
-		fmt.Printf("  %d observations migrated", migrated)
+	if len(projectObs) > 0 {
+		fmt.Printf("  %d observations uploaded", uploaded)
 		if errors > 0 {
 			fmt.Printf(", %d errors", errors)
 		}
@@ -685,6 +681,259 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func runVaultReencrypt(cmd *cobra.Command, args []string) error {
+	vaultID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	// Verify vault exists and get vault key
+	cfg, _ := loadLocalVaultConfig()
+	if cfg == nil {
+		return fmt.Errorf("no vault configuration - run 'sinesync vault sync' first")
+	}
+	var vaultName string
+	var vaultProjects []string
+	for _, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			vaultName = v.Name
+			vaultProjects = v.Projects
+			break
+		}
+	}
+	if vaultName == "" {
+		return fmt.Errorf("vault %s not found - run 'sinesync vault sync' first", vaultID)
+	}
+
+	// Get the vault key for encryption
+	vaultKey, err := GetVaultKey(vaultID)
+	if err != nil {
+		return fmt.Errorf("failed to get vault key: %w\nRun 'sinesync vault setup-key %s' if the vault has no encryption key", err, vaultID)
+	}
+
+	// Get encryption manager
+	encMgr := encryption.GetManager()
+	if !encMgr.HasKey() {
+		return fmt.Errorf("encryption key not available - please login again")
+	}
+
+	// Get local storage
+	localStorage := storage.NewLocalStorage()
+
+	// Get observations
+	observations, err := localStorage.ListObservations()
+	if err != nil {
+		return fmt.Errorf("failed to load observations: %w", err)
+	}
+
+	// Filter observations belonging to this vault
+	var vaultObs []storage.Observation
+	projectSet := make(map[string]bool)
+	for _, p := range vaultProjects {
+		projectSet[p] = true
+	}
+
+	for _, obs := range observations {
+		// If --project flag is set, only include that project
+		if reencryptProject != "" {
+			if obs.Core.Project == reencryptProject {
+				vaultObs = append(vaultObs, obs)
+			}
+			continue
+		}
+
+		// Otherwise include all projects assigned to this vault
+		if projectSet[obs.Core.Project] {
+			vaultObs = append(vaultObs, obs)
+		}
+	}
+
+	if len(vaultObs) == 0 {
+		if reencryptProject != "" {
+			fmt.Printf("No local observations for project '%s' in vault '%s'\n", reencryptProject, vaultName)
+		} else {
+			fmt.Printf("No local observations for vault '%s'\n", vaultName)
+		}
+		return nil
+	}
+
+	fmt.Printf("Found %d observations to re-encrypt in vault '%s'\n", len(vaultObs), vaultName)
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 300 * time.Second}
+
+	fmt.Println("Re-encrypting with vault key and uploading...")
+
+	uploaded, errors, err := reencryptAndUploadObservations(vaultObs, vaultKey, vaultID, token, apiBase, client, encMgr)
+	if err != nil {
+		return fmt.Errorf("re-encryption failed: %w", err)
+	}
+
+	fmt.Printf("✓ Re-encrypted %d observations", uploaded)
+	if errors > 0 {
+		fmt.Printf(", %d errors", errors)
+	}
+	fmt.Println()
+	fmt.Println("\nVault observations are now encrypted with the vault key and can be shared.")
+
+	return nil
+}
+
+// reencryptAndUploadObservations re-encrypts observations with a vault key and uploads them
+func reencryptAndUploadObservations(observations []storage.Observation, vaultKey []byte, vaultID, token, apiBase string, client *http.Client, encMgr *encryption.Manager) (uploaded, errors int, err error) {
+	batchSize := 50
+
+	for i := 0; i < len(observations); i += batchSize {
+		end := i + batchSize
+		if end > len(observations) {
+			end = len(observations)
+		}
+		batch := observations[i:end]
+
+		// Prepare batch for upload
+		type itemReq struct {
+			ID        string `json:"id"`
+			VaultID   string `json:"vaultId"`
+			Type      string `json:"type"`
+			SizeBytes int    `json:"sizeBytes"`
+			Checksum  string `json:"checksum"`
+		}
+
+		var items []itemReq
+		itemData := make(map[string][]byte)
+
+		for _, obs := range batch {
+			// Re-encrypt with vault key
+			encrypted, err := encMgr.EncryptObservationWithKey(&obs, vaultKey)
+			if err != nil {
+				fmt.Printf("  Warning: encrypt failed for %s: %v\n", obs.ID, err)
+				errors++
+				continue
+			}
+
+			checksum := storage.Checksum(encrypted)[:16]
+			items = append(items, itemReq{
+				ID:        obs.ID,
+				VaultID:   vaultID,
+				Type:      "memory",
+				SizeBytes: len(encrypted),
+				Checksum:  checksum,
+			})
+			itemData[obs.ID] = encrypted
+		}
+
+		if len(items) == 0 {
+			continue
+		}
+
+		// Get upload URLs
+		body := map[string]interface{}{"items": items}
+		bodyBytes, _ := json.Marshal(body)
+
+		req, _ := http.NewRequest("POST", apiBase+"/sync/upload-urls", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return uploaded, errors, fmt.Errorf("get upload URLs: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return uploaded, errors, fmt.Errorf("get upload URLs failed %d: %s", resp.StatusCode, string(respBody))
+		}
+
+		var urlResp struct {
+			Items []struct {
+				ID        string `json:"id"`
+				UploadURL string `json:"uploadUrl"`
+			} `json:"items"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
+			resp.Body.Close()
+			return uploaded, errors, fmt.Errorf("decode upload URLs: %w", err)
+		}
+		resp.Body.Close()
+
+		// Upload to GCS
+		var confirmBodies []map[string]interface{}
+		for _, urlItem := range urlResp.Items {
+			data := itemData[urlItem.ID]
+			if data == nil {
+				continue
+			}
+
+			uploadReq, _ := http.NewRequest("PUT", urlItem.UploadURL, bytes.NewReader(data))
+			uploadReq.Header.Set("Content-Type", "application/octet-stream")
+
+			uploadResp, err := client.Do(uploadReq)
+			if err != nil {
+				errors++
+				continue
+			}
+			uploadResp.Body.Close()
+
+			if uploadResp.StatusCode == http.StatusOK || uploadResp.StatusCode == http.StatusCreated {
+				confirmBodies = append(confirmBodies, map[string]interface{}{
+					"id":        urlItem.ID,
+					"vaultId":   vaultID,
+					"type":      "memory",
+					"sizeBytes": len(data),
+					"checksum":  storage.Checksum(data)[:16],
+				})
+			} else {
+				errors++
+			}
+		}
+
+		if len(confirmBodies) == 0 {
+			continue
+		}
+
+		// Confirm uploads
+		confirmBody := map[string]interface{}{"items": confirmBodies}
+		confirmBytes, _ := json.Marshal(confirmBody)
+
+		confirmReq, _ := http.NewRequest("POST", apiBase+"/sync/confirm-uploads", bytes.NewReader(confirmBytes))
+		confirmReq.Header.Set("Content-Type", "application/json")
+		confirmReq.Header.Set("Authorization", "Bearer "+token)
+
+		confirmResp, err := client.Do(confirmReq)
+		if err != nil {
+			return uploaded, errors, fmt.Errorf("confirm uploads: %w", err)
+		}
+
+		if confirmResp.StatusCode != http.StatusOK {
+			confirmResp.Body.Close()
+			return uploaded, errors, fmt.Errorf("confirm failed")
+		}
+
+		var confirmResult struct {
+			Items []struct {
+				Success bool `json:"success"`
+			} `json:"items"`
+		}
+		json.NewDecoder(confirmResp.Body).Decode(&confirmResult)
+		confirmResp.Body.Close()
+
+		for _, result := range confirmResult.Items {
+			if result.Success {
+				uploaded++
+			} else {
+				errors++
+			}
+		}
+
+		fmt.Printf("  Batch %d/%d: %d uploaded\n", (i/batchSize)+1, (len(observations)+batchSize-1)/batchSize, len(confirmBodies))
+	}
+
+	return uploaded, errors, nil
 }
 
 func runVaultSync(cmd *cobra.Command, args []string) error {
@@ -1038,8 +1287,20 @@ func removeProjectFromLocalVault(vaultID, projectName string) {
 	}
 }
 
-// migrateProjectObservations migrates observations for a project to a vault using server-side API
+// migrateProjectObservations re-encrypts and uploads observations for a project to a vault
 func migrateProjectObservations(projectName, toVaultID, token string) error {
+	// Get vault key
+	vaultKey, err := GetVaultKey(toVaultID)
+	if err != nil {
+		return fmt.Errorf("failed to get vault key: %w\nRun 'sinesync vault setup-key %s' first", err, toVaultID)
+	}
+
+	// Get encryption manager
+	encMgr := encryption.GetManager()
+	if !encMgr.HasKey() {
+		return fmt.Errorf("encryption key not available - please login again")
+	}
+
 	// Get local storage
 	localStorage := storage.NewLocalStorage()
 
@@ -1049,68 +1310,35 @@ func migrateProjectObservations(projectName, toVaultID, token string) error {
 		return fmt.Errorf("failed to load observations: %w", err)
 	}
 
-	var itemIds []string
+	var projectObs []storage.Observation
 	for _, obs := range observations {
 		if obs.Core.Project == projectName {
-			itemIds = append(itemIds, obs.ID)
+			projectObs = append(projectObs, obs)
 		}
 	}
 
-	if len(itemIds) == 0 {
+	if len(projectObs) == 0 {
 		fmt.Printf("No local observations for project '%s'\n", projectName)
 		return nil
 	}
 
-	fmt.Printf("Found %d observations to migrate\n", len(itemIds))
-
-	// Get the source vault (default vault for items not yet assigned)
-	fromVaultID, _ := GetDefaultVaultID()
+	fmt.Printf("Found %d observations to re-encrypt and upload\n", len(projectObs))
 
 	apiBase := getAPIBase()
 	client := &http.Client{Timeout: 300 * time.Second}
 
-	fmt.Println("Migrating observations (server-side)...")
+	fmt.Println("Re-encrypting with vault key and uploading...")
 
-	migrateReq := map[string]interface{}{
-		"itemIds":     itemIds,
-		"fromVaultId": fromVaultID,
-		"toVaultId":   toVaultID,
-	}
-	reqBody, _ := json.Marshal(migrateReq)
-	req, _ := http.NewRequest("POST", apiBase+"/sync/migrate", bytes.NewReader(reqBody))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := client.Do(req)
+	uploaded, errors, err := reencryptAndUploadObservations(projectObs, vaultKey, toVaultID, token, apiBase, client, encMgr)
 	if err != nil {
-		return fmt.Errorf("migration request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("migration failed: %s", string(body))
+		return fmt.Errorf("re-encryption failed: %w", err)
 	}
 
-	var result struct {
-		Migrated     int      `json:"migrated"`
-		Errors       int      `json:"errors"`
-		ErrorDetails []string `json:"errorDetails"`
-	}
-	json.NewDecoder(resp.Body).Decode(&result)
-
-	fmt.Printf("✓ %d observations migrated", result.Migrated)
-	if result.Errors > 0 {
-		fmt.Printf(", %d errors", result.Errors)
+	fmt.Printf("✓ %d observations uploaded", uploaded)
+	if errors > 0 {
+		fmt.Printf(", %d errors", errors)
 	}
 	fmt.Println()
-
-	if len(result.ErrorDetails) > 0 {
-		fmt.Println("  Some items had errors:")
-		for _, e := range result.ErrorDetails {
-			fmt.Printf("    - %s\n", e)
-		}
-	}
 
 	return nil
 }

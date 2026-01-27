@@ -246,6 +246,52 @@ func (m *Manager) DecryptObservation(encrypted []byte) (*storage.Observation, er
 	return &obs, nil
 }
 
+// EncryptObservationWithKey encrypts an observation using a specific key (e.g., vault key)
+func (m *Manager) EncryptObservationWithKey(obs *storage.Observation, key []byte) ([]byte, error) {
+	// Serialize to JSON
+	jsonData, err := json.Marshal(obs)
+	if err != nil {
+		return nil, fmt.Errorf("marshal observation: %w", err)
+	}
+
+	// Compress
+	compressed, err := compress(jsonData)
+	if err != nil {
+		return nil, fmt.Errorf("compress: %w", err)
+	}
+
+	// Encrypt
+	encrypted, err := crypto.Encrypt(compressed, key, AADObservation)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt: %w", err)
+	}
+
+	return encrypted, nil
+}
+
+// DecryptObservationWithKey decrypts an observation using a specific key (e.g., vault key)
+func (m *Manager) DecryptObservationWithKey(encrypted []byte, key []byte) (*storage.Observation, error) {
+	// Decrypt
+	compressed, err := crypto.Decrypt(encrypted, key, AADObservation)
+	if err != nil {
+		return nil, ErrDecryptFailed
+	}
+
+	// Decompress
+	jsonData, err := decompress(compressed)
+	if err != nil {
+		return nil, fmt.Errorf("decompress: %w", err)
+	}
+
+	// Unmarshal
+	var obs storage.Observation
+	if err := json.Unmarshal(jsonData, &obs); err != nil {
+		return nil, fmt.Errorf("unmarshal observation: %w", err)
+	}
+
+	return &obs, nil
+}
+
 // EncryptData encrypts arbitrary data for cloud storage
 func (m *Manager) EncryptData(data []byte, aad string) ([]byte, error) {
 	key, err := m.GetKey()
