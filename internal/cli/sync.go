@@ -156,6 +156,32 @@ func runSync(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	pushSkipped := len(observations) - len(pending)
+
+	// Show per-vault breakdown
+	if len(pending) > 0 {
+		vaultCounts := make(map[string]int)
+		for _, item := range pending {
+			vaultCounts[item.vaultID]++
+		}
+		if len(vaultCounts) > 1 {
+			fmt.Println("Routing by vault:")
+			cfg, _ := loadLocalVaultConfig()
+			for vaultID, count := range vaultCounts {
+				vaultName := vaultID[:8] + "..."
+				if cfg != nil {
+					for _, v := range cfg.Vaults {
+						if v.VaultID == vaultID {
+							vaultName = v.Name
+							break
+						}
+					}
+				}
+				fmt.Printf("  %s: %d items\n", vaultName, count)
+			}
+			fmt.Println()
+		}
+	}
+
 	fmt.Printf("Pushing to cloud: %d items to upload, %d already synced\n", len(pending), pushSkipped)
 
 	// Push in batches
