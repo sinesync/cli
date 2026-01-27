@@ -16,6 +16,7 @@ import (
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/encryption"
+	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
 	kr "github.com/zalando/go-keyring"
 )
@@ -139,6 +140,20 @@ var vaultRemoveProjectCmd = &cobra.Command{
 	RunE:  runVaultRemoveProject,
 }
 
+var vaultMigrateProjectCmd = &cobra.Command{
+	Use:   "migrate-project <project-name> <to-vault-id>",
+	Short: "Migrate a project's observations to a different vault",
+	Long: `Migrate all observations for a project to a new vault.
+
+This re-encrypts all observations with the new vault's key and uploads
+them to the new vault. The project is then moved to the new vault.
+
+Example:
+  sinesync vault migrate-project myproject abc123-def456`,
+	Args: cobra.ExactArgs(2),
+	RunE: runVaultMigrateProject,
+}
+
 var vaultSyncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "Sync vault keys from server",
@@ -201,6 +216,7 @@ func init() {
 	vaultCmd.AddCommand(vaultProjectsCmd)
 	vaultCmd.AddCommand(vaultAddProjectCmd)
 	vaultCmd.AddCommand(vaultRemoveProjectCmd)
+	vaultCmd.AddCommand(vaultMigrateProjectCmd)
 	vaultCmd.AddCommand(vaultSyncCmd)
 	vaultCmd.AddCommand(vaultShareCmd)
 	vaultCmd.AddCommand(vaultInvitesCmd)
@@ -487,6 +503,192 @@ func runVaultRemoveProject(cmd *cobra.Command, args []string) error {
 	removeProjectFromLocalVault(vaultID, projectName)
 
 	fmt.Printf("✓ Removed project '%s' from vault\n", projectName)
+	return nil
+}
+
+func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
+	projectName := args[0]
+	toVaultID := args[1]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	// Find current vault for the project
+	fromVaultID, err := GetVaultForProject(projectName)
+	if err != nil || fromVaultID == "" {
+		return fmt.Errorf("project '%s' is not in any vault - use 'vault add-project' first", projectName)
+	}
+
+	if fromVaultID == toVaultID {
+		return fmt.Errorf("project is already in vault %s", toVaultID)
+	}
+
+	// Verify target vault exists
+	cfg, _ := loadLocalVaultConfig()
+	if cfg == nil {
+		return fmt.Errorf("no vault configuration - run 'sinesync vault sync' first")
+	}
+	var targetVaultName string
+	for _, v := range cfg.Vaults {
+		if v.VaultID == toVaultID {
+			targetVaultName = v.Name
+			break
+		}
+	}
+	if targetVaultName == "" {
+		return fmt.Errorf("vault %s not found - run 'sinesync vault sync' first", toVaultID)
+	}
+
+	// Get encryption manager
+	encMgr := encryption.GetManager()
+	if !encMgr.HasKey() {
+		return fmt.Errorf("encryption key not available - please login again")
+	}
+
+	// Get local storage
+	localStorage := storage.NewLocalStorage()
+
+	// Get observations for this project
+	observations, err := localStorage.ListObservations()
+	if err != nil {
+		return fmt.Errorf("failed to load observations: %w", err)
+	}
+
+	var matching []storage.Observation
+	for _, obs := range observations {
+		if obs.Core.Project == projectName {
+			matching = append(matching, obs)
+		}
+	}
+
+	if len(matching) == 0 {
+		fmt.Printf("No local observations for project '%s'\n", projectName)
+	} else {
+		fmt.Printf("Found %d observations to migrate\n", len(matching))
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	// Migrate observations to new vault
+	migrated := 0
+	errors := 0
+	for i, obs := range matching {
+		fmt.Printf("\rMigrating: %d/%d", i+1, len(matching))
+
+		// Encrypt observation
+		encrypted, err := encMgr.EncryptObservation(&obs)
+		if err != nil {
+			errors++
+			continue
+		}
+		checksum := storage.Checksum(encrypted)[:16]
+
+		// Get upload URL for new vault
+		uploadReq := map[string]interface{}{
+			"id":        obs.ID,
+			"vaultId":   toVaultID,
+			"type":      "memory",
+			"sizeBytes": len(encrypted),
+			"checksum":  checksum,
+		}
+		reqBody, _ := json.Marshal(uploadReq)
+		req, _ := http.NewRequest("POST", apiBase+"/sync/upload-url", bytes.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			errors++
+			continue
+		}
+
+		var uploadResp struct {
+			ID        string `json:"id"`
+			UploadURL string `json:"uploadUrl"`
+		}
+		json.NewDecoder(resp.Body).Decode(&uploadResp)
+		resp.Body.Close()
+
+		if uploadResp.UploadURL == "" {
+			errors++
+			continue
+		}
+
+		// Upload to cloud storage
+		uploadReq2, _ := http.NewRequest("PUT", uploadResp.UploadURL, bytes.NewReader(encrypted))
+		uploadReq2.Header.Set("Content-Type", "application/octet-stream")
+		uploadResp2, err := client.Do(uploadReq2)
+		if err != nil {
+			errors++
+			continue
+		}
+		uploadResp2.Body.Close()
+
+		if uploadResp2.StatusCode >= 300 {
+			errors++
+			continue
+		}
+
+		// Confirm upload
+		confirmReq := map[string]interface{}{
+			"id":        obs.ID,
+			"vaultId":   toVaultID,
+			"type":      "memory",
+			"sizeBytes": len(encrypted),
+			"checksum":  checksum,
+		}
+		confirmBody, _ := json.Marshal(confirmReq)
+		req3, _ := http.NewRequest("POST", apiBase+"/sync/confirm-upload", bytes.NewReader(confirmBody))
+		req3.Header.Set("Content-Type", "application/json")
+		req3.Header.Set("Authorization", "Bearer "+token)
+
+		resp3, err := client.Do(req3)
+		if err != nil {
+			errors++
+			continue
+		}
+		resp3.Body.Close()
+
+		if resp3.StatusCode == http.StatusOK {
+			migrated++
+		} else {
+			errors++
+		}
+	}
+
+	if len(matching) > 0 {
+		fmt.Println() // newline after progress
+	}
+
+	// Update server: remove from old vault, add to new vault
+	// Remove from old vault
+	delReq, _ := http.NewRequest("DELETE", apiBase+"/vaults/"+fromVaultID+"/projects/"+url.PathEscape(projectName), nil)
+	delReq.Header.Set("Authorization", "Bearer "+token)
+	client.Do(delReq)
+
+	// Add to new vault
+	addBody, _ := json.Marshal(map[string]string{"projectName": projectName})
+	addReq, _ := http.NewRequest("POST", apiBase+"/vaults/"+toVaultID+"/projects", bytes.NewReader(addBody))
+	addReq.Header.Set("Content-Type", "application/json")
+	addReq.Header.Set("Authorization", "Bearer "+token)
+	client.Do(addReq)
+
+	// Update local config
+	removeProjectFromLocalVault(fromVaultID, projectName)
+	addProjectToLocalVault(toVaultID, projectName)
+
+	fmt.Printf("✓ Migrated project '%s' to vault '%s'\n", projectName, targetVaultName)
+	if len(matching) > 0 {
+		fmt.Printf("  %d observations migrated", migrated)
+		if errors > 0 {
+			fmt.Printf(", %d errors", errors)
+		}
+		fmt.Println()
+	}
+
 	return nil
 }
 
