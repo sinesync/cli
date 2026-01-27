@@ -63,10 +63,26 @@ var logoutCmd = &cobra.Command{
 	RunE:  runLogout,
 }
 
+var keypairCmd = &cobra.Command{
+	Use:   "keypair",
+	Short: "Generate or regenerate your vault sharing keypair",
+	Long: `Generate a new X25519 keypair for vault sharing.
+
+This is required if you signed up via the website, or if you want to
+rotate your keypair for security. The private key is encrypted with
+your local encryption key before being uploaded.
+
+Note: Regenerating your keypair will NOT affect existing vault shares.
+You will still be able to access vaults that were shared with your
+previous public key.`,
+	RunE: runKeypair,
+}
+
 func init() {
 	rootCmd.AddCommand(loginCmd)
 	rootCmd.AddCommand(signupCmd)
 	rootCmd.AddCommand(logoutCmd)
+	rootCmd.AddCommand(keypairCmd)
 }
 
 func getAPIBase() string {
@@ -218,6 +234,9 @@ func runLogin(cmd *cobra.Command, args []string) error {
 
 	// Update last auth time
 	keychain.SetLastAuth(time.Now())
+
+	// Check if user has a keypair, generate one if not
+	checkAndGenerateKeypair(authCfg.Token)
 
 	fmt.Println()
 	fmt.Println("✓ Logged in successfully!")
@@ -388,6 +407,109 @@ func runLogout(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println("✓ Logged out")
+	return nil
+}
+
+func runKeypair(cmd *cobra.Command, args []string) error {
+	authCfg, err := loadAuthConfig()
+	if err != nil || authCfg == nil {
+		return fmt.Errorf("not logged in - please run 'sinesync login' first")
+	}
+
+	return generateAndUploadKeypair(authCfg.Token, true)
+}
+
+// generateAndUploadKeypair generates a new X25519 keypair and uploads it
+// If showSuccess is true, prints success message (used by manual command)
+func generateAndUploadKeypair(token string, showSuccess bool) error {
+	encMgr := encryption.GetManager()
+
+	// Verify encryption is set up
+	_, err := encMgr.GetKey()
+	if err != nil {
+		return fmt.Errorf("encryption not set up - please run 'sinesync login' first")
+	}
+
+	// Generate X25519 keypair
+	fmt.Println("Generating vault sharing keypair...")
+	publicKey, privateKey, err := crypto.GenerateX25519Keypair()
+	if err != nil {
+		return fmt.Errorf("keypair generation failed: %w", err)
+	}
+
+	// Encrypt private key with user's derived key
+	encryptedPrivateKey, err := encMgr.EncryptUserPrivateKey([]byte(privateKey))
+	if err != nil {
+		return fmt.Errorf("failed to encrypt private key: %w", err)
+	}
+
+	// Upload to server
+	apiBase := getAPIBase()
+	body, _ := json.Marshal(map[string]string{
+		"publicKey":           publicKey,
+		"encryptedPrivateKey": encryptedPrivateKey,
+	})
+
+	req, err := http.NewRequest("POST", apiBase+"/users/keypair", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload keypair: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(respBody))
+	}
+
+	if showSuccess {
+		fmt.Println("✓ Vault sharing keypair generated and uploaded")
+		fmt.Println("  You can now share vaults with other users")
+	}
+
+	return nil
+}
+
+// checkAndGenerateKeypair checks if user has a keypair, generates one if not
+func checkAndGenerateKeypair(token string) error {
+	apiBase := getAPIBase()
+
+	// Check if user already has a keypair
+	req, err := http.NewRequest("GET", apiBase+"/users/keypair", nil)
+	if err != nil {
+		return nil // Don't fail login for this
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil // Don't fail login for this
+	}
+	defer resp.Body.Close()
+
+	// If user has a keypair (200 OK), nothing to do
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	// User doesn't have a keypair, generate one
+	fmt.Println()
+	fmt.Println("Setting up vault sharing keypair...")
+	if err := generateAndUploadKeypair(token, false); err != nil {
+		fmt.Printf("Warning: could not generate keypair: %v\n", err)
+		fmt.Println("You can run 'sinesync keypair' later to enable vault sharing")
+		return nil
+	}
+	fmt.Println("✓ Vault sharing enabled")
+
 	return nil
 }
 
