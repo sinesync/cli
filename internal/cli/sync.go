@@ -126,7 +126,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 					fmt.Printf("  Warning: failed to encrypt %s: %v\n", obs.ID, err)
 					continue
 				}
-				pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID, project: obs.Core.Project})
+				pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID})
 				continue
 			}
 		}
@@ -145,7 +145,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		if cloudChecksum, ok := cloudItems[obs.ID]; ok && cloudChecksum == checksum {
 			continue
 		}
-		pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID, project: obs.Core.Project})
+		pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID})
 	}
 
 	fmt.Printf("Local: %d items, Cloud: %d items\n", len(localItems), len(cloudItems))
@@ -185,7 +185,6 @@ func runSync(cmd *cobra.Command, args []string) error {
 			dataSize int
 			checksum string
 			vaultID  string
-			project  string
 			err      error
 		}
 		results := make(chan uploadResult, len(batch))
@@ -195,10 +194,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 				results <- uploadResult{index: j, err: fmt.Errorf("no URL")}
 				continue
 			}
-			go func(idx int, url string, data []byte, id, checksum, vaultID, project string) {
+			go func(idx int, url string, data []byte, id, checksum, vaultID string) {
 				err := uploadToGCS(url, data)
-				results <- uploadResult{index: idx, id: id, dataSize: len(data), checksum: checksum, vaultID: vaultID, project: project, err: err}
-			}(j, urls[j].UploadURL, item.data, urls[j].ID, item.checksum, item.vaultID, item.project)
+				results <- uploadResult{index: idx, id: id, dataSize: len(data), checksum: checksum, vaultID: vaultID, err: err}
+			}(j, urls[j].UploadURL, item.data, urls[j].ID, item.checksum, item.vaultID)
 		}
 
 		// Collect results
@@ -216,9 +215,6 @@ func runSync(cmd *cobra.Command, args []string) error {
 				"type":      "memory",
 				"sizeBytes": res.dataSize,
 				"checksum":  res.checksum,
-			}
-			if res.project != "" {
-				confirmItem["project"] = res.project
 			}
 			confirmItems = append(confirmItems, confirmItem)
 		}
@@ -400,7 +396,7 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 		}
 
 		// Push encrypted data to cloud
-		err = pushToCloud(apiBase, token, obs.ID, "memory", vaultID, obs.Core.Project, encrypted)
+		err = pushToCloud(apiBase, token, obs.ID, "memory", vaultID, encrypted)
 		if err != nil {
 			errors++
 			lastError = fmt.Sprintf("push %s: %v", obs.ID, err)
@@ -662,7 +658,6 @@ type pendingItem struct {
 	data     []byte
 	checksum string
 	vaultID  string
-	project  string
 }
 
 func getUploadUrlsBatch(apiBase, token string, items []pendingItem) ([]uploadURLResponse, error) {
@@ -674,9 +669,6 @@ func getUploadUrlsBatch(apiBase, token string, items []pendingItem) ([]uploadURL
 			"type":      "memory",
 			"sizeBytes": len(item.data),
 			"checksum":  item.checksum,
-		}
-		if item.project != "" {
-			reqItem["project"] = item.project
 		}
 		reqItems[i] = reqItem
 	}
@@ -803,7 +795,7 @@ func confirmUploadsBatch(apiBase, token string, items []map[string]interface{}) 
 	return result.Items, nil
 }
 
-func pushToCloud(apiBase, token, id, itemType, vaultID, project string, data []byte) error {
+func pushToCloud(apiBase, token, id, itemType, vaultID string, data []byte) error {
 	checksum := storage.Checksum(data)[:16]
 
 	// Step 1: Request presigned upload URL
@@ -813,9 +805,6 @@ func pushToCloud(apiBase, token, id, itemType, vaultID, project string, data []b
 		"type":      itemType,
 		"sizeBytes": len(data),
 		"checksum":  checksum,
-	}
-	if project != "" {
-		uploadReq["project"] = project
 	}
 	uploadReqBytes, _ := json.Marshal(uploadReq)
 
@@ -872,9 +861,6 @@ func pushToCloud(apiBase, token, id, itemType, vaultID, project string, data []b
 		"type":      itemType,
 		"sizeBytes": len(data),
 		"checksum":  checksum,
-	}
-	if project != "" {
-		confirmReq["project"] = project
 	}
 	confirmReqBytes, _ := json.Marshal(confirmReq)
 
