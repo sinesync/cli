@@ -563,111 +563,63 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load observations: %w", err)
 	}
 
-	var matching []storage.Observation
+	var itemIds []string
 	for _, obs := range observations {
 		if obs.Core.Project == projectName {
-			matching = append(matching, obs)
+			itemIds = append(itemIds, obs.ID)
 		}
 	}
 
-	if len(matching) == 0 {
+	if len(itemIds) == 0 {
 		fmt.Printf("No local observations for project '%s'\n", projectName)
 	} else {
-		fmt.Printf("Found %d observations to migrate\n", len(matching))
+		fmt.Printf("Found %d observations to migrate\n", len(itemIds))
 	}
 
 	apiBase := getAPIBase()
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 300 * time.Second} // 5 min timeout for large migrations
 
-	// Migrate observations to new vault
-	migrated := 0
-	errors := 0
-	for i, obs := range matching {
-		fmt.Printf("\rMigrating: %d/%d", i+1, len(matching))
+	// Use server-side migration API
+	var migrated, errors int
+	if len(itemIds) > 0 {
+		fmt.Println("Migrating observations (server-side)...")
 
-		// Encrypt observation
-		encrypted, err := encMgr.EncryptObservation(&obs)
-		if err != nil {
-			errors++
-			continue
+		migrateReq := map[string]interface{}{
+			"itemIds":     itemIds,
+			"fromVaultId": fromVaultID,
+			"toVaultId":   toVaultID,
 		}
-		checksum := storage.Checksum(encrypted)[:16]
-
-		// Get upload URL for new vault
-		uploadReq := map[string]interface{}{
-			"id":        obs.ID,
-			"vaultId":   toVaultID,
-			"type":      "memory",
-			"sizeBytes": len(encrypted),
-			"checksum":  checksum,
-		}
-		reqBody, _ := json.Marshal(uploadReq)
-		req, _ := http.NewRequest("POST", apiBase+"/sync/upload-url", bytes.NewReader(reqBody))
+		reqBody, _ := json.Marshal(migrateReq)
+		req, _ := http.NewRequest("POST", apiBase+"/sync/migrate", bytes.NewReader(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
 
 		resp, err := client.Do(req)
 		if err != nil {
-			errors++
-			continue
+			return fmt.Errorf("migration request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("migration failed: %s", string(body))
 		}
 
-		var uploadResp struct {
-			ID        string `json:"id"`
-			UploadURL string `json:"uploadUrl"`
+		var result struct {
+			Migrated     int      `json:"migrated"`
+			Errors       int      `json:"errors"`
+			ErrorDetails []string `json:"errorDetails"`
 		}
-		json.NewDecoder(resp.Body).Decode(&uploadResp)
-		resp.Body.Close()
+		json.NewDecoder(resp.Body).Decode(&result)
+		migrated = result.Migrated
+		errors = result.Errors
 
-		if uploadResp.UploadURL == "" {
-			errors++
-			continue
+		if len(result.ErrorDetails) > 0 {
+			fmt.Println("  Some items had errors:")
+			for _, e := range result.ErrorDetails {
+				fmt.Printf("    - %s\n", e)
+			}
 		}
-
-		// Upload to cloud storage
-		uploadReq2, _ := http.NewRequest("PUT", uploadResp.UploadURL, bytes.NewReader(encrypted))
-		uploadReq2.Header.Set("Content-Type", "application/octet-stream")
-		uploadResp2, err := client.Do(uploadReq2)
-		if err != nil {
-			errors++
-			continue
-		}
-		uploadResp2.Body.Close()
-
-		if uploadResp2.StatusCode >= 300 {
-			errors++
-			continue
-		}
-
-		// Confirm upload
-		confirmReq := map[string]interface{}{
-			"id":        obs.ID,
-			"vaultId":   toVaultID,
-			"type":      "memory",
-			"sizeBytes": len(encrypted),
-			"checksum":  checksum,
-		}
-		confirmBody, _ := json.Marshal(confirmReq)
-		req3, _ := http.NewRequest("POST", apiBase+"/sync/confirm-upload", bytes.NewReader(confirmBody))
-		req3.Header.Set("Content-Type", "application/json")
-		req3.Header.Set("Authorization", "Bearer "+token)
-
-		resp3, err := client.Do(req3)
-		if err != nil {
-			errors++
-			continue
-		}
-		resp3.Body.Close()
-
-		if resp3.StatusCode == http.StatusOK {
-			migrated++
-		} else {
-			errors++
-		}
-	}
-
-	if len(matching) > 0 {
-		fmt.Println() // newline after progress
 	}
 
 	// Update server: remove from old vault, add to new vault (only if different vaults)
@@ -692,7 +644,7 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("✓ Uploaded observations for project '%s' to vault '%s'\n", projectName, targetVaultName)
 	}
-	if len(matching) > 0 {
+	if len(itemIds) > 0 {
 		fmt.Printf("  %d observations migrated", migrated)
 		if errors > 0 {
 			fmt.Printf(", %d errors", errors)
