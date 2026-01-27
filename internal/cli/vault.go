@@ -872,8 +872,9 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 		}
 
 		if confirmResp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(confirmResp.Body)
 			confirmResp.Body.Close()
-			return uploaded, errors, fmt.Errorf("confirm failed")
+			return uploaded, errors, fmt.Errorf("confirm failed: %d - %s", confirmResp.StatusCode, string(respBody))
 		}
 
 		var confirmResult struct {
