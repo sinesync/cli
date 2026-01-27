@@ -293,7 +293,6 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Println("Connecting to claude-mem...")
 	adapter, err := adapters.NewClaudeMemAdapter(true)
 	if err != nil || adapter == nil {
 		return fmt.Errorf("failed to connect to claude-mem: %w", err)
@@ -303,34 +302,20 @@ func runImport(cmd *cobra.Command, args []string) error {
 	// Initialize local storage
 	localStorage := storage.NewLocalStorage()
 
-	// Initialize embedder
-	fmt.Println("Initializing embedding model...")
+	// Initialize embedder (silently)
 	embedder, _ := embeddings.NewProvider()
-	if embedder != nil && embedder.IsReady() {
-		fmt.Println("  Using ONNX model for embeddings")
-	} else {
-		fmt.Println("  Using fallback embeddings (ONNX model not available)")
-	}
 
 	// Import all observations from adapter (returns canonical format)
-	fmt.Println("Loading observations from claude-mem...")
 	observations, err := adapter.Import(ctx, 0)
 	if err != nil {
 		return fmt.Errorf("failed to import observations: %w", err)
 	}
-	total := len(observations)
-	fmt.Printf("Found %d observations to process\n", total)
 
 	imported := 0
 	skipped := 0
 	filtered := 0
 
-	for i, obs := range observations {
-		// Progress every 100 observations
-		if (i+1)%100 == 0 || i+1 == total {
-			fmt.Printf("\rProcessing: %d/%d (imported: %d, skipped: %d, filtered: %d)", i+1, total, imported, skipped, filtered)
-		}
-
+	for _, obs := range observations {
 		// Check project filter
 		if cfg != nil && cfg.Sync != nil && !cfg.ShouldSyncProject(obs.Core.Project) {
 			filtered++
@@ -364,15 +349,13 @@ func runImport(cmd *cobra.Command, args []string) error {
 		imported++
 	}
 
-	// Final summary
-	fmt.Println() // New line after progress
-	fmt.Println()
-	fmt.Println("Import complete:")
-	fmt.Printf("  Imported: %d\n", imported)
-	fmt.Printf("  Skipped (already exists): %d\n", skipped)
-	if filtered > 0 {
-		fmt.Printf("  Filtered (project rules): %d\n", filtered)
+	// Concise summary - only print if something happened
+	if imported > 0 {
+		fmt.Printf("Imported %d observations from claude-mem\n", imported)
+	} else if filtered > 0 {
+		fmt.Printf("claude-mem: %d filtered by project rules\n", filtered)
 	}
+	// Silent if nothing to import (all skipped as already existing)
 
 	return nil
 }

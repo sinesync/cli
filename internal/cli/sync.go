@@ -70,6 +70,12 @@ func runSync(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("encryption key not available - please login again")
 	}
 
+	// Get default vault ID
+	vaultID, err := GetDefaultVaultID()
+	if err != nil {
+		return fmt.Errorf("no vault configured - run 'sinesync vault sync' first: %w", err)
+	}
+
 	apiBase := getAPIBase()
 	localStorage := storage.NewLocalStorage()
 
@@ -111,7 +117,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		if cloudChecksum, exists := cloudItems[obs.ID]; exists && cloudChecksum == checksum {
 			continue
 		}
-		pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum})
+		pending = append(pending, pendingItem{obs: obs, data: encrypted, checksum: checksum, vaultID: vaultID, project: obs.Core.Project})
 	}
 
 	fmt.Printf("Local: %d items, Cloud: %d items\n", len(localItems), len(cloudItems))
@@ -150,6 +156,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 			id       string
 			dataSize int
 			checksum string
+			vaultID  string
+			project  string
 			err      error
 		}
 		results := make(chan uploadResult, len(batch))
@@ -159,10 +167,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 				results <- uploadResult{index: j, err: fmt.Errorf("no URL")}
 				continue
 			}
-			go func(idx int, url string, data []byte, id, checksum string) {
+			go func(idx int, url string, data []byte, id, checksum, vaultID, project string) {
 				err := uploadToGCS(url, data)
-				results <- uploadResult{index: idx, id: id, dataSize: len(data), checksum: checksum, err: err}
-			}(j, urls[j].UploadURL, item.data, urls[j].ID, item.checksum)
+				results <- uploadResult{index: idx, id: id, dataSize: len(data), checksum: checksum, vaultID: vaultID, project: project, err: err}
+			}(j, urls[j].UploadURL, item.data, urls[j].ID, item.checksum, item.vaultID, item.project)
 		}
 
 		// Collect results
@@ -174,12 +182,17 @@ func runSync(cmd *cobra.Command, args []string) error {
 				lastPushError = fmt.Sprintf("upload: %v", res.err)
 				continue
 			}
-			confirmItems = append(confirmItems, map[string]interface{}{
+			confirmItem := map[string]interface{}{
 				"id":        res.id,
+				"vaultId":   res.vaultID,
 				"type":      "memory",
 				"sizeBytes": res.dataSize,
 				"checksum":  res.checksum,
-			})
+			}
+			if res.project != "" {
+				confirmItem["project"] = res.project
+			}
+			confirmItems = append(confirmItems, confirmItem)
 		}
 
 		// Confirm uploads in batch
@@ -301,6 +314,12 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("encryption key not available - please login again")
 	}
 
+	// Get default vault ID
+	vaultID, err := GetDefaultVaultID()
+	if err != nil {
+		return fmt.Errorf("no vault configured - run 'sinesync vault sync' first: %w", err)
+	}
+
 	apiBase := getAPIBase()
 	localStorage := storage.NewLocalStorage()
 
@@ -353,7 +372,7 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 		}
 
 		// Push encrypted data to cloud
-		err = pushToCloud(apiBase, token, obs.ID, "memory", encrypted)
+		err = pushToCloud(apiBase, token, obs.ID, "memory", vaultID, obs.Core.Project, encrypted)
 		if err != nil {
 			errors++
 			lastError = fmt.Sprintf("push %s: %v", obs.ID, err)
@@ -614,17 +633,24 @@ type pendingItem struct {
 	obs      storage.Observation
 	data     []byte
 	checksum string
+	vaultID  string
+	project  string
 }
 
 func getUploadUrlsBatch(apiBase, token string, items []pendingItem) ([]uploadURLResponse, error) {
 	reqItems := make([]map[string]interface{}, len(items))
 	for i, item := range items {
-		reqItems[i] = map[string]interface{}{
+		reqItem := map[string]interface{}{
 			"id":        item.obs.ID,
+			"vaultId":   item.vaultID,
 			"type":      "memory",
 			"sizeBytes": len(item.data),
 			"checksum":  item.checksum,
 		}
+		if item.project != "" {
+			reqItem["project"] = item.project
+		}
+		reqItems[i] = reqItem
 	}
 
 	body := map[string]interface{}{"items": reqItems}
@@ -749,15 +775,19 @@ func confirmUploadsBatch(apiBase, token string, items []map[string]interface{}) 
 	return result.Items, nil
 }
 
-func pushToCloud(apiBase, token, id, itemType string, data []byte) error {
+func pushToCloud(apiBase, token, id, itemType, vaultID, project string, data []byte) error {
 	checksum := storage.Checksum(data)[:16]
 
 	// Step 1: Request presigned upload URL
 	uploadReq := map[string]interface{}{
 		"id":        id,
+		"vaultId":   vaultID,
 		"type":      itemType,
 		"sizeBytes": len(data),
 		"checksum":  checksum,
+	}
+	if project != "" {
+		uploadReq["project"] = project
 	}
 	uploadReqBytes, _ := json.Marshal(uploadReq)
 
@@ -810,9 +840,13 @@ func pushToCloud(apiBase, token, id, itemType string, data []byte) error {
 	// Step 3: Confirm upload with API
 	confirmReq := map[string]interface{}{
 		"id":        uploadResp.ID,
+		"vaultId":   vaultID,
 		"type":      itemType,
 		"sizeBytes": len(data),
 		"checksum":  checksum,
+	}
+	if project != "" {
+		confirmReq["project"] = project
 	}
 	confirmReqBytes, _ := json.Marshal(confirmReq)
 
