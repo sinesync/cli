@@ -129,9 +129,19 @@ var vaultProjectsCmd = &cobra.Command{
 var vaultAddProjectCmd = &cobra.Command{
 	Use:   "add-project <vault-id> <project-name>",
 	Short: "Add a project to a vault",
-	Args:  cobra.ExactArgs(2),
-	RunE:  runVaultAddProject,
+	Long: `Add a project to a vault for sync routing.
+
+Use --migrate to also migrate existing observations for the project
+to the vault (server-side, fast).
+
+Example:
+  sinesync vault add-project abc123 myproject
+  sinesync vault add-project abc123 myproject --migrate`,
+	Args: cobra.ExactArgs(2),
+	RunE: runVaultAddProject,
 }
+
+var addProjectMigrate bool
 
 var vaultRemoveProjectCmd = &cobra.Command{
 	Use:   "remove-project <vault-id> <project-name>",
@@ -221,6 +231,7 @@ func init() {
 	vaultCmd.AddCommand(vaultDeleteCmd)
 	vaultCmd.AddCommand(vaultProjectsCmd)
 	vaultCmd.AddCommand(vaultAddProjectCmd)
+	vaultAddProjectCmd.Flags().BoolVarP(&addProjectMigrate, "migrate", "m", false, "Migrate existing observations to the vault")
 	vaultCmd.AddCommand(vaultRemoveProjectCmd)
 	vaultCmd.AddCommand(vaultMigrateProjectCmd)
 	vaultMigrateProjectCmd.Flags().BoolVarP(&migrateForce, "force", "f", false, "Upload observations even if project is already in target vault")
@@ -474,6 +485,16 @@ func runVaultAddProject(cmd *cobra.Command, args []string) error {
 	addProjectToLocalVault(vaultID, projectName)
 
 	fmt.Printf("✓ Added project '%s' to vault\n", projectName)
+
+	// Migrate observations if requested
+	if addProjectMigrate {
+		fmt.Println()
+		if err := migrateProjectObservations(projectName, vaultID, token); err != nil {
+			fmt.Printf("Warning: migration failed: %v\n", err)
+			fmt.Println("You can run 'sinesync vault migrate-project' later to retry")
+		}
+	}
+
 	return nil
 }
 
@@ -959,6 +980,83 @@ func removeProjectFromLocalVault(vaultID, projectName string) {
 			return
 		}
 	}
+}
+
+// migrateProjectObservations migrates observations for a project to a vault using server-side API
+func migrateProjectObservations(projectName, toVaultID, token string) error {
+	// Get local storage
+	localStorage := storage.NewLocalStorage()
+
+	// Get observations for this project
+	observations, err := localStorage.ListObservations()
+	if err != nil {
+		return fmt.Errorf("failed to load observations: %w", err)
+	}
+
+	var itemIds []string
+	for _, obs := range observations {
+		if obs.Core.Project == projectName {
+			itemIds = append(itemIds, obs.ID)
+		}
+	}
+
+	if len(itemIds) == 0 {
+		fmt.Printf("No local observations for project '%s'\n", projectName)
+		return nil
+	}
+
+	fmt.Printf("Found %d observations to migrate\n", len(itemIds))
+
+	// Get the source vault (default vault for items not yet assigned)
+	fromVaultID, _ := GetDefaultVaultID()
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 300 * time.Second}
+
+	fmt.Println("Migrating observations (server-side)...")
+
+	migrateReq := map[string]interface{}{
+		"itemIds":     itemIds,
+		"fromVaultId": fromVaultID,
+		"toVaultId":   toVaultID,
+	}
+	reqBody, _ := json.Marshal(migrateReq)
+	req, _ := http.NewRequest("POST", apiBase+"/sync/migrate", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("migration request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("migration failed: %s", string(body))
+	}
+
+	var result struct {
+		Migrated     int      `json:"migrated"`
+		Errors       int      `json:"errors"`
+		ErrorDetails []string `json:"errorDetails"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	fmt.Printf("✓ %d observations migrated", result.Migrated)
+	if result.Errors > 0 {
+		fmt.Printf(", %d errors", result.Errors)
+	}
+	fmt.Println()
+
+	if len(result.ErrorDetails) > 0 {
+		fmt.Println("  Some items had errors:")
+		for _, e := range result.ErrorDetails {
+			fmt.Printf("    - %s\n", e)
+		}
+	}
+
+	return nil
 }
 
 // GetVaultForProject returns the vault ID for a given project
