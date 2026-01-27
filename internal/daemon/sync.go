@@ -77,6 +77,45 @@ func getDefaultVaultID() (string, error) {
 	return "", fmt.Errorf("no default vault configured")
 }
 
+// getVaultIDForObservation returns the vault ID for an observation based on its project
+func getVaultIDForObservation(project string, defaultVaultID string) string {
+	if project == "" {
+		return defaultVaultID
+	}
+
+	cfg, err := loadLocalVaultConfig()
+	if err != nil {
+		return defaultVaultID
+	}
+
+	// Find vault that has this project assigned
+	for _, v := range cfg.Vaults {
+		for _, p := range v.Projects {
+			if p == project {
+				return v.VaultID
+			}
+		}
+	}
+
+	return defaultVaultID
+}
+
+// getVaultName returns the vault name for a given vault ID
+func getVaultName(vaultID string) string {
+	cfg, err := loadLocalVaultConfig()
+	if err != nil {
+		return vaultID[:8] // Return truncated ID as fallback
+	}
+
+	for _, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			return v.Name
+		}
+	}
+
+	return vaultID[:8]
+}
+
 // SyncManager handles background cloud sync
 type SyncManager struct {
 	localStorage *storage.LocalStorage
@@ -371,8 +410,8 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		return 0, 0, fmt.Errorf("encryption key not available - please login again")
 	}
 
-	// Get default vault ID
-	vaultID, err := getDefaultVaultID()
+	// Get default vault ID (fallback for projects not assigned to a vault)
+	defaultVaultID, err := getDefaultVaultID()
 	if err != nil {
 		return 0, 0, fmt.Errorf("no vault configured - run 'sinesync vault sync' first: %w", err)
 	}
@@ -483,6 +522,7 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 				obs:       obs,
 				encrypted: encrypted,
 				checksum:  checksum,
+				vaultID:   getVaultIDForObservation(obs.Core.Project, defaultVaultID),
 			})
 		}
 	}
@@ -526,6 +566,19 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		syncManifest.MarkSeen(item.ID)
 	}
 
+	// Group items by vault for logging
+	vaultCounts := make(map[string]int)
+	for _, item := range toPush {
+		vaultCounts[item.vaultID]++
+	}
+	if len(vaultCounts) > 0 {
+		var vaultInfo []string
+		for vaultID, count := range vaultCounts {
+			vaultInfo = append(vaultInfo, fmt.Sprintf("%s: %d", getVaultName(vaultID), count))
+		}
+		log.Printf("[sync] Pushing to vaults: %s", strings.Join(vaultInfo, ", "))
+	}
+
 	// Push in batches
 	batchSize := 50
 	for i := 0; i < len(toPush); i += batchSize {
@@ -535,7 +588,7 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		}
 		batch := toPush[i:end]
 
-		n, uploadedItems, err := m.pushBatchEncrypted(token, vaultID, batch)
+		n, uploadedItems, err := m.pushBatchEncrypted(token, batch)
 		if err != nil {
 			// If 401, return immediately so doSync can refresh token and retry
 			if isUnauthorizedError(err) {
@@ -682,6 +735,7 @@ type encryptedObsItem struct {
 	obs       storage.Observation
 	encrypted []byte
 	checksum  string
+	vaultID   string
 }
 
 type manifestMeta struct {
@@ -789,7 +843,7 @@ type uploadedItem struct {
 	updatedAt time.Time
 }
 
-func (m *SyncManager) pushBatchEncrypted(token, vaultID string, batch []encryptedObsItem) (int, []uploadedItem, error) {
+func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem) (int, []uploadedItem, error) {
 	// Prepare items for URL request
 	type itemReq struct {
 		ID        string `json:"id"`
@@ -806,7 +860,7 @@ func (m *SyncManager) pushBatchEncrypted(token, vaultID string, batch []encrypte
 	for _, item := range batch {
 		items = append(items, itemReq{
 			ID:        item.obs.ID,
-			VaultID:   vaultID,
+			VaultID:   item.vaultID, // Use per-item vaultID
 			Type:      "memory",
 			SizeBytes: len(item.encrypted),
 			Checksum:  item.checksum,
@@ -886,9 +940,11 @@ func (m *SyncManager) pushBatchEncrypted(token, vaultID string, batch []encrypte
 		if uploadResp.StatusCode == http.StatusOK || uploadResp.StatusCode == http.StatusCreated {
 			checksum := storage.Checksum(data)[:16]
 			confirmItems = append(confirmItems, confirmItem{id: urlItem.ID, checksum: checksum})
+			// Use per-item vaultID from metadata
+			meta := itemMeta[urlItem.ID]
 			confirmBodies = append(confirmBodies, map[string]interface{}{
 				"id":        urlItem.ID,
-				"vaultId":   vaultID,
+				"vaultId":   meta.vaultID,
 				"type":      "memory",
 				"sizeBytes": len(data),
 				"checksum":  checksum,

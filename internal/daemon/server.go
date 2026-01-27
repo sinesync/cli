@@ -117,6 +117,7 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/tags", s.handleTags)
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/sync", s.handleSync)
+	mux.HandleFunc("/api/vaults", s.handleVaults)
 
 	// Static files for dashboard
 	staticFS, _ := fs.Sub(staticFiles, "static")
@@ -682,7 +683,108 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		stats["syncError"] = lastError
 	}
 
+	// Vault breakdown
+	vaultCfg, _ := loadLocalVaultConfig()
+	if vaultCfg != nil && len(vaultCfg.Vaults) > 0 {
+		byVault := make(map[string]int)
+		vaultNames := make(map[string]string)
+
+		// Build project-to-vault mapping
+		projectVault := make(map[string]string)
+		var defaultVaultID string
+		for _, v := range vaultCfg.Vaults {
+			vaultNames[v.VaultID] = v.Name
+			if v.IsDefault {
+				defaultVaultID = v.VaultID
+			}
+			for _, p := range v.Projects {
+				projectVault[p] = v.VaultID
+			}
+		}
+
+		// Count observations per vault
+		for _, obs := range observations {
+			vaultID := projectVault[obs.Core.Project]
+			if vaultID == "" {
+				vaultID = defaultVaultID
+			}
+			if vaultID != "" {
+				byVault[vaultID]++
+			}
+		}
+
+		stats["byVault"] = byVault
+		stats["vaultNames"] = vaultNames
+	}
+
 	writeJSON(w, stats)
+}
+
+func (s *Server) handleVaults(w http.ResponseWriter, r *http.Request) {
+	observations := s.getObservations()
+	syncManifest := storage.GetSyncManifest()
+
+	vaultCfg, err := loadLocalVaultConfig()
+	if err != nil || vaultCfg == nil || len(vaultCfg.Vaults) == 0 {
+		writeJSON(w, map[string]interface{}{
+			"vaults":      []interface{}{},
+			"totalItems":  len(observations),
+			"totalSynced": syncManifest.GetSyncedCount(),
+		})
+		return
+	}
+
+	// Build project-to-vault mapping
+	projectVault := make(map[string]string)
+	var defaultVaultID string
+	for _, v := range vaultCfg.Vaults {
+		if v.IsDefault {
+			defaultVaultID = v.VaultID
+		}
+		for _, p := range v.Projects {
+			projectVault[p] = v.VaultID
+		}
+	}
+
+	// Count observations per vault
+	vaultCounts := make(map[string]int)
+	for _, obs := range observations {
+		vaultID := projectVault[obs.Core.Project]
+		if vaultID == "" {
+			vaultID = defaultVaultID
+		}
+		if vaultID != "" {
+			vaultCounts[vaultID]++
+		}
+	}
+
+	// Build vault response
+	type vaultInfo struct {
+		ID          string   `json:"id"`
+		Name        string   `json:"name"`
+		IsDefault   bool     `json:"isDefault"`
+		Projects    []string `json:"projects"`
+		ItemCount   int      `json:"itemCount"`
+		SyncedCount int      `json:"syncedCount"`
+	}
+
+	vaults := make([]vaultInfo, 0, len(vaultCfg.Vaults))
+	for _, v := range vaultCfg.Vaults {
+		vaults = append(vaults, vaultInfo{
+			ID:          v.VaultID,
+			Name:        v.Name,
+			IsDefault:   v.IsDefault,
+			Projects:    v.Projects,
+			ItemCount:   vaultCounts[v.VaultID],
+			SyncedCount: vaultCounts[v.VaultID], // Approximation - synced items are tracked globally
+		})
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"vaults":      vaults,
+		"totalItems":  len(observations),
+		"totalSynced": syncManifest.GetSyncedCount(),
+	})
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
@@ -868,14 +970,30 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Build project-to-vault mapping
+	projectVault := make(map[string]string)
+	vaultCfg, _ := loadLocalVaultConfig()
+	if vaultCfg != nil {
+		for _, v := range vaultCfg.Vaults {
+			for _, p := range v.Projects {
+				projectVault[p] = v.Name
+			}
+		}
+	}
+
 	type projectInfo struct {
 		Name  string `json:"name"`
 		Count int    `json:"count"`
+		Vault string `json:"vault,omitempty"`
 	}
 
 	result := make([]projectInfo, 0, len(projects))
 	for name, count := range projects {
-		result = append(result, projectInfo{Name: name, Count: count})
+		result = append(result, projectInfo{
+			Name:  name,
+			Count: count,
+			Vault: projectVault[name],
+		})
 	}
 
 	sort.Slice(result, func(i, j int) bool {

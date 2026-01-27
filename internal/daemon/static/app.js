@@ -374,26 +374,56 @@ function renderBarChart(containerId, data, limit = 10) {
 async function renderVaults() {
     try {
         const response = await fetch('/api/vaults');
-        const vaults = await response.json();
+        const data = await response.json();
 
         const container = document.getElementById('chart-vaults');
 
-        if (!vaults || vaults.length === 0) {
+        if (!data.vaults || data.vaults.length === 0) {
             container.innerHTML = '<p class="loading">No vaults configured</p>';
             return;
         }
 
-        container.innerHTML = vaults.map(v => `
-            <div class="vault-item">
-                <span class="vault-name">
-                    <span class="vault-icon">~</span>
-                    ${v.Name || v.ID}
-                </span>
-                <span class="vault-backend">${v.Backend?.Type || 'sinesync'}</span>
+        container.innerHTML = data.vaults.map(v => `
+            <div class="vault-item ${v.isDefault ? 'default' : ''}" data-vault-id="${v.id}">
+                <div class="vault-header">
+                    <span class="vault-name">
+                        <span class="vault-icon">~</span>
+                        ${escapeHtml(v.name || v.id.slice(0, 8))}
+                    </span>
+                    ${v.isDefault ? '<span class="vault-badge default">default</span>' : ''}
+                </div>
+                <div class="vault-stats">
+                    <span class="vault-count">${v.itemCount}</span>
+                    <span class="vault-count-label">items</span>
+                </div>
+                ${v.projects && v.projects.length > 0 ? `
+                    <div class="vault-projects">
+                        ${v.projects.slice(0, 3).map(p => `<span class="vault-project">→ ${escapeHtml(p)}</span>`).join('')}
+                        ${v.projects.length > 3 ? `<span class="vault-project-more">+${v.projects.length - 3} more</span>` : ''}
+                    </div>
+                ` : '<div class="vault-projects"><span class="vault-project-empty">No projects assigned</span></div>'}
             </div>
         `).join('');
+
+        // Add click handlers to filter by vault
+        container.querySelectorAll('.vault-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const vaultId = item.dataset.vaultId;
+                const vault = data.vaults.find(v => v.id === vaultId);
+                if (vault && vault.projects && vault.projects.length > 0) {
+                    // Filter to first project in vault
+                    document.getElementById('filter-project').value = vault.projects[0];
+                    showView('memories');
+                    loadObservations();
+                }
+            });
+        });
     } catch (e) {
         console.error('Failed to load vaults:', e);
+        const container = document.getElementById('chart-vaults');
+        if (container) {
+            container.innerHTML = '<p class="loading">Failed to load vaults</p>';
+        }
     }
 }
 
