@@ -116,6 +116,31 @@ func getVaultName(vaultID string) string {
 	return vaultID[:8]
 }
 
+// getVaultKey returns the decrypted vault key for a given vault ID
+// Returns nil if no vault key is available (falls back to user's derived key)
+func getVaultKey(vaultID string, encMgr *encryption.Manager) []byte {
+	cfg, err := loadLocalVaultConfig()
+	if err != nil {
+		return nil
+	}
+
+	for _, v := range cfg.Vaults {
+		if v.VaultID == vaultID {
+			if v.EncryptedVaultKey == "" {
+				return nil
+			}
+			key, err := encMgr.DecryptVaultKey(v.EncryptedVaultKey)
+			if err != nil {
+				log.Printf("[sync] Failed to decrypt vault key for %s: %v", v.Name, err)
+				return nil
+			}
+			return key
+		}
+	}
+
+	return nil
+}
+
 // SyncManager handles background cloud sync
 type SyncManager struct {
 	localStorage *storage.LocalStorage
@@ -493,10 +518,19 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 			}
 		}
 
+		// Determine which vault this observation belongs to
+		vaultID := getVaultIDForObservation(obs.Core.Project, defaultVaultID)
+
 		// Need to encrypt (either no cache, changed, or need to upload)
 		if checksum == "" {
 			var err error
-			encrypted, err = encMgr.EncryptObservation(&obs)
+			// Use vault key if available, otherwise fall back to user's derived key
+			vaultKey := getVaultKey(vaultID, encMgr)
+			if vaultKey != nil {
+				encrypted, err = encMgr.EncryptObservationWithKey(&obs, vaultKey)
+			} else {
+				encrypted, err = encMgr.EncryptObservation(&obs)
+			}
 			if err != nil {
 				log.Printf("[sync] Encrypt error for %s: %v", obs.ID, err)
 				continue
@@ -506,7 +540,13 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		} else if encrypted == nil {
 			// Have checksum but need encrypted data for upload
 			var err error
-			encrypted, err = encMgr.EncryptObservation(&obs)
+			// Use vault key if available, otherwise fall back to user's derived key
+			vaultKey := getVaultKey(vaultID, encMgr)
+			if vaultKey != nil {
+				encrypted, err = encMgr.EncryptObservationWithKey(&obs, vaultKey)
+			} else {
+				encrypted, err = encMgr.EncryptObservation(&obs)
+			}
 			if err != nil {
 				log.Printf("[sync] Encrypt error for %s: %v", obs.ID, err)
 				continue
@@ -522,7 +562,7 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 				obs:       obs,
 				encrypted: encrypted,
 				checksum:  checksum,
-				vaultID:   getVaultIDForObservation(obs.Core.Project, defaultVaultID),
+				vaultID:   vaultID,
 			})
 		}
 	}
@@ -1050,10 +1090,35 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, encMgr *encrypt
 		return fmt.Errorf("checksum mismatch")
 	}
 
-	// Decrypt observation
-	obs, err := encMgr.DecryptObservation(encryptedData)
-	if err != nil {
-		return fmt.Errorf("decrypt failed: %w", err)
+	// Try to decrypt with vault keys first, then fall back to user's derived key
+	var obs *storage.Observation
+
+	// Try each vault key
+	cfg, _ := loadLocalVaultConfig()
+	if cfg != nil {
+		for _, v := range cfg.Vaults {
+			if v.EncryptedVaultKey == "" {
+				continue
+			}
+			vaultKey, err := encMgr.DecryptVaultKey(v.EncryptedVaultKey)
+			if err != nil {
+				continue
+			}
+			obs, err = encMgr.DecryptObservationWithKey(encryptedData, vaultKey)
+			if err == nil {
+				// Successfully decrypted with this vault key
+				break
+			}
+		}
+	}
+
+	// Fall back to user's derived key if vault keys didn't work
+	if obs == nil {
+		var err error
+		obs, err = encMgr.DecryptObservation(encryptedData)
+		if err != nil {
+			return fmt.Errorf("decrypt failed: %w", err)
+		}
 	}
 
 	return m.localStorage.SaveObservation(obs)
