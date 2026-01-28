@@ -216,6 +216,9 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				},
 			},
 		}
+		// Remove standalone-mode hooks that may exist from previous setup
+		delete(hooks, "PostToolUse")
+		delete(hooks, "Stop")
 	} else {
 		// Standalone mode - full capture
 		hooks["SessionStart"] = []map[string]interface{}{
@@ -253,6 +256,8 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				},
 			},
 		}
+		// Remove adapter-mode hook that may exist from previous setup
+		delete(hooks, "PreCompact")
 	}
 
 	settings["hooks"] = hooks
