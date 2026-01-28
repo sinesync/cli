@@ -52,6 +52,29 @@
                     </div>
                 </div>
 
+                <!-- Adapter Sync Status -->
+                <div id="adapter-sync-section" class="adapter-sync-section" style="display: none;">
+                    <h3 class="section-title">Adapter Sync (claude-mem)</h3>
+                    <div class="sync-stats-grid">
+                        <div class="sync-stat">
+                            <span class="sync-stat-label">Native</span>
+                            <span class="sync-stat-value" id="sync-native">-</span>
+                        </div>
+                        <div class="sync-stat">
+                            <span class="sync-stat-label">From sinesync</span>
+                            <span class="sync-stat-value" id="sync-exported">-</span>
+                        </div>
+                        <div class="sync-stat">
+                            <span class="sync-stat-label">Embeddings</span>
+                            <span class="sync-stat-value" id="sync-embeddings">-</span>
+                        </div>
+                        <div class="sync-stat" id="sync-backlog-container">
+                            <span class="sync-stat-label">Backlog</span>
+                            <span class="sync-stat-value sync-stat-warning" id="sync-backlog">-</span>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="charts-grid">
                     <div class="chart-card">
                         <h3>By Type</h3>

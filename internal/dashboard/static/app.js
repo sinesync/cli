@@ -32,17 +32,31 @@ function initSineWave() {
 
     let phase = 0;
 
+    // Rainbow colors
+    const rainbowColors = [
+        '#ff0080', '#ff0040', '#ff8000', '#ffff00',
+        '#00ff80', '#00d4ff', '#0080ff', '#8000ff'
+    ];
+
     function draw() {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+        // Create rainbow gradient
+        const gradient = ctx.createLinearGradient(0, 0, canvas.width, 0);
+        const colorShift = (phase * 0.5) % rainbowColors.length;
+        for (let i = 0; i < rainbowColors.length; i++) {
+            const colorIndex = Math.floor((i + colorShift) % rainbowColors.length);
+            gradient.addColorStop(i / (rainbowColors.length - 1), rainbowColors[colorIndex]);
+        }
+
         ctx.beginPath();
-        ctx.strokeStyle = '#00d4ff';
+        ctx.strokeStyle = gradient;
         ctx.lineWidth = 2;
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = 'rgba(0, 212, 255, 0.5)';
 
         for (let x = 0; x < canvas.width; x++) {
-            const y = canvas.height / 2 +
-                      Math.sin((x / 50) + phase) * 10 +
-                      Math.sin((x / 30) + phase * 1.5) * 5;
+            const y = canvas.height / 2 + Math.sin((x / 50) + phase) * 12;
 
             if (x === 0) {
                 ctx.moveTo(x, y);
@@ -260,6 +274,9 @@ function renderStats() {
     document.getElementById('stat-tagged').textContent = stats.tagged || 0;
     document.getElementById('stat-recent').textContent = stats.recentWeek || 0;
 
+    // Adapter sync stats
+    renderAdapterSync();
+
     // Type chart
     renderBarChart('chart-types', stats.byType || {});
 
@@ -271,6 +288,38 @@ function renderStats() {
 
     // Vaults
     renderVaults();
+}
+
+function renderAdapterSync() {
+    const section = document.getElementById('adapter-sync-section');
+    const syncData = stats.adapterSync;
+
+    if (!syncData) {
+        section.style.display = 'none';
+        return;
+    }
+
+    section.style.display = 'block';
+    document.getElementById('sync-native').textContent = syncData.nativeInClaudeMem?.toLocaleString() || '0';
+    document.getElementById('sync-exported').textContent = syncData.exportedToClaudeMem?.toLocaleString() || '0';
+
+    if (syncData.chromaAvailable) {
+        document.getElementById('sync-embeddings').textContent = syncData.chromaEmbeddings?.toLocaleString() || '0';
+
+        const backlog = syncData.embeddingBacklog || 0;
+        const backlogContainer = document.getElementById('sync-backlog-container');
+        const backlogEl = document.getElementById('sync-backlog');
+
+        if (backlog > 0) {
+            backlogContainer.style.display = 'flex';
+            backlogEl.textContent = backlog.toLocaleString();
+        } else {
+            backlogContainer.style.display = 'none';
+        }
+    } else {
+        document.getElementById('sync-embeddings').textContent = 'N/A';
+        document.getElementById('sync-backlog-container').style.display = 'none';
+    }
 }
 
 function renderBarChart(containerId, data, limit = 10) {

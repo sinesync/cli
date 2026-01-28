@@ -701,3 +701,47 @@ body {
     font-size: 0.875rem;
     margin-left: 1rem;
 }
+
+/* Adapter Sync Section */
+.adapter-sync-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.adapter-sync-section .section-title {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 1rem;
+}
+
+.sync-stats-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2rem;
+}
+
+.sync-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.sync-stat-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.sync-stat-value {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.sync-stat-value.sync-stat-warning {
+    color: var(--accent-yellow);
+}

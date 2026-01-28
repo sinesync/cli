@@ -420,3 +420,80 @@ func (a *ClaudeMemAdapter) DeleteBySourceID(ctx context.Context, sourceID string
 	`, sourceID)
 	return err
 }
+
+// AdapterSyncStats holds sync statistics between sinesync and claude-mem
+type AdapterSyncStats struct {
+	// Observations in claude-mem that came from sinesync (exported)
+	ExportedToClaudeMem int
+	// Observations in claude-mem that are native (not from sinesync)
+	NativeInClaudeMem int
+	// ChromaDB embedding count (if available)
+	ChromaEmbeddings int
+	// Whether ChromaDB stats are available
+	ChromaAvailable bool
+}
+
+// GetSyncStats returns sync statistics between sinesync and claude-mem
+func (a *ClaudeMemAdapter) GetSyncStats() (*AdapterSyncStats, error) {
+	stats := &AdapterSyncStats{}
+
+	// Check which session ID column exists
+	hasMemorySessionID := a.hasColumn("observations", "memory_session_id")
+
+	var sessionIDCol string
+	if hasMemorySessionID {
+		sessionIDCol = "memory_session_id"
+	} else {
+		sessionIDCol = "sdk_session_id"
+	}
+
+	// Count sinesync-exported observations (have sinesync- prefix in session ID)
+	err := a.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*) FROM observations
+		WHERE %s LIKE 'sinesync-%%'
+	`, sessionIDCol)).Scan(&stats.ExportedToClaudeMem)
+	if err != nil {
+		return nil, err
+	}
+
+	// Count native claude-mem observations
+	err = a.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*) FROM observations
+		WHERE %s IS NULL OR %s NOT LIKE 'sinesync-%%'
+	`, sessionIDCol, sessionIDCol)).Scan(&stats.NativeInClaudeMem)
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to get ChromaDB embedding count
+	stats.ChromaEmbeddings, stats.ChromaAvailable = a.getChromaEmbeddingCount()
+
+	return stats, nil
+}
+
+// getChromaEmbeddingCount tries to count embeddings in ChromaDB
+func (a *ClaudeMemAdapter) getChromaEmbeddingCount() (int, bool) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0, false
+	}
+
+	chromaDBPath := filepath.Join(home, ".claude-mem", "vector-db", "chroma.sqlite3")
+	if _, err := os.Stat(chromaDBPath); err != nil {
+		return 0, false
+	}
+
+	chromaDB, err := sql.Open("sqlite", chromaDBPath+"?mode=ro")
+	if err != nil {
+		return 0, false
+	}
+	defer chromaDB.Close()
+
+	var count int
+	err = chromaDB.QueryRow("SELECT COUNT(*) FROM embeddings").Scan(&count)
+	if err != nil {
+		return 0, false
+	}
+
+	return count, true
+}

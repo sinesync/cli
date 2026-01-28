@@ -127,6 +127,18 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		if err == nil && adapter != nil {
 			count, _ := adapter.GetObservationCount()
 			stats["claudeMemObservations"] = count
+
+			// Adapter sync stats
+			if syncStats, err := adapter.GetSyncStats(); err == nil {
+				stats["adapterSync"] = map[string]interface{}{
+					"nativeInClaudeMem":   syncStats.NativeInClaudeMem,
+					"exportedToClaudeMem": syncStats.ExportedToClaudeMem,
+					"chromaEmbeddings":    syncStats.ChromaEmbeddings,
+					"chromaAvailable":     syncStats.ChromaAvailable,
+					"embeddingBacklog":    count - syncStats.ChromaEmbeddings,
+				}
+			}
+
 			adapter.Close()
 		}
 	}

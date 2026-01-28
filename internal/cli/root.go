@@ -205,6 +205,22 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nClaude-mem:\n")
 			fmt.Printf("  • Observations: %d\n", count)
 			fmt.Printf("  • Projects: %d\n", len(projects))
+
+			// Adapter sync stats
+			if syncStats, err := adapter.GetSyncStats(); err == nil {
+				fmt.Printf("\nAdapter sync:\n")
+				fmt.Printf("  • Native (claude-mem): %d\n", syncStats.NativeInClaudeMem)
+				fmt.Printf("  • Synced (from sinesync): %d\n", syncStats.ExportedToClaudeMem)
+				if syncStats.ChromaAvailable {
+					// Calculate embedding gap
+					embeddingGap := count - syncStats.ChromaEmbeddings
+					if embeddingGap > 0 {
+						fmt.Printf("  • ChromaDB embeddings: %d (backlog: %d)\n", syncStats.ChromaEmbeddings, embeddingGap)
+					} else {
+						fmt.Printf("  • ChromaDB embeddings: %d\n", syncStats.ChromaEmbeddings)
+					}
+				}
+			}
 		}
 	}
 
