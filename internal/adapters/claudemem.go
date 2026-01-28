@@ -236,7 +236,7 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 	}
 
 	// Try to get claude-mem extension for lossless round-trip
-	var narrative, sdkSessionID, subtitle string
+	var narrative, memorySessionID, subtitle string
 
 	if ext, ok := obs.GetExtension(ClaudeMemAdapterName); ok {
 		if extMap, ok := ext.(map[string]interface{}); ok {
@@ -244,7 +244,7 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 				narrative = v
 			}
 			if v, ok := extMap["sdkSessionId"].(string); ok {
-				sdkSessionID = v
+				memorySessionID = v
 			}
 			if v, ok := extMap["subtitle"].(string); ok {
 				subtitle = v
@@ -259,8 +259,31 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 	if subtitle == "" {
 		subtitle = obs.Core.Summary
 	}
-	if sdkSessionID == "" {
-		sdkSessionID = "sinesync-" + obs.ID[:8]
+	if memorySessionID == "" {
+		memorySessionID = "sinesync-" + obs.ID[:8]
+	}
+
+	project := obs.Core.Project
+	if project == "" {
+		project = "unknown"
+	}
+
+	createdAt := obs.Core.CreatedAt.Format(time.RFC3339)
+	epoch := obs.Source.Epoch
+	if epoch == 0 {
+		epoch = obs.Core.CreatedAt.Unix()
+	}
+
+	// Ensure session exists (required for foreign key constraint)
+	contentSessionID := "sinesync-content-" + obs.ID[:8]
+	_, err = a.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO sdk_sessions (
+			content_session_id, memory_session_id, project,
+			started_at, started_at_epoch, status
+		) VALUES (?, ?, ?, ?, ?, 'completed')
+	`, contentSessionID, memorySessionID, project, createdAt, epoch)
+	if err != nil {
+		return fmt.Errorf("create session: %w", err)
 	}
 
 	// Serialize JSON arrays
@@ -269,40 +292,27 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 	filesReadJSON, _ := json.Marshal(obs.Structured.Files.Read)
 	filesModifiedJSON, _ := json.Marshal(obs.Structured.Files.Modified)
 
-	createdAt := obs.Core.CreatedAt.Format(time.RFC3339)
-	epoch := obs.Source.Epoch
-	if epoch == 0 {
-		epoch = obs.Core.CreatedAt.Unix()
+	// Map type to valid claude-mem types
+	obsType := obs.Core.Type
+	validTypes := map[string]bool{
+		"decision": true, "bugfix": true, "feature": true,
+		"refactor": true, "discovery": true, "change": true,
+	}
+	if !validTypes[obsType] {
+		obsType = "discovery" // Default fallback
 	}
 
-	// Check if sdk_session_id column exists (newer claude-mem versions have it)
-	hasSDKSessionID := a.hasColumn("observations", "sdk_session_id")
-
-	if hasSDKSessionID {
-		_, err = a.db.ExecContext(ctx, `
-			INSERT INTO observations (
-				sdk_session_id, project, type, title, subtitle, narrative,
-				facts, concepts, files_read, files_modified,
-				created_at, created_at_epoch
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`,
-			sdkSessionID, obs.Core.Project, obs.Core.Type, obs.Core.Title, subtitle, narrative,
-			string(factsJSON), string(conceptsJSON), string(filesReadJSON), string(filesModifiedJSON),
-			createdAt, epoch,
-		)
-	} else {
-		_, err = a.db.ExecContext(ctx, `
-			INSERT INTO observations (
-				project, type, title, subtitle, narrative,
-				facts, concepts, files_read, files_modified,
-				created_at, created_at_epoch
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`,
-			obs.Core.Project, obs.Core.Type, obs.Core.Title, subtitle, narrative,
-			string(factsJSON), string(conceptsJSON), string(filesReadJSON), string(filesModifiedJSON),
-			createdAt, epoch,
-		)
-	}
+	_, err = a.db.ExecContext(ctx, `
+		INSERT INTO observations (
+			memory_session_id, project, type, title, subtitle, narrative,
+			facts, concepts, files_read, files_modified,
+			created_at, created_at_epoch
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		memorySessionID, project, obsType, obs.Core.Title, subtitle, narrative,
+		string(factsJSON), string(conceptsJSON), string(filesReadJSON), string(filesModifiedJSON),
+		createdAt, epoch,
+	)
 
 	return err
 }
