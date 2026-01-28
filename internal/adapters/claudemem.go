@@ -102,11 +102,24 @@ func (a *ClaudeMemAdapter) hasColumn(table, column string) bool {
 
 // Import reads observations from claude-mem and converts to sinesync format
 func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]storage.Observation, error) {
-	// Check if sdk_session_id column exists (newer claude-mem versions have it)
+	// Check which session ID column exists
+	hasMemorySessionID := a.hasColumn("observations", "memory_session_id")
 	hasSDKSessionID := a.hasColumn("observations", "sdk_session_id")
 
 	var query string
-	if hasSDKSessionID {
+	if hasMemorySessionID {
+		// Newer schema - filter out sinesync-exported observations to prevent re-import loops
+		query = `
+			SELECT
+				id, memory_session_id, project, type, title, subtitle, narrative,
+				facts, concepts, files_read, files_modified,
+				created_at, created_at_epoch
+			FROM observations
+			WHERE created_at_epoch > ?
+			  AND (memory_session_id IS NULL OR memory_session_id NOT LIKE 'sinesync-%')
+			ORDER BY created_at_epoch ASC
+		`
+	} else if hasSDKSessionID {
 		query = `
 			SELECT
 				id, sdk_session_id, project, type, title, subtitle, narrative,
@@ -114,6 +127,7 @@ func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]stor
 				created_at, created_at_epoch
 			FROM observations
 			WHERE created_at_epoch > ?
+			  AND (sdk_session_id IS NULL OR sdk_session_id NOT LIKE 'sinesync-%')
 			ORDER BY created_at_epoch ASC
 		`
 	} else {

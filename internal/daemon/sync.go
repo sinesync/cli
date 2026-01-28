@@ -1091,12 +1091,8 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, expectedChecksu
 		return err
 	}
 
-	// Verify checksum (of encrypted data) using manifest checksum
-	actualChecksum := storage.Checksum(encryptedData)[:16]
-	checksumMismatch := actualChecksum != expectedChecksum
-	if checksumMismatch {
-		log.Printf("[sync] Checksum mismatch for %s: expected %s, got %s (size: %d bytes) - attempting decrypt anyway", id, expectedChecksum, actualChecksum, len(encryptedData))
-	}
+	// Note: Checksum verification skipped - decryption success is the real validation
+	// Historical data may have mismatched checksums due to manifest/GCS inconsistencies
 
 	// Try to decrypt with vault keys first, then fall back to user's derived key
 	var obs *storage.Observation
@@ -1236,11 +1232,8 @@ func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum strin
 		return err
 	}
 
-	// Verify checksum using manifest checksum
-	actualChecksum := storage.Checksum(encryptedData)[:16]
-	if actualChecksum != expectedChecksum {
-		log.Printf("[sync] Checksum mismatch for %s: expected %s, got %s (size: %d bytes) - attempting decrypt anyway", id, expectedChecksum, actualChecksum, len(encryptedData))
-	}
+	// Note: Checksum verification skipped - decryption success is the real validation
+	// Historical data may have mismatched checksums due to manifest/GCS inconsistencies
 
 	// Try to decrypt with vault keys first, then fall back to user's derived key
 	var obs *storage.Observation
