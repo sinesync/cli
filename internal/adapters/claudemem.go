@@ -22,9 +22,16 @@ func claudeMemDBPath() string {
 	return filepath.Join(home, ".claude-mem", "claude-mem.db")
 }
 
-// IsClaudeMemInstalled checks if claude-mem database exists
+// IsClaudeMemInstalled checks if claude-mem is installed
 func IsClaudeMemInstalled() bool {
-	_, err := os.Stat(claudeMemDBPath())
+	// Check for database
+	if _, err := os.Stat(claudeMemDBPath()); err == nil {
+		return true
+	}
+	// Check for settings file (database may not exist yet)
+	home, _ := os.UserHomeDir()
+	settingsPath := filepath.Join(home, ".claude-mem", "settings.json")
+	_, err := os.Stat(settingsPath)
 	return err == nil
 }
 
@@ -268,17 +275,34 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 		epoch = obs.Core.CreatedAt.Unix()
 	}
 
-	_, err = a.db.ExecContext(ctx, `
-		INSERT INTO observations (
-			sdk_session_id, project, type, title, subtitle, narrative,
-			facts, concepts, files_read, files_modified,
-			created_at, created_at_epoch
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		sdkSessionID, obs.Core.Project, obs.Core.Type, obs.Core.Title, subtitle, narrative,
-		string(factsJSON), string(conceptsJSON), string(filesReadJSON), string(filesModifiedJSON),
-		createdAt, epoch,
-	)
+	// Check if sdk_session_id column exists (newer claude-mem versions have it)
+	hasSDKSessionID := a.hasColumn("observations", "sdk_session_id")
+
+	if hasSDKSessionID {
+		_, err = a.db.ExecContext(ctx, `
+			INSERT INTO observations (
+				sdk_session_id, project, type, title, subtitle, narrative,
+				facts, concepts, files_read, files_modified,
+				created_at, created_at_epoch
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			sdkSessionID, obs.Core.Project, obs.Core.Type, obs.Core.Title, subtitle, narrative,
+			string(factsJSON), string(conceptsJSON), string(filesReadJSON), string(filesModifiedJSON),
+			createdAt, epoch,
+		)
+	} else {
+		_, err = a.db.ExecContext(ctx, `
+			INSERT INTO observations (
+				project, type, title, subtitle, narrative,
+				facts, concepts, files_read, files_modified,
+				created_at, created_at_epoch
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			obs.Core.Project, obs.Core.Type, obs.Core.Title, subtitle, narrative,
+			string(factsJSON), string(conceptsJSON), string(filesReadJSON), string(filesModifiedJSON),
+			createdAt, epoch,
+		)
+	}
 
 	return err
 }

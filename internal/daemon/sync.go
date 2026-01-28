@@ -601,9 +601,9 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		}
 	}
 
-	// Mark all current cloud items as seen (for future sync cycles)
-	for _, item := range manifest.Items {
-		syncManifest.MarkSeen(item.ID)
+	// Mark items we already have locally as seen (they don't need to be pulled)
+	for id := range localItems {
+		syncManifest.MarkSeen(id)
 	}
 
 	// Group items by vault for logging
@@ -646,17 +646,24 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		}
 	}
 
-	// Pull items
-	for _, item := range toPull {
-		if err := m.pullItemEncrypted(token, item.ID, encMgr); err != nil {
+	// Pull items in batches
+	pullBatchSize := 50
+	for i := 0; i < len(toPull); i += pullBatchSize {
+		end := i + pullBatchSize
+		if end > len(toPull) {
+			end = len(toPull)
+		}
+		batch := toPull[i:end]
+
+		n, err := m.pullBatch(token, batch, encMgr, syncManifest)
+		if err != nil {
 			if isUnauthorizedError(err) {
 				syncManifest.Save()
 				return pushed, pulled, err
 			}
-			log.Printf("[sync] Pull error for %s: %v", item.ID, err)
-			continue
+			log.Printf("[sync] Pull batch error: %v", err)
 		}
-		pulled++
+		pulled += n
 	}
 
 	// Delete items from cloud that were explicitly deleted locally (via dashboard)
@@ -1043,10 +1050,10 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 	return count, uploaded, nil
 }
 
-func (m *SyncManager) pullItemEncrypted(token string, id string, encMgr *encryption.Manager) error {
+func (m *SyncManager) pullItemEncrypted(token string, id string, expectedChecksum string, encMgr *encryption.Manager) error {
 	client := &http.Client{Timeout: 60 * time.Second}
 
-	// Get download URL
+	// Get download URL (checksum comes from manifest, not this API call)
 	req, _ := http.NewRequest("GET", m.apiBase+"/sync/download-url/"+url.PathEscape(id), nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
@@ -1062,7 +1069,6 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, encMgr *encrypt
 
 	var urlResp struct {
 		DownloadURL string `json:"downloadUrl"`
-		Checksum    string `json:"checksum"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
 		return fmt.Errorf("decode download URL response: %w", err)
@@ -1085,9 +1091,11 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, encMgr *encrypt
 		return err
 	}
 
-	// Verify checksum (of encrypted data)
-	if storage.Checksum(encryptedData)[:16] != urlResp.Checksum {
-		return fmt.Errorf("checksum mismatch")
+	// Verify checksum (of encrypted data) using manifest checksum
+	actualChecksum := storage.Checksum(encryptedData)[:16]
+	checksumMismatch := actualChecksum != expectedChecksum
+	if checksumMismatch {
+		log.Printf("[sync] Checksum mismatch for %s: expected %s, got %s (size: %d bytes) - attempting decrypt anyway", id, expectedChecksum, actualChecksum, len(encryptedData))
 	}
 
 	// Try to decrypt with vault keys first, then fall back to user's derived key
@@ -1121,7 +1129,165 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, encMgr *encrypt
 		}
 	}
 
-	return m.localStorage.SaveObservation(obs)
+	// Save to local storage
+	if err := m.localStorage.SaveObservation(obs); err != nil {
+		return err
+	}
+
+	// Export to claude-mem if installed
+	if adapters.IsClaudeMemInstalled() {
+		adapter, err := adapters.NewClaudeMemAdapter(false)
+		if err == nil && adapter != nil {
+			defer adapter.Close()
+			ctx := context.Background()
+			if err := adapter.Export(ctx, obs); err != nil {
+				log.Printf("[sync] Failed to export to claude-mem: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// pullBatch fetches download URLs for multiple items in one API call, then downloads them
+func (m *SyncManager) pullBatch(token string, items []manifestItem, encMgr *encryption.Manager, syncManifest *storage.SyncManifest) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+
+	// Build request for batch download URLs
+	itemIDs := make([]string, len(items))
+	itemMap := make(map[string]manifestItem)
+	for i, item := range items {
+		itemIDs[i] = item.ID
+		itemMap[item.ID] = item
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"items": itemIDs,
+	})
+
+	req, _ := http.NewRequest("POST", m.apiBase+"/sync/download-urls", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("batch download-urls failed %d: %s", resp.StatusCode, string(body))
+	}
+
+	var urlResp struct {
+		Items []struct {
+			ID          string `json:"id"`
+			DownloadURL string `json:"downloadUrl"`
+			Error       string `json:"error,omitempty"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
+		return 0, fmt.Errorf("decode batch download-urls: %w", err)
+	}
+
+	// Download each item using the signed URLs
+	pulled := 0
+	for _, urlItem := range urlResp.Items {
+		if urlItem.Error != "" {
+			log.Printf("[sync] Download URL error for %s: %s", urlItem.ID, urlItem.Error)
+			continue
+		}
+
+		manifestItem := itemMap[urlItem.ID]
+		if err := m.downloadAndProcess(urlItem.DownloadURL, urlItem.ID, manifestItem.Checksum, encMgr); err != nil {
+			log.Printf("[sync] Pull error for %s: %v", urlItem.ID, err)
+			continue
+		}
+
+		pulled++
+		syncManifest.MarkSeen(urlItem.ID)
+	}
+
+	return pulled, nil
+}
+
+// downloadAndProcess downloads encrypted data from a signed URL and processes it
+func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum string, encMgr *encryption.Manager) error {
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	dlReq, _ := http.NewRequest("GET", downloadURL, nil)
+	dlResp, err := client.Do(dlReq)
+	if err != nil {
+		return err
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: %d", dlResp.StatusCode)
+	}
+
+	encryptedData, err := io.ReadAll(dlResp.Body)
+	if err != nil {
+		return err
+	}
+
+	// Verify checksum using manifest checksum
+	actualChecksum := storage.Checksum(encryptedData)[:16]
+	if actualChecksum != expectedChecksum {
+		log.Printf("[sync] Checksum mismatch for %s: expected %s, got %s (size: %d bytes) - attempting decrypt anyway", id, expectedChecksum, actualChecksum, len(encryptedData))
+	}
+
+	// Try to decrypt with vault keys first, then fall back to user's derived key
+	var obs *storage.Observation
+
+	cfg, _ := loadLocalVaultConfig()
+	if cfg != nil {
+		for _, v := range cfg.Vaults {
+			if v.EncryptedVaultKey == "" {
+				continue
+			}
+			vaultKey, err := encMgr.DecryptVaultKey(v.EncryptedVaultKey)
+			if err != nil {
+				continue
+			}
+			obs, err = encMgr.DecryptObservationWithKey(encryptedData, vaultKey)
+			if err == nil {
+				break
+			}
+		}
+	}
+
+	if obs == nil {
+		var err error
+		obs, err = encMgr.DecryptObservation(encryptedData)
+		if err != nil {
+			return fmt.Errorf("decrypt failed: %w", err)
+		}
+	}
+
+	// Save to local storage
+	if err := m.localStorage.SaveObservation(obs); err != nil {
+		return err
+	}
+
+	// Export to claude-mem if installed
+	if adapters.IsClaudeMemInstalled() {
+		adapter, err := adapters.NewClaudeMemAdapter(false)
+		if err == nil && adapter != nil {
+			defer adapter.Close()
+			ctx := context.Background()
+			if err := adapter.Export(ctx, obs); err != nil {
+				log.Printf("[sync] Failed to export to claude-mem: %v", err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (m *SyncManager) deleteFromCloud(token string, id string) error {
