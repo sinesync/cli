@@ -23,11 +23,10 @@ const (
 )
 
 var (
-	ErrNoKey          = errors.New("no encryption key available")
-	ErrInvalidKey     = errors.New("invalid encryption key")
-	ErrDecryptFailed  = errors.New("decryption failed")
-	ErrKeyMismatch    = errors.New("encryption key does not match")
-	ErrNeedsReauth    = errors.New("re-authentication required (24 hours expired)")
+	ErrNoKey         = errors.New("no encryption key available")
+	ErrInvalidKey    = errors.New("invalid encryption key")
+	ErrDecryptFailed = errors.New("decryption failed")
+	ErrKeyMismatch   = errors.New("encryption key does not match")
 )
 
 // Manager handles encryption key lifecycle and encryption/decryption operations
@@ -146,27 +145,9 @@ func (m *Manager) LoadKey() error {
 }
 
 // GetKey returns the current derived key
-// Returns ErrNeedsReauth if 24 hours have passed since last authentication
 func (m *Manager) GetKey() ([]byte, error) {
 	if len(m.derivedKey) == 0 {
 		// Try to load from keychain
-		if err := m.LoadKey(); err != nil {
-			return nil, ErrNoKey
-		}
-	}
-
-	// Check if re-authentication is required (24 hours)
-	if keychain.NeedsReauth() {
-		return nil, ErrNeedsReauth
-	}
-
-	return m.derivedKey, nil
-}
-
-// GetKeyUnchecked returns the derived key without checking reauth expiry
-// Use only for operations that handle reauth separately (e.g., unlock command)
-func (m *Manager) GetKeyUnchecked() ([]byte, error) {
-	if len(m.derivedKey) == 0 {
 		if err := m.LoadKey(); err != nil {
 			return nil, ErrNoKey
 		}

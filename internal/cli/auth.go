@@ -78,25 +78,11 @@ previous public key.`,
 	RunE: runKeypair,
 }
 
-var unlockCmd = &cobra.Command{
-	Use:   "unlock",
-	Short: "Unlock encryption after 24-hour expiry",
-	Long: `Re-authenticate to unlock encryption operations.
-
-For security, sine~sync requires you to re-enter your password every 24 hours.
-This ensures that even if your device is compromised while unlocked, the
-attacker only has a limited window to access your encrypted data.
-
-Run this command when you see "re-authentication required" errors.`,
-	RunE: runUnlock,
-}
-
 func init() {
 	rootCmd.AddCommand(loginCmd)
 	rootCmd.AddCommand(signupCmd)
 	rootCmd.AddCommand(logoutCmd)
 	rootCmd.AddCommand(keypairCmd)
-	rootCmd.AddCommand(unlockCmd)
 }
 
 func getAPIBase() string {
@@ -422,79 +408,6 @@ func runLogout(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("✓ Logged out")
 	return nil
-}
-
-func runUnlock(cmd *cobra.Command, args []string) error {
-	// Check if logged in
-	authCfg, err := loadAuthConfig()
-	if err != nil || authCfg == nil {
-		return fmt.Errorf("not logged in - please run 'sinesync login' first")
-	}
-
-	// Check if we have the secret key (existing device)
-	if !encryption.HasSecretKeyInKeychain() {
-		return fmt.Errorf("no secret key found - please run 'sinesync login' first")
-	}
-
-	// Check if unlock is actually needed
-	if !keychain.NeedsReauth() {
-		fmt.Println("✓ Already unlocked (valid for another", formatTimeRemaining(), ")")
-		return nil
-	}
-
-	fmt.Println("Re-authentication required (24 hours expired)")
-	fmt.Print("Password: ")
-	passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
-	fmt.Println()
-	if err != nil {
-		return fmt.Errorf("failed to read password: %w", err)
-	}
-	password := string(passwordBytes)
-
-	if password == "" {
-		return fmt.Errorf("password is required")
-	}
-
-	// Re-derive key using stored secret key and salt
-	encMgr := encryption.GetManager()
-	if err := encMgr.SetupExistingDevice(password); err != nil {
-		return fmt.Errorf("unlock failed: %w", err)
-	}
-
-	// Verify key by fetching and decrypting test blob
-	apiBase := getAPIBase()
-	testBlob, err := fetchTestBlob(apiBase, authCfg.Token)
-	if err != nil {
-		fmt.Printf("Warning: could not verify encryption key: %v\n", err)
-	} else if !encMgr.VerifyKey(testBlob) {
-		// Clear the bad key
-		keychain.ClearDerivedKey()
-		return fmt.Errorf("incorrect password - please try again")
-	}
-
-	// Update last auth time
-	keychain.SetLastAuth(time.Now())
-
-	fmt.Println("✓ Unlocked successfully")
-	return nil
-}
-
-// formatTimeRemaining returns human-readable time until reauth needed
-func formatTimeRemaining() string {
-	lastAuth, err := keychain.GetLastAuth()
-	if err != nil {
-		return "unknown"
-	}
-	remaining := 24*time.Hour - time.Since(lastAuth)
-	if remaining < 0 {
-		return "0 minutes"
-	}
-	hours := int(remaining.Hours())
-	minutes := int(remaining.Minutes()) % 60
-	if hours > 0 {
-		return fmt.Sprintf("%d hours %d minutes", hours, minutes)
-	}
-	return fmt.Sprintf("%d minutes", minutes)
 }
 
 func runKeypair(cmd *cobra.Command, args []string) error {
