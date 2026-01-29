@@ -175,13 +175,41 @@ var vaultShareCmd = &cobra.Command{
 	Short: "Share a vault with another user",
 	Long: `Invite another user to access a vault.
 
-For existing users, they'll receive a simple notification.
-For new users, you'll get an invite code to share with them.
+The invitee will receive an email with a link to accept.
+Once they accept, you'll need to confirm the invite using 'vault confirm'.
+
+Flow:
+  1. You run 'vault share' - invite is created, email sent
+  2. Invitee clicks link, creates account (or logs in), accepts
+  3. You run 'vault pending-confirm' to see who's waiting
+  4. You run 'vault confirm <invite-id>' to complete the share
 
 Examples:
   sinesync vault share abc123 --email alice@example.com`,
 	Args: cobra.ExactArgs(1),
 	RunE: runVaultShare,
+}
+
+var vaultPendingConfirmCmd = &cobra.Command{
+	Use:   "pending-confirm",
+	Short: "List invites awaiting your confirmation",
+	Long: `List vault invites that have been accepted by invitees and are waiting
+for you to confirm and share the vault key.
+
+Run 'vault confirm <invite-id>' to complete the share.`,
+	RunE: runVaultPendingConfirm,
+}
+
+var vaultConfirmCmd = &cobra.Command{
+	Use:   "confirm <invite-id>",
+	Short: "Confirm an invite and share the vault key",
+	Long: `Confirm a vault invite after the invitee has accepted.
+
+This encrypts the vault key with the invitee's public key and grants them access.
+
+Use 'vault pending-confirm' to see invites waiting for confirmation.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runVaultConfirm,
 }
 
 var vaultInvitesCmd = &cobra.Command{
@@ -203,8 +231,8 @@ var vaultAcceptCmd = &cobra.Command{
 	Short: "Accept a vault invite",
 	Long: `Accept an invitation to join a shared vault.
 
-For invites from existing users, you just need the invite ID.
-For invites from new users, you'll need both codes.`,
+After accepting, the inviter will be notified and must confirm the share.
+Once confirmed, you can sync to access the shared vault.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runVaultAccept,
 }
@@ -260,6 +288,8 @@ func init() {
 	vaultMigrateProjectCmd.Flags().BoolVarP(&migrateForce, "force", "f", false, "Upload observations even if project is already in target vault")
 	vaultCmd.AddCommand(vaultSyncCmd)
 	vaultCmd.AddCommand(vaultShareCmd)
+	vaultCmd.AddCommand(vaultPendingConfirmCmd)
+	vaultCmd.AddCommand(vaultConfirmCmd)
 	vaultCmd.AddCommand(vaultInvitesCmd)
 	vaultCmd.AddCommand(vaultCancelInviteCmd)
 	vaultCmd.AddCommand(vaultAcceptCmd)
@@ -1366,6 +1396,9 @@ func GetDefaultVaultID() (string, error) {
 
 // === Vault Sharing Commands ===
 
+// runVaultShare creates an invite and sends email to the invitee.
+// The invitee must accept, then the inviter confirms with the encrypted vault key.
+// This async flow eliminates user enumeration - we never check if user exists upfront.
 func runVaultShare(cmd *cobra.Command, args []string) error {
 	vaultID := args[0]
 
@@ -1377,124 +1410,18 @@ func runVaultShare(cmd *cobra.Command, args []string) error {
 	apiBase := getAPIBase()
 	client := &http.Client{Timeout: 30 * time.Second}
 
-	// Get the vault key from local storage
-	vaultKey, err := GetVaultKey(vaultID)
-	if err != nil {
-		return fmt.Errorf("failed to get vault key: %w", err)
-	}
+	fmt.Printf("Creating invite for %s...\n", shareEmail)
 
-	// Check if invitee has a public key (don't reveal result to avoid user enumeration)
-	fmt.Println("Preparing invite...")
-
-	pubKeyReq, err := http.NewRequest("GET", apiBase+"/users/public-key?email="+url.QueryEscape(shareEmail), nil)
-	if err != nil {
-		return err
-	}
-	pubKeyReq.Header.Set("Authorization", "Bearer "+token)
-
-	pubKeyResp, err := client.Do(pubKeyReq)
-	if err != nil {
-		return fmt.Errorf("failed to check user: %w", err)
-	}
-	defer pubKeyResp.Body.Close()
-
-	var inviteType, encryptedVaultKey string
-	var emailCode, inviteCode, salt, emailCodeHash, inviteCodeHash, encryptedTempPrivKey, tempPubKey string
-
-	if pubKeyResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(pubKeyResp.Body)
-		return fmt.Errorf("failed to check user: %s", string(body))
-	}
-
-	// Parse response - publicKey will be null if user doesn't exist or has no keypair
-	var pubKeyResult struct {
-		PublicKey *string `json:"publicKey"`
-	}
-	if err := json.NewDecoder(pubKeyResp.Body).Decode(&pubKeyResult); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if pubKeyResult.PublicKey != nil && *pubKeyResult.PublicKey != "" {
-		// User has a public key - encrypt vault key directly
-		inviteType = "direct"
-		encryptedVaultKey, err = crypto.X25519Seal(vaultKey, *pubKeyResult.PublicKey)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt vault key: %w", err)
-		}
-	} else {
-		// New user - generate temp keypair and two codes
-		inviteType = "new_user"
-
-		// Generate codes
-		emailCode, err = crypto.GenerateInviteCode()
-		if err != nil {
-			return fmt.Errorf("failed to generate email code: %w", err)
-		}
-		inviteCode, err = crypto.GenerateInviteCode()
-		if err != nil {
-			return fmt.Errorf("failed to generate invite code: %w", err)
-		}
-
-		// Generate salt
-		saltBytes, err := crypto.GenerateSalt()
-		if err != nil {
-			return fmt.Errorf("failed to generate salt: %w", err)
-		}
-		salt = crypto.EncodeBase64(saltBytes)
-
-		// Generate temp keypair
-		tempPubKey, tempPrivKey, err := crypto.GenerateX25519Keypair()
-		if err != nil {
-			return fmt.Errorf("failed to generate temp keypair: %w", err)
-		}
-
-		// Derive key from both codes
-		codeKey := crypto.DeriveInviteKey(emailCode, inviteCode, saltBytes)
-
-		// Encrypt temp private key with code-derived key
-		tempPrivKeyBytes, err := crypto.DecodeBase64(tempPrivKey)
-		if err != nil {
-			return fmt.Errorf("failed to decode temp private key: %w", err)
-		}
-		encryptedTempPrivKeyBytes, err := crypto.Encrypt(tempPrivKeyBytes, codeKey, "sinesync-invite-key-v1")
-		if err != nil {
-			return fmt.Errorf("failed to encrypt temp private key: %w", err)
-		}
-		encryptedTempPrivKey = crypto.EncodeBase64(encryptedTempPrivKeyBytes)
-
-		// Encrypt vault key with temp public key
-		encryptedVaultKey, err = crypto.X25519Seal(vaultKey, tempPubKey)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt vault key: %w", err)
-		}
-
-		// Hash codes for server storage
-		emailCodeHash = crypto.HashCode(emailCode)
-		inviteCodeHash = crypto.HashCode(inviteCode)
-
-		fmt.Println("✓ New user - generating invite codes")
-	}
-
-	// Create invite on server
+	// Create invite on server - just email, no encryption yet
 	inviteBody := map[string]interface{}{
-		"email":             shareEmail,
-		"inviteType":        inviteType,
-		"encryptedVaultKey": encryptedVaultKey,
-	}
-
-	if inviteType == "new_user" {
-		inviteBody["encryptedTempPrivateKey"] = encryptedTempPrivKey
-		inviteBody["tempPublicKey"] = tempPubKey
-		inviteBody["emailCodeHash"] = emailCodeHash
-		inviteBody["inviteCodeHash"] = inviteCodeHash
-		inviteBody["salt"] = salt
-		inviteBody["emailCode"] = emailCode // Sent to server for email, not stored
+		"email": shareEmail,
 	}
 
 	bodyBytes, err := json.Marshal(inviteBody)
 	if err != nil {
 		return fmt.Errorf("failed to marshal invite body: %w", err)
 	}
+
 	inviteReq, err := http.NewRequest("POST", apiBase+"/vaults/"+vaultID+"/invites", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return err
@@ -1513,29 +1440,190 @@ func runVaultShare(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("server error: %s", string(respBody))
 	}
 
-	var invite VaultInvite
-	if err := json.NewDecoder(inviteResp.Body).Decode(&invite); err != nil {
+	var result struct {
+		ID           string `json:"id"`
+		InviteeEmail string `json:"inviteeEmail"`
+		Status       string `json:"status"`
+		Message      string `json:"message"`
+	}
+	if err := json.NewDecoder(inviteResp.Body).Decode(&result); err != nil {
 		return err
 	}
 
 	fmt.Println()
-	if inviteType == "direct" {
-		fmt.Printf("✓ Invite sent! %s will see this in their account.\n", shareEmail)
-	} else {
-		fmt.Printf("✓ Invite created for %s\n", shareEmail)
-		fmt.Println()
-		fmt.Println("╔═══════════════════════════════════════════════════════════════════╗")
-		fmt.Println("║                     SHARE THIS CODE                               ║")
-		fmt.Println("╠═══════════════════════════════════════════════════════════════════╣")
-		fmt.Printf("║  Invite Code: %-52s║\n", inviteCode)
-		fmt.Println("║                                                                   ║")
-		fmt.Println("║  Share this code with the invitee via a DIFFERENT channel        ║")
-		fmt.Println("║  (SMS, Slack, in-person) - NOT the same as the email.            ║")
-		fmt.Println("║                                                                   ║")
-		fmt.Println("║  They will receive an email with a separate code.                ║")
-		fmt.Println("║  Both codes are needed to access the vault.                      ║")
-		fmt.Println("╚═══════════════════════════════════════════════════════════════════╝")
+	fmt.Printf("✓ Invite sent to %s\n", shareEmail)
+	fmt.Println()
+	fmt.Println("What happens next:")
+	fmt.Println("  1. They receive an email with a link to accept")
+	fmt.Println("  2. They click the link and create an account (or log in)")
+	fmt.Println("  3. You'll be notified to confirm the invite")
+	fmt.Println("  4. Run 'sinesync vault pending-confirm' to see invites awaiting confirmation")
+	fmt.Println("  5. Run 'sinesync vault confirm <invite-id>' to complete the share")
+
+	return nil
+}
+
+// runVaultPendingConfirm lists invites that are awaiting confirmation from the inviter
+func runVaultPendingConfirm(cmd *cobra.Command, args []string) error {
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
 	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("GET", apiBase+"/invites/awaiting-confirmation", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch invites: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server error: %s", string(respBody))
+	}
+
+	var result struct {
+		Invites []struct {
+			ID               string `json:"id"`
+			VaultID          string `json:"vaultId"`
+			VaultName        string `json:"vaultName"`
+			InviteeEmail     string `json:"inviteeEmail"`
+			InviteePublicKey string `json:"inviteePublicKey"`
+			AcceptedAt       string `json:"acceptedAt"`
+		} `json:"invites"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	if len(result.Invites) == 0 {
+		fmt.Println("No invites awaiting confirmation.")
+		return nil
+	}
+
+	fmt.Println("Invites awaiting your confirmation:")
+	fmt.Println()
+	for _, inv := range result.Invites {
+		fmt.Printf("  Invite ID: %s\n", inv.ID)
+		fmt.Printf("  Vault:     %s (%s)\n", inv.VaultName, inv.VaultID)
+		fmt.Printf("  Invitee:   %s\n", inv.InviteeEmail)
+		fmt.Printf("  Accepted:  %s\n", inv.AcceptedAt)
+		fmt.Println()
+		fmt.Printf("  To confirm: sinesync vault confirm %s\n", inv.ID)
+		fmt.Println("  " + strings.Repeat("-", 50))
+	}
+
+	return nil
+}
+
+// runVaultConfirm confirms an invite by encrypting the vault key for the invitee
+func runVaultConfirm(cmd *cobra.Command, args []string) error {
+	inviteID := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// First, get the invite details to get the vault ID and invitee's public key
+	req, err := http.NewRequest("GET", apiBase+"/invites/awaiting-confirmation", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch invites: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Invites []struct {
+			ID               string `json:"id"`
+			VaultID          string `json:"vaultId"`
+			VaultName        string `json:"vaultName"`
+			InviteeEmail     string `json:"inviteeEmail"`
+			InviteePublicKey string `json:"inviteePublicKey"`
+		} `json:"invites"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	// Find the invite
+	var targetInvite *struct {
+		ID               string `json:"id"`
+		VaultID          string `json:"vaultId"`
+		VaultName        string `json:"vaultName"`
+		InviteeEmail     string `json:"inviteeEmail"`
+		InviteePublicKey string `json:"inviteePublicKey"`
+	}
+	for i := range result.Invites {
+		if result.Invites[i].ID == inviteID {
+			targetInvite = &result.Invites[i]
+			break
+		}
+	}
+
+	if targetInvite == nil {
+		return fmt.Errorf("invite not found or not awaiting confirmation")
+	}
+
+	fmt.Printf("Confirming invite for %s to vault %s...\n", targetInvite.InviteeEmail, targetInvite.VaultName)
+
+	// Get the vault key from local storage
+	vaultKey, err := GetVaultKey(targetInvite.VaultID)
+	if err != nil {
+		return fmt.Errorf("failed to get vault key: %w", err)
+	}
+
+	// Encrypt vault key with invitee's public key
+	encryptedVaultKey, err := crypto.X25519Seal(vaultKey, targetInvite.InviteePublicKey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt vault key: %w", err)
+	}
+
+	// Confirm the invite
+	confirmBody := map[string]interface{}{
+		"encryptedVaultKey": encryptedVaultKey,
+	}
+	bodyBytes, err := json.Marshal(confirmBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal confirm body: %w", err)
+	}
+
+	confirmReq, err := http.NewRequest("POST", apiBase+"/invites/"+inviteID+"/confirm", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	confirmReq.Header.Set("Content-Type", "application/json")
+	confirmReq.Header.Set("Authorization", "Bearer "+token)
+
+	confirmResp, err := client.Do(confirmReq)
+	if err != nil {
+		return fmt.Errorf("failed to confirm invite: %w", err)
+	}
+	defer confirmResp.Body.Close()
+
+	if confirmResp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(confirmResp.Body)
+		return fmt.Errorf("server error: %s", string(respBody))
+	}
+
+	fmt.Println()
+	fmt.Printf("✓ Invite confirmed! %s now has access to %s\n", targetInvite.InviteeEmail, targetInvite.VaultName)
 
 	return nil
 }
@@ -1734,7 +1822,7 @@ func runVaultAccept(cmd *cobra.Command, args []string) error {
 	apiBase := getAPIBase()
 	client := &http.Client{Timeout: 30 * time.Second}
 
-	// Get invite details
+	// Get invite details first (to show vault name and inviter)
 	fmt.Println("Fetching invite details...")
 	inviteReq, err := http.NewRequest("GET", apiBase+"/invites/"+inviteID, nil)
 	if err != nil {
@@ -1754,15 +1842,11 @@ func runVaultAccept(cmd *cobra.Command, args []string) error {
 	}
 
 	var inviteDetails struct {
-		ID                      string `json:"id"`
-		VaultName               string `json:"vaultName"`
-		InviterEmail            string `json:"inviterEmail"`
-		InviteeEmail            string `json:"inviteeEmail"`
-		InviteType              string `json:"inviteType"`
-		EncryptedVaultKey       string `json:"encryptedVaultKey"`
-		EncryptedTempPrivateKey string `json:"encryptedTempPrivateKey,omitempty"`
-		TempPublicKey           string `json:"tempPublicKey,omitempty"`
-		Salt                    string `json:"salt,omitempty"`
+		ID           string `json:"id"`
+		VaultName    string `json:"vaultName"`
+		InviterEmail string `json:"inviterEmail"`
+		InviteeEmail string `json:"inviteeEmail"`
+		Status       string `json:"status"`
 	}
 	if err := json.NewDecoder(inviteResp.Body).Decode(&inviteDetails); err != nil {
 		return fmt.Errorf("failed to decode invite: %w", err)
@@ -1772,123 +1856,11 @@ func runVaultAccept(cmd *cobra.Command, args []string) error {
 	fmt.Printf("From: %s\n", inviteDetails.InviterEmail)
 	fmt.Println()
 
-	var vaultKey []byte
-	var userEncryptedVaultKey string
-	acceptBody := make(map[string]string)
-
-	encMgr := encryption.GetManager()
-	if !encMgr.HasKey() {
-		return fmt.Errorf("encryption key not available - please login first")
-	}
-
-	if inviteDetails.InviteType == "direct" {
-		// Direct invite - decrypt with our private key
-		// Get our encrypted private key from server
-		privKeyReq, err := http.NewRequest("GET", apiBase+"/users/keypair", nil)
-		if err != nil {
-			return err
-		}
-		privKeyReq.Header.Set("Authorization", "Bearer "+token)
-
-		privKeyResp, err := client.Do(privKeyReq)
-		if err != nil {
-			return fmt.Errorf("failed to get private key: %w", err)
-		}
-		defer privKeyResp.Body.Close()
-
-		if privKeyResp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(privKeyResp.Body)
-			return fmt.Errorf("failed to get keypair: %s", string(body))
-		}
-
-		var keypairResult struct {
-			EncryptedPrivateKey string `json:"encryptedPrivateKey"`
-		}
-		if err := json.NewDecoder(privKeyResp.Body).Decode(&keypairResult); err != nil {
-			return fmt.Errorf("failed to decode keypair: %w", err)
-		}
-
-		// Decrypt our private key
-		privateKey, err := encMgr.DecryptUserPrivateKey(keypairResult.EncryptedPrivateKey)
-		if err != nil {
-			return fmt.Errorf("failed to decrypt private key: %w", err)
-		}
-
-		// Decrypt vault key with our private key
-		vaultKey, err = crypto.X25519Open(inviteDetails.EncryptedVaultKey, privateKey)
-		if err != nil {
-			return fmt.Errorf("failed to decrypt vault key: %w", err)
-		}
-
-		fmt.Println("✓ Decrypted vault key")
-
-	} else {
-		// New user invite - need both codes
-		reader := bufio.NewReader(os.Stdin)
-
-		fmt.Print("Email code (from email): ")
-		emailCode, err := reader.ReadString('\n')
-		if err != nil {
-			return fmt.Errorf("failed to read email code: %w", err)
-		}
-		emailCode = strings.TrimSpace(emailCode)
-
-		fmt.Print("Invite code (from inviter): ")
-		inviteCode, err := reader.ReadString('\n')
-		if err != nil {
-			return fmt.Errorf("failed to read invite code: %w", err)
-		}
-		inviteCode = strings.TrimSpace(inviteCode)
-
-		// Derive key from codes
-		saltBytes, err := crypto.DecodeBase64(inviteDetails.Salt)
-		if err != nil {
-			return fmt.Errorf("invalid salt: %w", err)
-		}
-		codeKey := crypto.DeriveInviteKey(emailCode, inviteCode, saltBytes)
-
-		// Decrypt temp private key
-		encTempPrivKey, err := crypto.DecodeBase64(inviteDetails.EncryptedTempPrivateKey)
-		if err != nil {
-			return fmt.Errorf("invalid encrypted temp key: %w", err)
-		}
-		tempPrivKeyBytes, err := crypto.Decrypt(encTempPrivKey, codeKey, "sinesync-invite-key-v1")
-		if err != nil {
-			return fmt.Errorf("failed to decrypt temp key - check your codes: %w", err)
-		}
-		tempPrivKey := crypto.EncodeBase64(tempPrivKeyBytes)
-
-		// Decrypt vault key with temp private key
-		vaultKey, err = crypto.X25519Open(inviteDetails.EncryptedVaultKey, tempPrivKey)
-		if err != nil {
-			return fmt.Errorf("failed to decrypt vault key: %w", err)
-		}
-
-		fmt.Println("✓ Codes verified and vault key decrypted")
-
-		// Add codes to accept body for server verification
-		acceptBody["emailCode"] = emailCode
-		acceptBody["inviteCode"] = inviteCode
-	}
-
-	// Re-encrypt vault key with our derived key
-	userEncryptedVaultKey, err = encMgr.EncryptVaultKey(vaultKey)
-	if err != nil {
-		return fmt.Errorf("failed to re-encrypt vault key: %w", err)
-	}
-
-	acceptBody["userEncryptedVaultKey"] = userEncryptedVaultKey
-
-	// Accept the invite
-	acceptBodyBytes, err := json.Marshal(acceptBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal accept body: %w", err)
-	}
-	acceptReq, err := http.NewRequest("POST", apiBase+"/invites/"+inviteID+"/accept", bytes.NewReader(acceptBodyBytes))
+	// Accept the invite (no body needed - server gets our public key from profile)
+	acceptReq, err := http.NewRequest("POST", apiBase+"/invites/"+inviteID+"/accept", nil)
 	if err != nil {
 		return err
 	}
-	acceptReq.Header.Set("Content-Type", "application/json")
 	acceptReq.Header.Set("Authorization", "Bearer "+token)
 
 	acceptResp, err := client.Do(acceptReq)
@@ -1902,22 +1874,12 @@ func runVaultAccept(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("accept failed: %s", string(body))
 	}
 
-	// Add vault to local config
-	// First get the vault ID from the accept response
-	var acceptResult struct {
-		Member struct {
-			VaultID string `json:"vaultId"`
-		} `json:"member"`
-	}
-	if err := json.NewDecoder(acceptResp.Body).Decode(&acceptResult); err != nil {
-		return fmt.Errorf("failed to decode accept response: %w", err)
-	}
-
-	addLocalVault(acceptResult.Member.VaultID, inviteDetails.VaultName, userEncryptedVaultKey, false)
-
+	fmt.Println("✓ Invite accepted!")
 	fmt.Println()
-	fmt.Printf("✓ Successfully joined vault: %s\n", inviteDetails.VaultName)
-	fmt.Println("  Run 'sinesync vault sync' to sync all vault keys.")
+	fmt.Println("Next steps:")
+	fmt.Printf("  1. %s will be notified that you accepted\n", inviteDetails.InviterEmail)
+	fmt.Println("  2. They will confirm the share and encrypt the vault key for you")
+	fmt.Println("  3. Once confirmed, run 'sinesync vault sync' to access the shared vault")
 
 	return nil
 }
