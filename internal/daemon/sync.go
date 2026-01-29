@@ -429,9 +429,12 @@ func (m *SyncManager) updateStoredToken(token string) {
 }
 
 func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
-	// Get encryption manager
+	// Get encryption manager and verify key is available and valid
 	encMgr := encryption.GetManager()
-	if !encMgr.HasKey() {
+	if _, err := encMgr.GetKey(); err != nil {
+		if err == encryption.ErrNeedsReauth {
+			return 0, 0, fmt.Errorf("re-authentication required - run 'sinesync unlock'")
+		}
 		return 0, 0, fmt.Errorf("encryption key not available - please login again")
 	}
 
