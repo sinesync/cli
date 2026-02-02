@@ -44,8 +44,14 @@ type ClaudeMemExtension struct {
 
 // ClaudeMemAdapter implements Adapter for claude-mem
 type ClaudeMemAdapter struct {
-	db       *sql.DB
-	readonly bool
+	db             *sql.DB
+	readonly       bool
+	lastInsertedID int64
+}
+
+// GetLastInsertedID returns the ID of the last inserted observation
+func (a *ClaudeMemAdapter) GetLastInsertedID() int64 {
+	return a.lastInsertedID
 }
 
 // NewClaudeMemAdapter creates a new adapter
@@ -316,7 +322,7 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 		obsType = "discovery" // Default fallback
 	}
 
-	_, err = a.db.ExecContext(ctx, `
+	result, err := a.db.ExecContext(ctx, `
 		INSERT INTO observations (
 			memory_session_id, project, type, title, subtitle, narrative,
 			facts, concepts, files_read, files_modified,
@@ -327,8 +333,16 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 		string(factsJSON), string(conceptsJSON), string(filesReadJSON), string(filesModifiedJSON),
 		createdAt, epoch,
 	)
+	if err != nil {
+		return err
+	}
 
-	return err
+	// Capture the inserted ID for ChromaDB embedding
+	if id, err := result.LastInsertId(); err == nil {
+		a.lastInsertedID = id
+	}
+
+	return nil
 }
 
 // Exists checks if an observation already exists in claude-mem
@@ -352,6 +366,32 @@ func (a *ClaudeMemAdapter) Exists(ctx context.Context, obs *storage.Observation)
 	`, obs.Core.Project, obs.Core.Title).Scan(&count)
 
 	return count > 0, err
+}
+
+// GetObservationID returns the sqlite ID for an observation, or 0 if not found
+func (a *ClaudeMemAdapter) GetObservationID(ctx context.Context, obs *storage.Observation) int64 {
+	// First try by source ID if this came from claude-mem
+	if obs.Source.Adapter == ClaudeMemAdapterName && obs.Source.ID != "" {
+		var id int64
+		err := a.db.QueryRowContext(ctx, `
+			SELECT id FROM observations WHERE id = ?
+		`, obs.Source.ID).Scan(&id)
+		if err == nil {
+			return id
+		}
+	}
+
+	// Fall back to project + title lookup
+	var id int64
+	err := a.db.QueryRowContext(ctx, `
+		SELECT id FROM observations
+		WHERE project = ? AND title = ?
+		LIMIT 1
+	`, obs.Core.Project, obs.Core.Title).Scan(&id)
+	if err != nil {
+		return 0
+	}
+	return id
 }
 
 // GetProjects returns a list of projects with stats
@@ -427,8 +467,10 @@ type AdapterSyncStats struct {
 	ExportedToClaudeMem int
 	// Observations in claude-mem that are native (not from sinesync)
 	NativeInClaudeMem int
-	// ChromaDB embedding count (if available)
+	// ChromaDB total embedding documents (each observation has multiple docs)
 	ChromaEmbeddings int
+	// ChromaDB unique observation IDs (for accurate backlog calculation)
+	ChromaUniqueObservations int
 	// Whether ChromaDB stats are available
 	ChromaAvailable bool
 }
@@ -466,34 +508,48 @@ func (a *ClaudeMemAdapter) GetSyncStats() (*AdapterSyncStats, error) {
 	}
 
 	// Try to get ChromaDB embedding count
-	stats.ChromaEmbeddings, stats.ChromaAvailable = a.getChromaEmbeddingCount()
+	stats.ChromaEmbeddings, stats.ChromaUniqueObservations, stats.ChromaAvailable = a.getChromaEmbeddingCount()
 
 	return stats, nil
 }
 
-// getChromaEmbeddingCount tries to count embeddings in ChromaDB
-func (a *ClaudeMemAdapter) getChromaEmbeddingCount() (int, bool) {
+// getChromaEmbeddingCount returns total embeddings, unique observation count, and availability
+func (a *ClaudeMemAdapter) getChromaEmbeddingCount() (int, int, bool) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 
 	chromaDBPath := filepath.Join(home, ".claude-mem", "vector-db", "chroma.sqlite3")
 	if _, err := os.Stat(chromaDBPath); err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 
 	chromaDB, err := sql.Open("sqlite", chromaDBPath+"?mode=ro")
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	defer chromaDB.Close()
 
-	var count int
-	err = chromaDB.QueryRow("SELECT COUNT(*) FROM embeddings").Scan(&count)
+	// Total embedding documents
+	var totalCount int
+	err = chromaDB.QueryRow("SELECT COUNT(*) FROM embeddings").Scan(&totalCount)
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 
-	return count, true
+	// Unique observation IDs (extract ID from embedding_id like "obs_123_narrative")
+	var uniqueCount int
+	err = chromaDB.QueryRow(`
+		SELECT COUNT(DISTINCT
+			CAST(SUBSTR(embedding_id, 5, INSTR(SUBSTR(embedding_id, 5), '_') - 1) AS INTEGER)
+		) FROM embeddings
+		WHERE embedding_id LIKE 'obs_%'
+	`).Scan(&uniqueCount)
+	if err != nil {
+		// Fall back to estimate if query fails
+		uniqueCount = totalCount / 5 // rough estimate
+	}
+
+	return totalCount, uniqueCount, true
 }

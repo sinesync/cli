@@ -143,14 +143,17 @@ func getVaultKey(vaultID string, encMgr *encryption.Manager) []byte {
 
 // SyncManager handles background cloud sync
 type SyncManager struct {
-	localStorage *storage.LocalStorage
-	apiBase      string
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
-	mu           sync.Mutex
-	lastSync     time.Time
-	lastError    string
-	syncing      bool
+	localStorage    *storage.LocalStorage
+	apiBase         string
+	stopChan        chan struct{}
+	backfillStop    chan struct{}
+	wg              sync.WaitGroup
+	mu              sync.Mutex
+	lastSync        time.Time
+	lastError       string
+	syncing         bool
+	chromaClient    *adapters.ChromaMCPClient // Shared chroma client for embedding
+	backfillRunning bool
 }
 
 // NewSyncManager creates a new sync manager
@@ -164,6 +167,7 @@ func NewSyncManager(localStorage *storage.LocalStorage) *SyncManager {
 		localStorage: localStorage,
 		apiBase:      apiBase,
 		stopChan:     make(chan struct{}),
+		backfillStop: make(chan struct{}),
 	}
 }
 
@@ -172,11 +176,19 @@ func (m *SyncManager) Start() {
 	m.wg.Add(1)
 	go m.syncLoop()
 	log.Printf("[sync] Background sync started (interval: %v)", SyncInterval)
+
+	// Start continuous ChromaDB backfill if claude-mem is installed
+	if adapters.IsClaudeMemInstalled() {
+		m.wg.Add(1)
+		go m.chromaBackfillLoop()
+		log.Printf("[sync] ChromaDB backfill started (continuous)")
+	}
 }
 
 // Stop halts background sync
 func (m *SyncManager) Stop() {
 	close(m.stopChan)
+	close(m.backfillStop)
 	m.wg.Wait()
 	log.Printf("[sync] Background sync stopped")
 }
@@ -433,6 +445,24 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 	encMgr := encryption.GetManager()
 	if !encMgr.HasKey() {
 		return 0, 0, fmt.Errorf("encryption key not available - please login again")
+	}
+
+	// Initialize chroma client for embedding (if claude-mem is installed)
+	if adapters.IsClaudeMemInstalled() {
+		m.chromaClient = adapters.NewChromaMCPClient()
+		ctx := context.Background()
+		if err := m.chromaClient.Connect(ctx); err != nil {
+			log.Printf("[sync] ChromaDB connect failed (will skip embedding): %v", err)
+			m.chromaClient = nil
+		} else {
+			if err := m.chromaClient.EnsureCollection(ctx); err != nil {
+				log.Printf("[sync] ChromaDB ensure collection failed: %v", err)
+				m.chromaClient.Close()
+				m.chromaClient = nil
+			} else {
+				log.Printf("[sync] ChromaDB connected for real-time embedding")
+			}
+		}
 	}
 
 	// Get default vault ID (fallback for projects not assigned to a vault)
@@ -703,6 +733,12 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 	// Update sync manifest with current cloud state
 	syncManifest.UpdateFromCloud(cloudItems)
 	syncManifest.Save()
+
+	// Close chroma client if it was used (backfill now runs in separate goroutine)
+	if m.chromaClient != nil {
+		m.chromaClient.Close()
+		m.chromaClient = nil
+	}
 
 	return pushed, pulled, nil
 }
@@ -1268,15 +1304,70 @@ func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum strin
 		return err
 	}
 
-	// Export to claude-mem if installed
+	// Export to claude-mem SQLite if installed
 	if adapters.IsClaudeMemInstalled() {
 		adapter, err := adapters.NewClaudeMemAdapter(false)
 		if err == nil && adapter != nil {
-			defer adapter.Close()
 			ctx := context.Background()
 			if err := adapter.Export(ctx, obs); err != nil {
 				log.Printf("[sync] Failed to export to claude-mem: %v", err)
 			}
+
+			// Embed to ChromaDB immediately (blocks until complete - natural backpressure)
+			if m.chromaClient != nil {
+				obsID := adapter.GetLastInsertedID()
+				// If Export returned early (observation already exists), fall back to lookup
+				if obsID <= 0 {
+					obsID = adapter.GetObservationID(ctx, obs)
+				}
+				if obsID > 0 {
+					// Extract fields similar to Export logic
+					narrative := obs.Core.Content
+					subtitle := obs.Core.Summary
+					memorySessionID := "sinesync-" + obs.ID[:8]
+					if ext, ok := obs.GetExtension(adapters.ClaudeMemAdapterName); ok {
+						if extMap, ok := ext.(map[string]interface{}); ok {
+							if v, ok := extMap["narrative"].(string); ok && v != "" {
+								narrative = v
+							}
+							if v, ok := extMap["sdkSessionId"].(string); ok && v != "" {
+								memorySessionID = v
+							}
+							if v, ok := extMap["subtitle"].(string); ok && v != "" {
+								subtitle = v
+							}
+						}
+					}
+					project := obs.Core.Project
+					if project == "" {
+						project = "unknown"
+					}
+
+					ids, docs, metas := adapters.FormatObservationDocs(
+						obsID,
+						memorySessionID,
+						project,
+						obs.Core.Type,
+						obs.Core.Title,
+						subtitle,
+						narrative,
+						obs.Structured.Facts,
+						obs.Structured.Concepts,
+						obs.Structured.Files.Read,
+						obs.Structured.Files.Modified,
+						obs.Core.CreatedAt.Unix(),
+					)
+					if len(ids) > 0 {
+						if err := m.chromaClient.AddDocuments(ctx, ids, docs, metas); err != nil {
+							log.Printf("[sync] ChromaDB embed failed for obs %d: %v", obsID, err)
+						} else {
+							// Mark as embedded in sync manifest
+							storage.GetSyncManifest().MarkChromaEmbedded(id)
+						}
+					}
+				}
+			}
+			adapter.Close()
 		}
 	}
 
@@ -1338,4 +1429,353 @@ func (m *SyncManager) deleteLocally(id string) error {
 
 	log.Printf("[sync] Deleted locally: %s (project: %s)", id, obs.Core.Project)
 	return nil
+}
+
+// backfillChromaDB embeds existing observations to ChromaDB that haven't been embedded yet.
+// Processes observations one at a time with natural backpressure (waits for each response).
+// Returns the number of observations embedded this cycle.
+func (m *SyncManager) backfillChromaDB(syncManifest *storage.SyncManifest) int {
+	const batchSize = 100 // Max observations to backfill per sync cycle
+
+	// Get all local observations
+	observations, err := m.localStorage.ListObservations()
+	if err != nil {
+		log.Printf("[sync] ChromaDB backfill: failed to list observations: %v", err)
+		return 0
+	}
+
+	// Find observations that need embedding
+	var toEmbed []storage.Observation
+	for _, obs := range observations {
+		if !syncManifest.IsChromaEmbedded(obs.ID) {
+			toEmbed = append(toEmbed, obs)
+			if len(toEmbed) >= batchSize {
+				break
+			}
+		}
+	}
+
+	if len(toEmbed) == 0 {
+		return 0
+	}
+
+	remaining := len(observations) - syncManifest.GetChromaEmbeddedCount()
+	log.Printf("[sync] ChromaDB backfill: processing %d of %d remaining observations", len(toEmbed), remaining)
+
+	// Open claude-mem adapter for getting sqlite IDs
+	adapter, err := adapters.NewClaudeMemAdapter(false)
+	if err != nil {
+		log.Printf("[sync] ChromaDB backfill: failed to open claude-mem: %v", err)
+		return 0
+	}
+	defer adapter.Close()
+
+	ctx := context.Background()
+	embedded := 0
+
+	for _, obs := range toEmbed {
+		// First ensure the observation is exported to claude-mem SQLite
+		if err := adapter.Export(ctx, &obs); err != nil {
+			log.Printf("[sync] ChromaDB backfill: export to claude-mem failed for %s: %v", obs.ID, err)
+			continue
+		}
+
+		obsID := adapter.GetLastInsertedID()
+		if obsID <= 0 {
+			// Observation already exists in claude-mem - look up its ID
+			obsID = adapter.GetObservationID(ctx, &obs)
+			if obsID <= 0 {
+				log.Printf("[sync] ChromaDB backfill: no sqlite ID for %s, skipping", obs.ID)
+				// Mark as embedded anyway to avoid infinite retry
+				syncManifest.MarkChromaEmbedded(obs.ID)
+				continue
+			}
+		}
+
+		// Extract fields for embedding
+		narrative := obs.Core.Content
+		subtitle := obs.Core.Summary
+		memorySessionID := "sinesync-" + obs.ID[:8]
+		if ext, ok := obs.GetExtension(adapters.ClaudeMemAdapterName); ok {
+			if extMap, ok := ext.(map[string]interface{}); ok {
+				if v, ok := extMap["narrative"].(string); ok && v != "" {
+					narrative = v
+				}
+				if v, ok := extMap["sdkSessionId"].(string); ok && v != "" {
+					memorySessionID = v
+				}
+				if v, ok := extMap["subtitle"].(string); ok && v != "" {
+					subtitle = v
+				}
+			}
+		}
+		project := obs.Core.Project
+		if project == "" {
+			project = "unknown"
+		}
+
+		ids, docs, metas := adapters.FormatObservationDocs(
+			obsID,
+			memorySessionID,
+			project,
+			obs.Core.Type,
+			obs.Core.Title,
+			subtitle,
+			narrative,
+			obs.Structured.Facts,
+			obs.Structured.Concepts,
+			obs.Structured.Files.Read,
+			obs.Structured.Files.Modified,
+			obs.Core.CreatedAt.Unix(),
+		)
+
+		if len(ids) > 0 {
+			// This blocks until ChromaDB responds - natural backpressure
+			if err := m.chromaClient.AddDocuments(ctx, ids, docs, metas); err != nil {
+				log.Printf("[sync] ChromaDB backfill: embed failed for %s (sqlite %d): %v", obs.ID, obsID, err)
+				continue
+			}
+		}
+
+		// Mark as embedded and save progress
+		syncManifest.MarkChromaEmbedded(obs.ID)
+		embedded++
+
+		// Save progress every 10 embeddings
+		if embedded%10 == 0 {
+			syncManifest.Save()
+		}
+	}
+
+	// Final save
+	if embedded > 0 {
+		syncManifest.Save()
+	}
+
+	return embedded
+}
+
+// chromaBackfillLoop runs continuously to backfill observations to ChromaDB
+// It processes observations as fast as ChromaDB can handle them (natural backpressure)
+func (m *SyncManager) chromaBackfillLoop() {
+	defer m.wg.Done()
+
+	// Wait a bit for startup to settle
+	select {
+	case <-time.After(10 * time.Second):
+	case <-m.backfillStop:
+		return
+	}
+
+	log.Printf("[chroma] Backfill loop starting...")
+
+	for {
+		select {
+		case <-m.backfillStop:
+			log.Printf("[chroma] Backfill loop stopped")
+			return
+		default:
+		}
+
+		// Connect to ChromaDB with cancellable context
+		chromaClient := adapters.NewChromaMCPClient()
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// Cancel context when backfillStop is triggered (prevents zombie processes)
+		go func() {
+			select {
+			case <-m.backfillStop:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		if err := chromaClient.Connect(ctx); err != nil {
+			log.Printf("[chroma] Connect failed, retrying in 30s: %v", err)
+			cancel()
+			select {
+			case <-time.After(30 * time.Second):
+				continue
+			case <-m.backfillStop:
+				return
+			}
+		}
+
+		if err := chromaClient.EnsureCollection(ctx); err != nil {
+			log.Printf("[chroma] EnsureCollection failed, retrying in 30s: %v", err)
+			cancel()
+			chromaClient.Close()
+			select {
+			case <-time.After(30 * time.Second):
+				continue
+			case <-m.backfillStop:
+				return
+			}
+		}
+
+		// Run backfill until complete or error
+		completed := m.runBackfillBatch(chromaClient)
+		cancel()
+		chromaClient.Close()
+
+		if completed {
+			log.Printf("[chroma] Backfill complete! All observations embedded.")
+			// Check periodically for new observations
+			select {
+			case <-time.After(5 * time.Minute):
+				continue
+			case <-m.backfillStop:
+				return
+			}
+		}
+
+		// Small delay between batches to avoid hammering on errors
+		select {
+		case <-time.After(1 * time.Second):
+		case <-m.backfillStop:
+			return
+		}
+	}
+}
+
+// runBackfillBatch processes observations until done or error
+// Returns true if all observations are embedded
+func (m *SyncManager) runBackfillBatch(chromaClient *adapters.ChromaMCPClient) bool {
+	syncManifest := storage.GetSyncManifest()
+
+	// Get all local observations
+	observations, err := m.localStorage.ListObservations()
+	if err != nil {
+		log.Printf("[chroma] Failed to list observations: %v", err)
+		return false
+	}
+
+	// Find observations that need embedding
+	var toEmbed []storage.Observation
+	for _, obs := range observations {
+		if !syncManifest.IsChromaEmbedded(obs.ID) {
+			toEmbed = append(toEmbed, obs)
+		}
+	}
+
+	if len(toEmbed) == 0 {
+		return true // All done
+	}
+
+	log.Printf("[chroma] Backfilling %d observations to ChromaDB...", len(toEmbed))
+
+	// Open claude-mem adapter
+	adapter, err := adapters.NewClaudeMemAdapter(false)
+	if err != nil {
+		log.Printf("[chroma] Failed to open claude-mem: %v", err)
+		return false
+	}
+	defer adapter.Close()
+
+	ctx := context.Background()
+	embedded := 0
+	errors := 0
+	startTime := time.Now()
+
+	for i, obs := range toEmbed {
+		// Check for stop signal
+		select {
+		case <-m.backfillStop:
+			log.Printf("[chroma] Backfill interrupted, embedded %d observations", embedded)
+			return false
+		default:
+		}
+
+		// Ensure observation exists in claude-mem SQLite
+		if err := adapter.Export(ctx, &obs); err != nil {
+			errors++
+			continue
+		}
+
+		obsID := adapter.GetLastInsertedID()
+		if obsID <= 0 {
+			obsID = adapter.GetObservationID(ctx, &obs)
+			if obsID <= 0 {
+				syncManifest.MarkChromaEmbedded(obs.ID) // Skip this one
+				continue
+			}
+		}
+
+		// Extract fields for embedding
+		narrative := obs.Core.Content
+		subtitle := obs.Core.Summary
+		memorySessionID := "sinesync-" + obs.ID[:8]
+		if ext, ok := obs.GetExtension(adapters.ClaudeMemAdapterName); ok {
+			if extMap, ok := ext.(map[string]interface{}); ok {
+				if v, ok := extMap["narrative"].(string); ok && v != "" {
+					narrative = v
+				}
+				if v, ok := extMap["sdkSessionId"].(string); ok && v != "" {
+					memorySessionID = v
+				}
+				if v, ok := extMap["subtitle"].(string); ok && v != "" {
+					subtitle = v
+				}
+			}
+		}
+		project := obs.Core.Project
+		if project == "" {
+			project = "unknown"
+		}
+
+		ids, docs, metas := adapters.FormatObservationDocs(
+			obsID,
+			memorySessionID,
+			project,
+			obs.Core.Type,
+			obs.Core.Title,
+			subtitle,
+			narrative,
+			obs.Structured.Facts,
+			obs.Structured.Concepts,
+			obs.Structured.Files.Read,
+			obs.Structured.Files.Modified,
+			obs.Core.CreatedAt.Unix(),
+		)
+
+		if len(ids) == 0 {
+			// No documents to embed (empty content)
+			syncManifest.MarkChromaEmbedded(obs.ID)
+			continue
+		}
+
+		// Natural backpressure - wait for ChromaDB response
+		if err := chromaClient.AddDocuments(ctx, ids, docs, metas); err != nil {
+			log.Printf("[chroma] AddDocuments error for %s: %v", obs.ID[:8], err)
+			errors++
+			if errors > 10 {
+				log.Printf("[chroma] Too many errors (%d), pausing backfill", errors)
+				return false
+			}
+			continue
+		}
+
+		syncManifest.MarkChromaEmbedded(obs.ID)
+		embedded++
+		errors = 0 // Reset error count on success
+
+		// Save progress and log every 100 embeddings
+		if embedded%100 == 0 {
+			syncManifest.Save()
+			elapsed := time.Since(startTime)
+			rate := float64(embedded) / elapsed.Seconds()
+			remaining := len(toEmbed) - i - 1
+			eta := time.Duration(float64(remaining)/rate) * time.Second
+			log.Printf("[chroma] Progress: %d/%d embedded (%.1f/sec, ETA: %v)", embedded, len(toEmbed), rate, eta)
+		}
+	}
+
+	if embedded > 0 {
+		syncManifest.Save()
+		elapsed := time.Since(startTime)
+		rate := float64(embedded) / elapsed.Seconds()
+		log.Printf("[chroma] Batch complete: embedded %d observations in %v (%.1f/sec)", embedded, elapsed, rate)
+	}
+
+	return len(toEmbed) == embedded
 }

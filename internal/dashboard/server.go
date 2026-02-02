@@ -131,11 +131,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			// Adapter sync stats
 			if syncStats, err := adapter.GetSyncStats(); err == nil {
 				stats["adapterSync"] = map[string]interface{}{
-					"nativeInClaudeMem":   syncStats.NativeInClaudeMem,
-					"exportedToClaudeMem": syncStats.ExportedToClaudeMem,
-					"chromaEmbeddings":    syncStats.ChromaEmbeddings,
-					"chromaAvailable":     syncStats.ChromaAvailable,
-					"embeddingBacklog":    count - syncStats.ChromaEmbeddings,
+					"nativeInClaudeMem":      syncStats.NativeInClaudeMem,
+					"exportedToClaudeMem":    syncStats.ExportedToClaudeMem,
+					"chromaEmbeddings":       syncStats.ChromaEmbeddings,
+					"chromaUniqueObs":        syncStats.ChromaUniqueObservations,
+					"chromaAvailable":        syncStats.ChromaAvailable,
+					"embeddingBacklog":       count - syncStats.ChromaUniqueObservations,
 				}
 			}
 

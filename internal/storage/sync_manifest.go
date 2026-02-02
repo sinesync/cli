@@ -24,6 +24,7 @@ type SyncManifest struct {
 	PendingDeletes  map[string]bool             `json:"pendingDeletes"`  // explicit deletes to sync to cloud
 	ManifestVersion int                         `json:"manifestVersion"` // version from server for cache invalidation
 	LocalUploads    map[string]LocalUploadState `json:"localUploads"`    // id -> our uploaded state
+	ChromaEmbedded  map[string]bool             `json:"chromaEmbedded"`  // observations embedded to ChromaDB
 	mu              sync.RWMutex
 }
 
@@ -58,6 +59,7 @@ func GetSyncManifest() *SyncManifest {
 			SeenIDs:        make(map[string]bool),
 			PendingDeletes: make(map[string]bool),
 			LocalUploads:   make(map[string]LocalUploadState),
+			ChromaEmbedded: make(map[string]bool),
 		}
 		manifest.Load()
 	})
@@ -251,4 +253,45 @@ func (m *SyncManifest) ClearLocalUpload(id string) {
 	defer m.mu.Unlock()
 
 	delete(m.LocalUploads, id)
+}
+
+// MarkChromaEmbedded marks an observation as embedded in ChromaDB
+func (m *SyncManifest) MarkChromaEmbedded(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.ChromaEmbedded == nil {
+		m.ChromaEmbedded = make(map[string]bool)
+	}
+	m.ChromaEmbedded[id] = true
+}
+
+// IsChromaEmbedded checks if an observation is already embedded in ChromaDB
+func (m *SyncManifest) IsChromaEmbedded(id string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.ChromaEmbedded == nil {
+		return false
+	}
+	return m.ChromaEmbedded[id]
+}
+
+// GetChromaEmbeddedCount returns the number of observations embedded in ChromaDB
+func (m *SyncManifest) GetChromaEmbeddedCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.ChromaEmbedded == nil {
+		return 0
+	}
+	return len(m.ChromaEmbedded)
+}
+
+// ClearChromaEmbedded removes an observation from ChromaDB tracking (e.g., after deletion)
+func (m *SyncManifest) ClearChromaEmbedded(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.ChromaEmbedded, id)
 }

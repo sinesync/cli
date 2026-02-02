@@ -40,6 +40,11 @@ func LogDir() string {
 	return filepath.Join(config.DataDir(), "logs")
 }
 
+// TodayLogFile returns the path to today's log file
+func TodayLogFile() string {
+	return filepath.Join(LogDir(), fmt.Sprintf("daemon-%s.log", time.Now().Format("2006-01-02")))
+}
+
 // ReadPIDInfo reads the PID file
 func ReadPIDInfo() (*PIDInfo, error) {
 	data, err := os.ReadFile(PIDFilePath())

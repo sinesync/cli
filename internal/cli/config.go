@@ -32,7 +32,7 @@ var configShowCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Println("\nsine~sync configuration\n")
+		fmt.Println("\nsine~sync configuration")
 		fmt.Println("────────────────────────────────────────")
 		fmt.Printf("\nClaude-mem mode: %v\n", cfg.ClaudeMemMode)
 
@@ -62,7 +62,7 @@ var configProjectsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, _ := config.Load()
 
-		fmt.Println("\nAvailable projects\n")
+		fmt.Println("\nAvailable projects")
 		fmt.Println("────────────────────────────────────────────────────────────")
 
 		if !adapters.IsClaudeMemInstalled() {

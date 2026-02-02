@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 
@@ -45,14 +46,24 @@ var daemonRunCmd = &cobra.Command{
 	RunE:   runDaemonForeground,
 }
 
+var daemonLogsCmd = &cobra.Command{
+	Use:   "logs",
+	Short: "Show daemon logs",
+	Long:  `Tails the daemon log file. Use -f to follow, -n to specify number of lines.`,
+	RunE:  runDaemonLogs,
+}
+
 func init() {
 	daemonCmd.AddCommand(daemonStartCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonRunCmd)
+	daemonCmd.AddCommand(daemonLogsCmd)
 
 	daemonStartCmd.Flags().IntP("port", "p", daemon.DefaultPort, "Port to run on")
 	daemonRunCmd.Flags().IntP("port", "p", daemon.DefaultPort, "Port to run on")
+	daemonLogsCmd.Flags().BoolP("follow", "f", false, "Follow log output")
+	daemonLogsCmd.Flags().IntP("lines", "n", 50, "Number of lines to show")
 }
 
 func runDaemonStart(cmd *cobra.Command, args []string) error {
@@ -124,6 +135,34 @@ func runDaemonForeground(cmd *cobra.Command, args []string) error {
 
 	server := daemon.NewServer(port)
 	return server.Run()
+}
+
+func runDaemonLogs(cmd *cobra.Command, args []string) error {
+	follow, _ := cmd.Flags().GetBool("follow")
+	lines, _ := cmd.Flags().GetInt("lines")
+
+	// Find today's log file
+	logFile := daemon.TodayLogFile()
+
+	// Check if log file exists
+	if _, err := os.Stat(logFile); os.IsNotExist(err) {
+		fmt.Printf("No log file found at: %s\n", logFile)
+		fmt.Println("The daemon may not have been started today.")
+		return nil
+	}
+
+	// Use tail command
+	tailArgs := []string{"-n", fmt.Sprintf("%d", lines)}
+	if follow {
+		tailArgs = append(tailArgs, "-f")
+	}
+	tailArgs = append(tailArgs, logFile)
+
+	tailCmd := exec.Command("tail", tailArgs...)
+	tailCmd.Stdout = os.Stdout
+	tailCmd.Stderr = os.Stderr
+
+	return tailCmd.Run()
 }
 
 // openBrowser opens a URL in the default browser

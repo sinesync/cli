@@ -212,12 +212,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  • Native (claude-mem): %d\n", syncStats.NativeInClaudeMem)
 				fmt.Printf("  • Synced (from sinesync): %d\n", syncStats.ExportedToClaudeMem)
 				if syncStats.ChromaAvailable {
-					// Calculate embedding gap
-					embeddingGap := count - syncStats.ChromaEmbeddings
+					// Calculate embedding gap using unique observation count
+					embeddingGap := count - syncStats.ChromaUniqueObservations
 					if embeddingGap > 0 {
-						fmt.Printf("  • ChromaDB embeddings: %d (backlog: %d)\n", syncStats.ChromaEmbeddings, embeddingGap)
+						fmt.Printf("  • ChromaDB embeddings: %d docs, %d observations (backlog: %d)\n",
+							syncStats.ChromaEmbeddings, syncStats.ChromaUniqueObservations, embeddingGap)
 					} else {
-						fmt.Printf("  • ChromaDB embeddings: %d\n", syncStats.ChromaEmbeddings)
+						fmt.Printf("  • ChromaDB embeddings: %d docs, %d observations\n",
+							syncStats.ChromaEmbeddings, syncStats.ChromaUniqueObservations)
 					}
 				}
 			}
