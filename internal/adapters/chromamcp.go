@@ -111,6 +111,9 @@ func (c *ChromaMCPClient) Connect(ctx context.Context) error {
 		"--client-type", "persistent",
 		"--data-dir", vectorDBPath)
 
+	// Create process group so we can kill all child processes
+	c.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
 	var err error
 	c.stdin, err = c.cmd.StdinPipe()
 	if err != nil {
@@ -194,7 +197,8 @@ func (c *ChromaMCPClient) Close() error {
 		c.stdin.Close()
 	}
 	if c.cmd != nil && c.cmd.Process != nil {
-		c.cmd.Process.Kill()
+		// Kill the entire process group (negative PID) to ensure child processes are cleaned up
+		syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
 		c.cmd.Wait()
 	}
 	if c.stderrLog != nil {
