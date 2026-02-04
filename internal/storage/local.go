@@ -154,14 +154,14 @@ func (s *LocalStorage) Delete(itemType, id string) error {
 var sourceIndex map[string]bool
 var sourceIndexLoaded bool
 
-// ExistsBySource checks if an observation exists by source adapter and ID
-func (s *LocalStorage) ExistsBySource(adapter, sourceID string) (bool, error) {
+// ExistsBySource checks if an observation exists by source adapter, machine, and ID
+func (s *LocalStorage) ExistsBySource(adapter, machine, sourceID string) (bool, error) {
 	// Build index on first call
 	if !sourceIndexLoaded {
 		s.buildSourceIndex()
 	}
 
-	key := adapter + ":" + sourceID
+	key := adapter + ":" + machine + ":" + sourceID
 	return sourceIndex[key], nil
 }
 
@@ -180,7 +180,7 @@ func (s *LocalStorage) buildSourceIndex() {
 		var obs Observation
 		if err := json.Unmarshal(dataBytes, &obs); err == nil {
 			if obs.Source.Adapter != "" && obs.Source.ID != "" {
-				key := obs.Source.Adapter + ":" + obs.Source.ID
+				key := obs.Source.Adapter + ":" + obs.Source.Machine + ":" + obs.Source.ID
 				sourceIndex[key] = true
 			}
 		}
@@ -194,11 +194,11 @@ func (s *LocalStorage) InvalidateSourceIndex() {
 }
 
 // AddToSourceIndex adds a new entry without full rebuild
-func (s *LocalStorage) AddToSourceIndex(adapter, sourceID string) {
+func (s *LocalStorage) AddToSourceIndex(adapter, machine, sourceID string) {
 	if sourceIndex == nil {
 		sourceIndex = make(map[string]bool)
 	}
-	key := adapter + ":" + sourceID
+	key := adapter + ":" + machine + ":" + sourceID
 	sourceIndex[key] = true
 }
 
@@ -221,7 +221,7 @@ func (s *LocalStorage) GetStatus() (itemCount int, storageBytes int64, err error
 func (s *LocalStorage) SaveObservation(obs *Observation) error {
 	// Update source index
 	if obs.Source.Adapter != "" && obs.Source.ID != "" {
-		s.AddToSourceIndex(obs.Source.Adapter, obs.Source.ID)
+		s.AddToSourceIndex(obs.Source.Adapter, obs.Source.Machine, obs.Source.ID)
 	}
 	return s.Save("observation", obs.ID, obs)
 }
@@ -269,7 +269,7 @@ func (s *LocalStorage) ListObservations() ([]Observation, error) {
 // ObservationExists checks if an observation exists by source
 func (s *LocalStorage) ObservationExists(obs *Observation) (bool, error) {
 	if obs.Source.Adapter != "" && obs.Source.ID != "" {
-		return s.ExistsBySource(obs.Source.Adapter, obs.Source.ID)
+		return s.ExistsBySource(obs.Source.Adapter, obs.Source.Machine, obs.Source.ID)
 	}
 	return false, nil
 }

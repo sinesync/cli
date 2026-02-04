@@ -43,6 +43,28 @@ type ProjectInfo struct {
 	LastActivity string `json:"lastActivity,omitempty"`
 }
 
+// EmbeddingConfig describes what embedding configuration an adapter expects
+// Used to determine if observations need re-embedding on export
+type EmbeddingConfig struct {
+	Model     string // e.g., "all-MiniLM-L6-v2"
+	Tokenizer string // e.g., "wordpiece-hf"
+	Dims      int    // e.g., 384
+}
+
+// EmbeddingAwareAdapter extends Adapter with embedding configuration
+// Adapters that support vector embeddings should implement this
+type EmbeddingAwareAdapter interface {
+	Adapter
+
+	// GetEmbeddingConfig returns the embedding configuration this adapter expects
+	// Returns nil if the adapter doesn't use embeddings
+	GetEmbeddingConfig() *EmbeddingConfig
+
+	// ExportWithEmbedding exports an observation with its embedding to the adapter's vector store
+	// This is called after re-embedding if the observation's embedding doesn't match
+	ExportWithEmbedding(ctx context.Context, obs *storage.Observation) error
+}
+
 // Registry holds available adapters
 type Registry struct {
 	adapters map[string]Adapter

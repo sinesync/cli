@@ -62,16 +62,28 @@ type Meta struct {
 	VaultID        string   `json:"vaultId,omitempty"`
 }
 
-// EmbeddingData contains the vector embedding
+// EmbeddingData contains the vector embedding with metadata
 type EmbeddingData struct {
-	Model  string    `json:"model,omitempty"`
-	Vector []float32 `json:"vector,omitempty"`
+	Model     string    `json:"model,omitempty"`     // e.g., "all-MiniLM-L6-v2"
+	Tokenizer string    `json:"tokenizer,omitempty"` // e.g., "wordpiece-hf" or "hash-simple"
+	Dims      int       `json:"dims,omitempty"`      // e.g., 384
+	Vector    []float32 `json:"vector,omitempty"`
+}
+
+// IsCompatibleWith checks if this embedding is compatible with target config
+func (e *EmbeddingData) IsCompatibleWith(model, tokenizerType string, dims int) bool {
+	// No metadata = old embedding, needs regeneration
+	if e.Model == "" || e.Tokenizer == "" || e.Dims == 0 {
+		return false
+	}
+	return e.Model == model && e.Tokenizer == tokenizerType && e.Dims == dims
 }
 
 // Source tracks where the observation came from
 type Source struct {
 	Adapter  string `json:"adapter"`            // claude-mem, mem0, sinesync, etc.
 	ID       string `json:"id,omitempty"`       // Original ID in source system
+	Machine  string `json:"machine,omitempty"`  // Machine hostname for cross-device dedup
 	Epoch    int64  `json:"epoch,omitempty"`    // Creation timestamp for ordering
 	Checksum string `json:"checksum,omitempty"` // For conflict detection
 }

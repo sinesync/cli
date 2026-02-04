@@ -93,9 +93,11 @@ func runReembed(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Update observation with new embedding
+		// Update observation with new embedding and metadata
 		obs.Embedding.Vector = embedding
 		obs.Embedding.Model = embeddings.ModelName
+		obs.Embedding.Tokenizer = embedder.TokenizerType()
+		obs.Embedding.Dims = embeddings.Dimensions
 		obs.Core.UpdatedAt = time.Now()
 
 		if err := localStorage.SaveObservation(&obs); err != nil {
@@ -340,24 +342,28 @@ func runImport(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Check if already imported (by source adapter + ID)
-		exists, _ := localStorage.ExistsBySource(obs.Source.Adapter, obs.Source.ID)
+		// Check if already imported (by source adapter + machine + ID)
+		exists, _ := localStorage.ExistsBySource(obs.Source.Adapter, obs.Source.Machine, obs.Source.ID)
 		if exists {
 			skipped++
 			continue
 		}
 
-		// Generate embedding
+		// Generate embedding with metadata
 		textForEmbedding := obs.TextForEmbedding()
 		if embedder != nil && embedder.IsReady() {
 			embedding, err := embedder.Embed(textForEmbedding)
 			if err == nil {
 				obs.Embedding.Vector = embedding
 				obs.Embedding.Model = embeddings.ModelName
+				obs.Embedding.Tokenizer = embedder.TokenizerType()
+				obs.Embedding.Dims = embeddings.Dimensions
 			}
 		} else {
 			obs.Embedding.Vector = embeddings.FallbackEmbed(textForEmbedding)
 			obs.Embedding.Model = "fallback"
+			obs.Embedding.Tokenizer = "hash-simple"
+			obs.Embedding.Dims = embeddings.Dimensions
 		}
 
 		// Save to local storage
@@ -393,8 +399,17 @@ This command:
 Use case: After cloud sync brings memories from other devices, export
 them to claude-mem so they appear in claude-mem's semantic search.
 
-Can be called manually or via Claude Code SessionStart hook.`,
+Can be called manually or via Claude Code SessionStart hook.
+
+Flags:
+  --force   Export all observations, including those originally from claude-mem`,
 	RunE: runExport,
+}
+
+var exportForce bool
+
+func init() {
+	exportCmd.Flags().BoolVar(&exportForce, "force", false, "Export all observations, including those originally from claude-mem")
 }
 
 func runExport(cmd *cobra.Command, args []string) error {
@@ -427,7 +442,8 @@ func runExport(cmd *cobra.Command, args []string) error {
 	for _, obs := range observations {
 		// Only sync observations NOT from claude-mem (those are already there)
 		// This syncs observations from: other devices, backend, manual imports
-		if obs.Source.Adapter == adapters.ClaudeMemAdapterName {
+		// Unless --force is specified (e.g., after database reset)
+		if !exportForce && obs.Source.Adapter == adapters.ClaudeMemAdapterName {
 			continue
 		}
 

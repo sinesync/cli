@@ -80,11 +80,11 @@ func (s *Server) getObservations() []storage.Observation {
 	defer s.obsCacheMu.Unlock()
 
 	if time.Since(s.obsCacheTime) > s.obsCacheTTL || s.obsCache == nil {
-		fmt.Fprintf(os.Stderr, "Loading observations into cache...\n")
+		log.Printf("[cache] Loading observations into cache...")
 		start := time.Now()
 		s.obsCache, _ = s.localStorage.ListObservations()
 		s.obsCacheTime = time.Now()
-		fmt.Fprintf(os.Stderr, "Cached %d observations in %v\n", len(s.obsCache), time.Since(start))
+		log.Printf("[cache] Cached %d observations in %v", len(s.obsCache), time.Since(start))
 	}
 	return s.obsCache
 }
@@ -150,7 +150,7 @@ func (s *Server) Run() error {
 
 	go func() {
 		<-sigChan
-		fmt.Fprintln(os.Stderr, "\nsine~sync daemon shutting down...")
+		log.Printf("[daemon] Shutting down...")
 		s.syncManager.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -158,11 +158,11 @@ func (s *Server) Run() error {
 		RemovePIDFile()
 	}()
 
-	fmt.Fprintf(os.Stderr, "sine~sync daemon starting on http://%s\n", addr)
-	fmt.Fprintf(os.Stderr, "  Mode: %s\n", s.mode)
-	fmt.Fprintf(os.Stderr, "  Dashboard: http://%s\n", addr)
-	fmt.Fprintf(os.Stderr, "  Hook API: http://%s/api/\n", addr)
-	fmt.Fprintf(os.Stderr, "  Cloud sync: every %v\n", SyncInterval)
+	log.Printf("[daemon] sine~sync starting on http://%s", addr)
+	log.Printf("[daemon]   Mode: %s", s.mode)
+	log.Printf("[daemon]   Dashboard: http://%s", addr)
+	log.Printf("[daemon]   Hook API: http://%s/api/", addr)
+	log.Printf("[daemon]   Cloud sync: every %v", SyncInterval)
 
 	return s.httpServer.ListenAndServe()
 }
@@ -373,17 +373,21 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate embedding
+	// Generate embedding with metadata
 	textForEmbedding := obs.TextForEmbedding()
 	if s.embedder != nil && s.embedder.IsReady() {
 		embedding, err := s.embedder.Embed(textForEmbedding)
 		if err == nil {
 			obs.Embedding.Vector = embedding
 			obs.Embedding.Model = embeddings.ModelName
+			obs.Embedding.Tokenizer = s.embedder.TokenizerType()
+			obs.Embedding.Dims = embeddings.Dimensions
 		}
 	} else {
 		obs.Embedding.Vector = embeddings.FallbackEmbed(textForEmbedding)
 		obs.Embedding.Model = "fallback"
+		obs.Embedding.Tokenizer = "hash-simple"
+		obs.Embedding.Dims = embeddings.Dimensions
 	}
 
 	// Save observation
@@ -605,17 +609,21 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Generate embedding
+	// Generate embedding with metadata
 	textForEmbedding := summary.TextForEmbedding()
 	if s.embedder != nil && s.embedder.IsReady() {
 		embedding, err := s.embedder.Embed(textForEmbedding)
 		if err == nil {
 			summary.Embedding.Vector = embedding
 			summary.Embedding.Model = embeddings.ModelName
+			summary.Embedding.Tokenizer = s.embedder.TokenizerType()
+			summary.Embedding.Dims = embeddings.Dimensions
 		}
 	} else {
 		summary.Embedding.Vector = embeddings.FallbackEmbed(textForEmbedding)
 		summary.Embedding.Model = "fallback"
+		summary.Embedding.Tokenizer = "hash-simple"
+		summary.Embedding.Dims = embeddings.Dimensions
 	}
 
 	// Save
@@ -800,9 +808,13 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	syncManifest := storage.GetSyncManifest()
 	authenticated := s.isAuthenticated()
 
+	// Get local observation count
+	localCount, _, _ := s.localStorage.GetStatus()
+
 	status := map[string]interface{}{
 		"syncing":       syncing,
 		"syncedCount":   syncManifest.GetSyncedCount(),
+		"localCount":    localCount,
 		"authenticated": authenticated,
 	}
 	if !lastSync.IsZero() {
@@ -810,6 +822,31 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	if lastError != "" {
 		status["syncError"] = lastError
+	}
+
+	// Add backfill status
+	backfillRunning, backfillProgress, backfillTotal, backfillElapsed := s.syncManager.BackfillStatus()
+	if backfillRunning {
+		status["backfill"] = map[string]interface{}{
+			"running":  true,
+			"progress": backfillProgress,
+			"total":    backfillTotal,
+			"elapsed":  backfillElapsed.Round(time.Second).String(),
+		}
+	}
+
+	// Add claude-mem status if in adapter mode
+	if s.mode == "adapter" && adapters.IsClaudeMemInstalled() {
+		adapter, err := adapters.NewClaudeMemAdapter(true)
+		if err == nil && adapter != nil {
+			defer adapter.Close()
+			claudeMemCount, _ := adapter.GetObservationCount()
+			backlog := adapter.GetEmbeddingBacklog()
+			status["claudeMem"] = map[string]interface{}{
+				"observations":     claudeMemCount,
+				"embeddingBacklog": backlog,
+			}
+		}
 	}
 
 	writeJSON(w, status)
@@ -926,7 +963,7 @@ func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request,
 	}
 
 	// Delete from local sinesync storage
-	if err := s.localStorage.Delete("observations", id); err != nil {
+	if err := s.localStorage.Delete("observation", id); err != nil {
 		http.Error(w, "Failed to delete: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

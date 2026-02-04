@@ -2,13 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
 
+	"github.com/miclip/sinesync/internal/adapters"
+	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
@@ -313,6 +317,13 @@ func runSync(cmd *cobra.Command, args []string) error {
 			}
 			continue
 		}
+
+		// Export to claude-mem with re-embedding if needed
+		ctx := context.Background()
+		if err := exportToClaudeMemWithEmbedding(ctx, obs); err != nil {
+			log.Printf("[sync] Failed to export to claude-mem: %v", err)
+		}
+
 		pulled++
 
 		if (pulled+pullSkipped)%100 == 0 {
@@ -515,6 +526,14 @@ func runSyncPull(cmd *cobra.Command, args []string) error {
 			errors++
 			continue
 		}
+
+		// Export to claude-mem with re-embedding if needed
+		ctx := context.Background()
+		if err := exportToClaudeMemWithEmbedding(ctx, obs); err != nil {
+			// Log error but don't count as failure - observation is still saved locally
+			log.Printf("[sync] Failed to export to claude-mem: %v", err)
+		}
+
 		pulled++
 	}
 
@@ -994,4 +1013,61 @@ func getVaultIDForObservation(project string, defaultVaultID string) string {
 		return defaultVaultID
 	}
 	return vaultID
+}
+
+// exportToClaudeMemWithEmbedding exports an observation to claude-mem, re-embedding if needed
+// Returns error if export fails, nil on success or if claude-mem is not installed
+func exportToClaudeMemWithEmbedding(ctx context.Context, obs *storage.Observation) error {
+	if !adapters.IsClaudeMemInstalled() {
+		return nil
+	}
+
+	adapter, err := adapters.NewClaudeMemAdapter(false)
+	if err != nil || adapter == nil {
+		return err
+	}
+	defer adapter.Close()
+
+	// Get adapter's embedding config (ClaudeMemAdapter implements EmbeddingAwareAdapter)
+	adapterConfig := adapter.GetEmbeddingConfig()
+	if adapterConfig == nil {
+		// No embedding config, use regular export
+		return adapter.Export(ctx, obs)
+	}
+
+	// Check if observation's embedding is compatible
+	if obs.Embedding.IsCompatibleWith(adapterConfig.Model, adapterConfig.Tokenizer, adapterConfig.Dims) {
+		// Embedding is compatible, export with embedding
+		return adapter.ExportWithEmbedding(ctx, obs)
+	}
+
+	// Embedding is incompatible or missing - need to re-embed
+	embedder, err := embeddings.GetProvider()
+	if err != nil {
+		log.Printf("[sync] Embedding provider unavailable, using regular export: %v", err)
+		return adapter.Export(ctx, obs)
+	}
+	// Don't close singleton provider
+
+	// Generate text for embedding
+	text := obs.Core.Title
+	if obs.Core.Content != "" {
+		text += "\n" + obs.Core.Content
+	}
+
+	// Generate new embedding
+	vector, err := embedder.Embed(text)
+	if err != nil {
+		log.Printf("[sync] Failed to generate embedding, using regular export: %v", err)
+		return adapter.Export(ctx, obs)
+	}
+
+	// Update observation with new embedding metadata
+	obs.Embedding.Vector = vector
+	obs.Embedding.Model = embeddings.ModelName
+	obs.Embedding.Tokenizer = embedder.TokenizerType()
+	obs.Embedding.Dims = embeddings.Dimensions
+
+	// Now export with embedding
+	return adapter.ExportWithEmbedding(ctx, obs)
 }

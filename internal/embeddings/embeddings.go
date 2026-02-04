@@ -2,6 +2,7 @@ package embeddings
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -11,40 +12,81 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"unicode"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
 
 const (
-	ModelName  = "all-MiniLM-L6-v2"
-	Dimensions = 384
-	MaxTokens  = 256
+	ModelName     = "all-MiniLM-L6-v2"
+	TokenizerType = "wordpiece-hf"
+	Dimensions    = 384
+	MaxTokens     = 256
 
-	// Hugging Face model URL
+	// Hugging Face URLs
 	modelURL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+	vocabURL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt"
+
+	// Special token IDs (BERT vocab)
+	clsTokenID = 101  // [CLS]
+	sepTokenID = 102  // [SEP]
+	unkTokenID = 100  // [UNK]
+	padTokenID = 0    // [PAD]
 
 	// ONNX Runtime library URL (Linux x64)
 	onnxRuntimeVersion = "1.16.3"
 	onnxRuntimeURL     = "https://github.com/microsoft/onnxruntime/releases/download/v1.16.3/onnxruntime-linux-x64-1.16.3.tgz"
 )
 
+
 // Accelerator type for embeddings
 type Accelerator string
 
 const (
-	AcceleratorCPU     Accelerator = "CPU"
-	AcceleratorCUDA    Accelerator = "CUDA"
-	AcceleratorCoreML  Accelerator = "CoreML"
+	AcceleratorCPU      Accelerator = "CPU"
+	AcceleratorCUDA     Accelerator = "CUDA"
+	AcceleratorCoreML   Accelerator = "CoreML"
 	AcceleratorDirectML Accelerator = "DirectML"
 )
+
+// WordPieceTokenizer implements BERT-style WordPiece tokenization
+type WordPieceTokenizer struct {
+	vocab    map[string]int // token -> id
+	invVocab map[int]string // id -> token
+}
 
 // Provider generates embeddings
 type Provider struct {
 	modelPath    string
+	vocabPath    string
 	session      *ort.DynamicAdvancedSession
+	tokenizer    *WordPieceTokenizer
 	ready        bool
 	accelerator  Accelerator
 	needsPooling bool // true if model outputs last_hidden_state (needs mean pooling)
+}
+
+// Singleton instance - ONNX can only be initialized once per process
+var (
+	globalProvider     *Provider
+	globalProviderOnce sync.Once
+	globalProviderErr  error
+)
+
+// GetProvider returns the singleton embedding provider
+// This is the preferred way to get an embedder as ONNX can only be initialized once
+func GetProvider() (*Provider, error) {
+	globalProviderOnce.Do(func() {
+		globalProvider, globalProviderErr = newProviderInternal()
+	})
+	return globalProvider, globalProviderErr
+}
+
+// NewProvider creates or returns the singleton embedding provider
+// For backwards compatibility - internally uses GetProvider()
+func NewProvider() (*Provider, error) {
+	return GetProvider()
 }
 
 // modelDir returns the directory for storing models
@@ -56,6 +98,148 @@ func modelDir() string {
 // modelFilePath returns the path to the ONNX model file
 func modelFilePath() string {
 	return filepath.Join(modelDir(), "model.onnx")
+}
+
+// vocabFilePath returns the path to the vocab.txt file
+func vocabFilePath() string {
+	return filepath.Join(modelDir(), "vocab.txt")
+}
+
+// NewWordPieceTokenizer loads a WordPiece vocabulary from a vocab.txt file
+func NewWordPieceTokenizer(vocabPath string) (*WordPieceTokenizer, error) {
+	file, err := os.Open(vocabPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	vocab := make(map[string]int)
+	invVocab := make(map[int]string)
+
+	scanner := bufio.NewScanner(file)
+	id := 0
+	for scanner.Scan() {
+		token := scanner.Text()
+		vocab[token] = id
+		invVocab[id] = token
+		id++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return &WordPieceTokenizer{vocab: vocab, invVocab: invVocab}, nil
+}
+
+// Tokenize converts text to token IDs using WordPiece algorithm
+func (t *WordPieceTokenizer) Tokenize(text string) []int {
+	// Normalize: lowercase and clean whitespace
+	text = strings.ToLower(text)
+
+	// Start with [CLS]
+	tokens := []int{clsTokenID}
+
+	// Split into words (basic whitespace tokenization)
+	words := strings.Fields(text)
+
+	for _, word := range words {
+		if len(tokens) >= MaxTokens-1 {
+			break
+		}
+
+		// Clean punctuation - split punctuation from words
+		subwords := t.splitPunctuation(word)
+
+		for _, subword := range subwords {
+			if len(tokens) >= MaxTokens-1 {
+				break
+			}
+
+			// Apply WordPiece to each subword
+			wordTokens := t.wordPiece(subword)
+			for _, tok := range wordTokens {
+				if len(tokens) >= MaxTokens-1 {
+					break
+				}
+				tokens = append(tokens, tok)
+			}
+		}
+	}
+
+	// End with [SEP]
+	tokens = append(tokens, sepTokenID)
+
+	return tokens
+}
+
+// splitPunctuation splits punctuation from words
+func (t *WordPieceTokenizer) splitPunctuation(word string) []string {
+	var result []string
+	var current strings.Builder
+
+	for _, r := range word {
+		if unicode.IsPunct(r) {
+			if current.Len() > 0 {
+				result = append(result, current.String())
+				current.Reset()
+			}
+			result = append(result, string(r))
+		} else {
+			current.WriteRune(r)
+		}
+	}
+
+	if current.Len() > 0 {
+		result = append(result, current.String())
+	}
+
+	return result
+}
+
+// wordPiece applies the WordPiece algorithm to a single word
+func (t *WordPieceTokenizer) wordPiece(word string) []int {
+	if len(word) == 0 {
+		return nil
+	}
+
+	// Check if whole word is in vocab
+	if id, ok := t.vocab[word]; ok {
+		return []int{id}
+	}
+
+	var tokens []int
+	start := 0
+
+	for start < len(word) {
+		end := len(word)
+		foundToken := false
+
+		for end > start {
+			substr := word[start:end]
+			if start > 0 {
+				// Add ## prefix for subword tokens
+				substr = "##" + substr
+			}
+
+			if id, ok := t.vocab[substr]; ok {
+				tokens = append(tokens, id)
+				foundToken = true
+				break
+			}
+			end--
+		}
+
+		if !foundToken {
+			// Character not in vocab, use [UNK]
+			tokens = append(tokens, unkTokenID)
+			start++
+		} else {
+			start = end
+		}
+	}
+
+	return tokens
 }
 
 // onnxLibPath returns the path to the ONNX runtime library
@@ -91,12 +275,13 @@ func detectGPU() (Accelerator, bool) {
 	return AcceleratorCPU, false
 }
 
-// NewProvider creates a new embedding provider
-// Downloads the ONNX model and runtime if not present
+// newProviderInternal creates the actual embedding provider
+// Downloads the ONNX model, vocab, and runtime if not present
 // Automatically detects and uses GPU/MPS acceleration when available
-func NewProvider() (*Provider, error) {
+func newProviderInternal() (*Provider, error) {
 	p := &Provider{
 		modelPath:   modelFilePath(),
+		vocabPath:   vocabFilePath(),
 		ready:       false,
 		accelerator: AcceleratorCPU,
 	}
@@ -116,6 +301,24 @@ func NewProvider() (*Provider, error) {
 		}
 		fmt.Fprintf(os.Stderr, "sine~sync: Model downloaded successfully\n")
 	}
+
+	// Check if vocab exists, download if not
+	if _, err := os.Stat(p.vocabPath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "sine~sync: Downloading vocab...\n")
+		if err := downloadVocab(); err != nil {
+			fmt.Fprintf(os.Stderr, "sine~sync: Vocab download failed: %v (using fallback)\n", err)
+			return p, nil
+		}
+		fmt.Fprintf(os.Stderr, "sine~sync: Vocab ready\n")
+	}
+
+	// Initialize WordPiece tokenizer
+	tk, err := NewWordPieceTokenizer(p.vocabPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sine~sync: Tokenizer init failed: %v (using fallback)\n", err)
+		return p, nil
+	}
+	p.tokenizer = tk
 
 	// Check if ONNX runtime library exists, download if not
 	libPath := onnxLibPath()
@@ -161,6 +364,8 @@ func NewProvider() (*Provider, error) {
 			cudaOpts.Destroy()
 		}
 	case AcceleratorCoreML:
+		// Note: CoreML may print "Context leak detected, CoreAnalytics returned false"
+		// This is harmless - it's an Apple internal diagnostic, not an error
 		err = opts.AppendExecutionProviderCoreML(0)
 		if err == nil {
 			gpuEnabled = true
@@ -226,6 +431,40 @@ func downloadModel() error {
 	defer out.Close()
 
 	// Copy with progress indication
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("save file: %w", err)
+	}
+
+	return nil
+}
+
+// downloadVocab downloads the vocab.txt from Hugging Face
+func downloadVocab() error {
+	// Create model directory
+	dir := modelDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create dir: %w", err)
+	}
+
+	// Download vocab file
+	resp, err := http.Get(vocabURL)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	}
+
+	// Create output file
+	out, err := os.Create(vocabFilePath())
+	if err != nil {
+		return fmt.Errorf("create file: %w", err)
+	}
+	defer out.Close()
+
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
 		return fmt.Errorf("save file: %w", err)
@@ -355,28 +594,29 @@ var Verbose = false
 
 // Embed generates an embedding for text using ONNX model
 func (p *Provider) Embed(text string) ([]float32, error) {
-	if !p.ready || p.session == nil {
+	if !p.ready || p.session == nil || p.tokenizer == nil {
 		if Verbose {
-			fmt.Fprintf(os.Stderr, "ONNX: not ready (ready=%v, session=%v)\n", p.ready, p.session != nil)
+			fmt.Fprintf(os.Stderr, "ONNX: not ready (ready=%v, session=%v, tokenizer=%v)\n", p.ready, p.session != nil, p.tokenizer != nil)
 		}
 		return FallbackEmbed(text), nil
 	}
 
-	// Tokenize text (simplified - real impl would use a tokenizer)
-	tokens := simpleTokenize(text)
+	// Tokenize text using WordPiece tokenizer
+	tokenIDs := p.tokenizer.Tokenize(text)
 
-	// Create input tensors
-	inputIDs := make([]int64, len(tokens))
-	attentionMask := make([]int64, len(tokens))
-	tokenTypeIDs := make([]int64, len(tokens))
+	// Create input tensors from tokenizer output
+	seqLen := len(tokenIDs)
+	inputIDs := make([]int64, seqLen)
+	attentionMask := make([]int64, seqLen)
+	tokenTypeIDs := make([]int64, seqLen)
 
-	for i, t := range tokens {
+	for i, t := range tokenIDs {
 		inputIDs[i] = int64(t)
-		attentionMask[i] = 1
-		tokenTypeIDs[i] = 0
+		attentionMask[i] = 1 // All tokens are valid
+		tokenTypeIDs[i] = 0  // Single sequence
 	}
 
-	shape := ort.Shape{1, int64(len(tokens))}
+	shape := ort.Shape{1, int64(seqLen)}
 
 	inputIDsTensor, err := ort.NewTensor(shape, inputIDs)
 	if err != nil {
@@ -449,7 +689,7 @@ func (p *Provider) Embed(text string) ([]float32, error) {
 					for i := 0; i < Dimensions; i++ {
 						var sum float32
 						validTokens := 0
-						for j := 0; j < seqLen && j < len(tokens); j++ {
+						for j := 0; j < seqLen && j < len(tokenIDs); j++ {
 							if attentionMask[j] == 1 {
 								sum += data[j*Dimensions+i]
 								validTokens++
@@ -489,48 +729,36 @@ func (p *Provider) Embed(text string) ([]float32, error) {
 	return FallbackEmbed(text), nil
 }
 
-// simpleTokenize provides basic tokenization
-// A proper implementation would use the model's actual tokenizer
-// MiniLM vocabulary size is 30522
-const vocabSize = 30522
-
-func simpleTokenize(text string) []int {
-	// [CLS] token
-	tokens := []int{101}
-
-	// Simple word-based tokenization
-	// Map words to token IDs within vocabulary bounds
-	words := strings.Fields(strings.ToLower(text))
-	for _, word := range words {
-		if len(tokens) >= MaxTokens-1 {
-			break
-		}
-
-		// Hash word to a token ID within vocabulary
-		h := 0
-		for _, c := range word {
-			h = h*31 + int(c)
-		}
-		if h < 0 {
-			h = -h
-		}
-		// Keep in vocab range [1000, 30521] - avoid special tokens
-		tokenID := (h % (vocabSize - 1000)) + 1000
-		tokens = append(tokens, tokenID)
-	}
-
-	// [SEP] token
-	tokens = append(tokens, 102)
-
-	return tokens
-}
 
 // Close cleans up resources
 func (p *Provider) Close() error {
+	p.tokenizer = nil
 	if p.session != nil {
 		return p.session.Destroy()
 	}
 	return nil
+}
+
+// TokenizerType returns the tokenizer type used
+func (p *Provider) TokenizerType() string {
+	if p.tokenizer != nil {
+		return TokenizerType
+	}
+	return "hash-simple"
+}
+
+// EmbedWithMetadata generates an embedding and returns it with full metadata
+func (p *Provider) EmbedWithMetadata(text string) (vector []float32, model, tokenizerType string, dims int, err error) {
+	vector, err = p.Embed(text)
+	if err != nil {
+		return nil, "", "", 0, err
+	}
+	return vector, ModelName, p.TokenizerType(), Dimensions, nil
+}
+
+// GetConfig returns the current embedding configuration
+func (p *Provider) GetConfig() (model, tokenizerType string, dims int) {
+	return ModelName, p.TokenizerType(), Dimensions
 }
 
 // CosineSimilarity computes cosine similarity between two embeddings

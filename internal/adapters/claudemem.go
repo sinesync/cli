@@ -3,8 +3,10 @@ package adapters
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,6 +17,12 @@ import (
 )
 
 const ClaudeMemAdapterName = "claude-mem"
+
+// hostname returns the machine hostname for cross-device dedup
+func hostname() string {
+	h, _ := os.Hostname()
+	return h
+}
 
 // ClaudeMemDB path
 func claudeMemDBPath() string {
@@ -223,6 +231,7 @@ func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]stor
 			Source: storage.Source{
 				Adapter: ClaudeMemAdapterName,
 				ID:      fmt.Sprintf("%d", id),
+				Machine: hostname(),
 				Epoch:   createdAtEpoch,
 			},
 		}
@@ -256,15 +265,12 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 	}
 
 	// Try to get claude-mem extension for lossless round-trip
-	var narrative, memorySessionID, subtitle string
+	var narrative, subtitle string
 
 	if ext, ok := obs.GetExtension(ClaudeMemAdapterName); ok {
 		if extMap, ok := ext.(map[string]interface{}); ok {
 			if v, ok := extMap["narrative"].(string); ok {
 				narrative = v
-			}
-			if v, ok := extMap["sdkSessionId"].(string); ok {
-				memorySessionID = v
 			}
 			if v, ok := extMap["subtitle"].(string); ok {
 				subtitle = v
@@ -279,9 +285,9 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 	if subtitle == "" {
 		subtitle = obs.Core.Summary
 	}
-	if memorySessionID == "" {
-		memorySessionID = "sinesync-" + obs.ID[:8]
-	}
+
+	// Always use sinesync prefix - identifies exports and prevents re-import loops
+	memorySessionID := "sinesync-" + obs.ID[:8]
 
 	project := obs.Core.Project
 	if project == "" {
@@ -347,7 +353,7 @@ func (a *ClaudeMemAdapter) Export(ctx context.Context, obs *storage.Observation)
 
 // Exists checks if an observation already exists in claude-mem
 func (a *ClaudeMemAdapter) Exists(ctx context.Context, obs *storage.Observation) (bool, error) {
-	// First check by source ID if this came from claude-mem
+	// First check by source ID if this came from claude-mem originally
 	if obs.Source.Adapter == ClaudeMemAdapterName && obs.Source.ID != "" {
 		var count int
 		err := a.db.QueryRowContext(ctx, `
@@ -358,14 +364,23 @@ func (a *ClaudeMemAdapter) Exists(ctx context.Context, obs *storage.Observation)
 		}
 	}
 
-	// Fall back to project + title check
-	var count int
-	err := a.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM observations
-		WHERE project = ? AND title = ?
-	`, obs.Core.Project, obs.Core.Title).Scan(&count)
+	// Check if this specific sinesync observation was already exported
+	// Look for the memory_session_id that would be created during export
+	if obs.ID != "" && len(obs.ID) >= 8 {
+		expectedSessionID := "sinesync-" + obs.ID[:8]
+		var count int
+		err := a.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM observations
+			WHERE memory_session_id = ?
+		`, expectedSessionID).Scan(&count)
+		if err == nil && count > 0 {
+			return true, nil
+		}
+	}
 
-	return count > 0, err
+	// Don't fall back to project + title - that causes false positives
+	// where native claude-mem observations block sinesync exports
+	return false, nil
 }
 
 // GetObservationID returns the sqlite ID for an observation, or 0 if not found
@@ -381,17 +396,20 @@ func (a *ClaudeMemAdapter) GetObservationID(ctx context.Context, obs *storage.Ob
 		}
 	}
 
-	// Fall back to project + title lookup
-	var id int64
-	err := a.db.QueryRowContext(ctx, `
-		SELECT id FROM observations
-		WHERE project = ? AND title = ?
-		LIMIT 1
-	`, obs.Core.Project, obs.Core.Title).Scan(&id)
-	if err != nil {
-		return 0
+	// Look up by sinesync session ID (consistent with Export())
+	if obs.ID != "" && len(obs.ID) >= 8 {
+		var id int64
+		expectedSessionID := "sinesync-" + obs.ID[:8]
+		err := a.db.QueryRowContext(ctx, `
+			SELECT id FROM observations
+			WHERE memory_session_id = ?
+			LIMIT 1
+		`, expectedSessionID).Scan(&id)
+		if err == nil {
+			return id
+		}
 	}
-	return id
+	return 0
 }
 
 // GetProjects returns a list of projects with stats
@@ -514,6 +532,7 @@ func (a *ClaudeMemAdapter) GetSyncStats() (*AdapterSyncStats, error) {
 }
 
 // getChromaEmbeddingCount returns total embeddings, unique observation count, and availability
+// Includes both processed embeddings and items in the queue
 func (a *ClaudeMemAdapter) getChromaEmbeddingCount() (int, int, bool) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -531,25 +550,428 @@ func (a *ClaudeMemAdapter) getChromaEmbeddingCount() (int, int, bool) {
 	}
 	defer chromaDB.Close()
 
-	// Total embedding documents
+	// Total embedding documents (processed)
 	var totalCount int
-	err = chromaDB.QueryRow("SELECT COUNT(*) FROM embeddings").Scan(&totalCount)
-	if err != nil {
-		return 0, 0, false
-	}
+	chromaDB.QueryRow("SELECT COUNT(*) FROM embeddings").Scan(&totalCount)
 
-	// Unique observation IDs (extract ID from embedding_id like "obs_123_narrative")
-	var uniqueCount int
-	err = chromaDB.QueryRow(`
+	// Unique observation IDs from processed embeddings
+	var uniqueProcessed int
+	chromaDB.QueryRow(`
 		SELECT COUNT(DISTINCT
 			CAST(SUBSTR(embedding_id, 5, INSTR(SUBSTR(embedding_id, 5), '_') - 1) AS INTEGER)
 		) FROM embeddings
 		WHERE embedding_id LIKE 'obs_%'
-	`).Scan(&uniqueCount)
-	if err != nil {
-		// Fall back to estimate if query fails
-		uniqueCount = totalCount / 5 // rough estimate
+	`).Scan(&uniqueProcessed)
+
+	// Also count queue items (pending processing by claude-mem compact)
+	var uniqueQueued int
+	chromaDB.QueryRow(`
+		SELECT COUNT(DISTINCT
+			CAST(SUBSTR(id, 5, INSTR(SUBSTR(id, 5), '_') - 1) AS INTEGER)
+		) FROM embeddings_queue
+		WHERE id LIKE 'obs_%'
+	`).Scan(&uniqueQueued)
+
+	// Combine processed and queued (subtract overlap if any)
+	uniqueTotal := uniqueProcessed + uniqueQueued
+
+	return totalCount, uniqueTotal, true
+}
+
+// GetEmbeddingConfig returns the embedding configuration claude-mem expects
+// Claude-mem uses sentence-transformers all-MiniLM-L6-v2 with proper WordPiece tokenization
+func (a *ClaudeMemAdapter) GetEmbeddingConfig() *EmbeddingConfig {
+	return &EmbeddingConfig{
+		Model:     "all-MiniLM-L6-v2",
+		Tokenizer: "wordpiece-hf",
+		Dims:      384,
+	}
+}
+
+// ExportWithEmbedding exports an observation to claude-mem SQLite AND inserts embedding into ChromaDB queue
+func (a *ClaudeMemAdapter) ExportWithEmbedding(ctx context.Context, obs *storage.Observation) error {
+	// First export to SQLite
+	if err := a.Export(ctx, obs); err != nil {
+		return err
 	}
 
-	return totalCount, uniqueCount, true
+	// Get the SQLite ID we just inserted
+	obsID := a.lastInsertedID
+	if obsID == 0 {
+		// Try to look it up
+		obsID = a.GetObservationID(ctx, obs)
+		if obsID == 0 {
+			return fmt.Errorf("could not determine observation ID for ChromaDB")
+		}
+	}
+
+	// Check if embedding is compatible
+	cfg := a.GetEmbeddingConfig()
+	if !obs.Embedding.IsCompatibleWith(cfg.Model, cfg.Tokenizer, cfg.Dims) {
+		// Embedding is incompatible or missing - caller should have re-embedded
+		return fmt.Errorf("embedding not compatible with adapter config")
+	}
+
+	// Insert into ChromaDB queue
+	return a.insertChromaEmbedding(obsID, obs)
+}
+
+// insertChromaEmbedding inserts the observation's embedding directly into ChromaDB's embeddings_queue
+func (a *ClaudeMemAdapter) insertChromaEmbedding(obsID int64, obs *storage.Observation) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	chromaDBPath := filepath.Join(home, ".claude-mem", "vector-db", "chroma.sqlite3")
+	if _, err := os.Stat(chromaDBPath); err != nil {
+		// ChromaDB not initialized yet - skip silently, embeddings can be backfilled later
+		return nil
+	}
+
+	chromaDB, err := sql.Open("sqlite", chromaDBPath)
+	if err != nil {
+		return fmt.Errorf("open ChromaDB: %w", err)
+	}
+	defer chromaDB.Close()
+
+	// Get collection topic from collections table
+	var collectionID string
+	err = chromaDB.QueryRow(`
+		SELECT id FROM collections WHERE name = 'cm__claude-mem' LIMIT 1
+	`).Scan(&collectionID)
+	if err != nil {
+		// Collection doesn't exist yet - claude-mem creates it on first use
+		// Skip ChromaDB insertion, embeddings can be backfilled once collection exists
+		return nil
+	}
+	topic := fmt.Sprintf("persistent://default/default/%s", collectionID)
+
+	// Convert float32 slice to bytes (FLOAT32 encoding)
+	vectorBytes := float32SliceToBytes(obs.Embedding.Vector)
+
+	// Build metadata JSON
+	metadata := buildChromaMetadata(obsID, obs)
+
+	// Insert narrative document
+	docID := fmt.Sprintf("obs_%d_narrative", obsID)
+	_, err = chromaDB.Exec(`
+		INSERT INTO embeddings_queue (operation, topic, id, vector, encoding, metadata)
+		VALUES (0, ?, ?, ?, 'FLOAT32', ?)
+	`, topic, docID, vectorBytes, metadata)
+	if err != nil {
+		return fmt.Errorf("insert embedding: %w", err)
+	}
+
+	// Also insert facts as separate documents if present
+	for i, fact := range obs.Structured.Facts {
+		factDocID := fmt.Sprintf("obs_%d_fact_%d", obsID, i)
+		factMeta := buildChromaFactMetadata(obsID, obs, i, fact)
+		_, err = chromaDB.Exec(`
+			INSERT INTO embeddings_queue (operation, topic, id, vector, encoding, metadata)
+			VALUES (0, ?, ?, ?, 'FLOAT32', ?)
+		`, topic, factDocID, vectorBytes, factMeta)
+		if err != nil {
+			// Don't fail on fact insertion errors
+			continue
+		}
+	}
+
+	return nil
+}
+
+// float32SliceToBytes converts a float32 slice to raw bytes (little-endian)
+func float32SliceToBytes(floats []float32) []byte {
+	buf := make([]byte, len(floats)*4)
+	for i, f := range floats {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
+	}
+	return buf
+}
+
+// buildChromaMetadata builds the metadata JSON for ChromaDB
+func buildChromaMetadata(obsID int64, obs *storage.Observation) string {
+	// Always use sinesync prefix - consistent with Export() to identify sinesync exports
+	memorySessionID := "sinesync-" + obs.ID[:8]
+
+	meta := map[string]interface{}{
+		"sqlite_id":         obsID,
+		"doc_type":          "observation",
+		"memory_session_id": memorySessionID,
+		"project":           obs.Core.Project,
+		"type":              obs.Core.Type,
+		"title":             obs.Core.Title,
+		"field_type":        "narrative",
+		"created_at_epoch":  obs.Source.Epoch,
+		"chroma:document":   obs.Core.Content,
+	}
+	if obs.Core.Summary != "" {
+		meta["subtitle"] = obs.Core.Summary
+	}
+	if len(obs.Structured.Concepts) > 0 {
+		meta["concepts"] = joinStrings(obs.Structured.Concepts, ",")
+	}
+
+	jsonBytes, _ := json.Marshal(meta)
+	return string(jsonBytes)
+}
+
+// buildChromaFactMetadata builds metadata for a fact document
+func buildChromaFactMetadata(obsID int64, obs *storage.Observation, factIndex int, fact string) string {
+	// Always use sinesync prefix - consistent with Export() to identify sinesync exports
+	memorySessionID := "sinesync-" + obs.ID[:8]
+
+	meta := map[string]interface{}{
+		"sqlite_id":         obsID,
+		"doc_type":          "observation",
+		"memory_session_id": memorySessionID,
+		"project":           obs.Core.Project,
+		"type":              obs.Core.Type,
+		"title":             obs.Core.Title,
+		"field_type":        "fact",
+		"fact_index":        factIndex,
+		"created_at_epoch":  obs.Source.Epoch,
+		"chroma:document":   fact,
+	}
+
+	jsonBytes, _ := json.Marshal(meta)
+	return string(jsonBytes)
+}
+
+func joinStrings(strs []string, sep string) string {
+	if len(strs) == 0 {
+		return ""
+	}
+	result := strs[0]
+	for i := 1; i < len(strs); i++ {
+		result += sep + strs[i]
+	}
+	return result
+}
+
+// GetEmbeddingBacklog returns count of observations without ChromaDB embeddings
+func (a *ClaudeMemAdapter) GetEmbeddingBacklog() int {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0
+	}
+
+	chromaDBPath := filepath.Join(home, ".claude-mem", "vector-db", "chroma.sqlite3")
+	if _, err := os.Stat(chromaDBPath); err != nil {
+		return 0
+	}
+
+	chromaDB, err := sql.Open("sqlite", chromaDBPath+"?mode=ro")
+	if err != nil {
+		return 0
+	}
+	defer chromaDB.Close()
+
+	// Get observation IDs that already have embeddings (in embeddings table or queue)
+	existingIDs := make(map[int64]bool)
+
+	rows, _ := chromaDB.Query(`
+		SELECT DISTINCT CAST(SUBSTR(embedding_id, 5, INSTR(SUBSTR(embedding_id, 5), '_') - 1) AS INTEGER)
+		FROM embeddings WHERE embedding_id LIKE 'obs_%'
+	`)
+	if rows != nil {
+		for rows.Next() {
+			var id int64
+			rows.Scan(&id)
+			existingIDs[id] = true
+		}
+		rows.Close()
+	}
+
+	rows, _ = chromaDB.Query(`
+		SELECT DISTINCT CAST(SUBSTR(id, 5, INSTR(SUBSTR(id, 5), '_') - 1) AS INTEGER)
+		FROM embeddings_queue WHERE id LIKE 'obs_%'
+	`)
+	if rows != nil {
+		for rows.Next() {
+			var id int64
+			rows.Scan(&id)
+			existingIDs[id] = true
+		}
+		rows.Close()
+	}
+
+	// Count observations without embeddings
+	var totalObs int
+	a.db.QueryRow("SELECT COUNT(*) FROM observations").Scan(&totalObs)
+
+	return totalObs - len(existingIDs)
+}
+
+// BackfillEmbeddings generates embeddings for observations missing from ChromaDB
+// Returns number of observations processed
+func (a *ClaudeMemAdapter) BackfillEmbeddings(limit int) (int, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0, err
+	}
+
+	chromaDBPath := filepath.Join(home, ".claude-mem", "vector-db", "chroma.sqlite3")
+	if _, err := os.Stat(chromaDBPath); err != nil {
+		// ChromaDB not initialized yet
+		return 0, nil
+	}
+
+	chromaDB, err := sql.Open("sqlite", chromaDBPath)
+	if err != nil {
+		return 0, err
+	}
+	defer chromaDB.Close()
+
+	// Get collection topic
+	var collectionID string
+	err = chromaDB.QueryRow(`SELECT id FROM collections WHERE name = 'cm__claude-mem' LIMIT 1`).Scan(&collectionID)
+	if err != nil {
+		// Collection doesn't exist yet - claude-mem creates it on first use
+		return 0, nil
+	}
+	topic := fmt.Sprintf("persistent://default/default/%s", collectionID)
+
+	// Get existing observation IDs
+	existingIDs := make(map[int64]bool)
+	rows, _ := chromaDB.Query(`
+		SELECT DISTINCT CAST(SUBSTR(embedding_id, 5, INSTR(SUBSTR(embedding_id, 5), '_') - 1) AS INTEGER)
+		FROM embeddings WHERE embedding_id LIKE 'obs_%'
+		UNION
+		SELECT DISTINCT CAST(SUBSTR(id, 5, INSTR(SUBSTR(id, 5), '_') - 1) AS INTEGER)
+		FROM embeddings_queue WHERE id LIKE 'obs_%'
+	`)
+	if rows != nil {
+		for rows.Next() {
+			var id int64
+			rows.Scan(&id)
+			existingIDs[id] = true
+		}
+		rows.Close()
+	}
+
+	// Get observations needing embeddings
+	rows, err = a.db.Query(`
+		SELECT id, project, type, title, subtitle, narrative, created_at_epoch, memory_session_id
+		FROM observations
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type obsData struct {
+		ID               int64
+		Project          string
+		Type             string
+		Title            string
+		Subtitle         string
+		Narrative        string
+		Epoch            int64
+		MemorySessionID  string
+	}
+
+	var toProcess []obsData
+	for rows.Next() {
+		var o obsData
+		var project, obsType, title, subtitle, narrative, memSessionID sql.NullString
+		err := rows.Scan(&o.ID, &project, &obsType, &title, &subtitle, &narrative, &o.Epoch, &memSessionID)
+		if err != nil {
+			continue
+		}
+		o.Project = project.String
+		o.Type = obsType.String
+		o.Title = title.String
+		o.Subtitle = subtitle.String
+		o.Narrative = narrative.String
+		o.MemorySessionID = memSessionID.String
+
+		if existingIDs[o.ID] {
+			continue
+		}
+		if o.Title == "" && o.Narrative == "" {
+			continue
+		}
+		toProcess = append(toProcess, o)
+		if len(toProcess) >= limit {
+			break
+		}
+	}
+
+	if len(toProcess) == 0 {
+		return 0, nil
+	}
+
+	// Initialize embedder (import cycle avoided by using package directly)
+	embedder, err := getEmbedder()
+	if err != nil {
+		return 0, err
+	}
+	// Don't close - it's a singleton that may be reused
+
+	if !embedder.IsReady() {
+		return 0, fmt.Errorf("embedder not ready")
+	}
+
+	// Process observations
+	processed := 0
+	for _, o := range toProcess {
+		text := o.Title
+		if o.Narrative != "" {
+			text += "\n" + o.Narrative
+		}
+
+		vector, err := embedder.Embed(text)
+		if err != nil {
+			continue
+		}
+
+		vectorBytes := float32SliceToBytes(vector)
+
+		meta := map[string]interface{}{
+			"sqlite_id":        o.ID,
+			"doc_type":         "observation",
+			"project":          o.Project,
+			"type":             o.Type,
+			"title":            o.Title,
+			"field_type":       "narrative",
+			"created_at_epoch": o.Epoch,
+			"chroma:document":  text,
+		}
+		if o.MemorySessionID != "" {
+			meta["memory_session_id"] = o.MemorySessionID
+		}
+		if o.Subtitle != "" {
+			meta["subtitle"] = o.Subtitle
+		}
+		metaJSON, _ := json.Marshal(meta)
+
+		docID := fmt.Sprintf("obs_%d_narrative", o.ID)
+		_, err = chromaDB.Exec(`
+			INSERT INTO embeddings_queue (operation, topic, id, vector, encoding, metadata)
+			VALUES (0, ?, ?, ?, 'FLOAT32', ?)
+		`, topic, docID, vectorBytes, string(metaJSON))
+		if err != nil {
+			continue
+		}
+		processed++
+	}
+
+	return processed, nil
+}
+
+// EmbedderInterface to avoid import cycle
+type EmbedderInterface interface {
+	IsReady() bool
+	Embed(text string) ([]float32, error)
+	Close() error
+}
+
+// getEmbedder is set by RegisterEmbedder to avoid import cycle
+var getEmbedder func() (EmbedderInterface, error)
+
+// RegisterEmbedder sets the embedder factory function
+func RegisterEmbedder(factory func() (EmbedderInterface, error)) {
+	getEmbedder = factory
 }

@@ -120,8 +120,12 @@ function initSync() {
     if (syncBtn) {
         syncBtn.addEventListener('click', triggerSync);
     }
-    // Auto-refresh sync status every 30 seconds
-    setInterval(loadSyncStatus, 30000);
+    // Auto-refresh sync status
+    setInterval(() => {
+        loadSyncStatus().then(() => {
+            // Adjust polling based on activity (handled in loadSyncStatus)
+        });
+    }, 5000); // Check every 5 seconds
 }
 
 async function loadSyncStatus() {
@@ -153,8 +157,10 @@ async function triggerSync() {
 
 function renderSyncStatus(data) {
     const syncIcon = document.getElementById('sync-icon');
+    const syncLocal = document.getElementById('sync-local');
     const syncCount = document.getElementById('sync-count');
     const syncLast = document.getElementById('sync-last');
+    const syncProgress = document.getElementById('sync-progress');
     const syncError = document.getElementById('sync-error');
 
     // If any required element is missing, skip updating sync status UI
@@ -164,7 +170,7 @@ function renderSyncStatus(data) {
 
     // Update icon state
     syncIcon.classList.remove('syncing', 'error', 'success');
-    if (data.syncing) {
+    if (data.syncing || (data.backfill && data.backfill.running)) {
         syncIcon.classList.add('syncing');
         syncIcon.innerHTML = '&#8635;'; // Rotating arrow
     } else if (data.syncError) {
@@ -176,8 +182,28 @@ function renderSyncStatus(data) {
     }
 
     // Update stats
+    if (syncLocal) {
+        syncLocal.textContent = data.localCount || 0;
+    }
     syncCount.textContent = data.syncedCount || 0;
     syncLast.textContent = data.lastSync ? formatDate(data.lastSync) : '—';
+
+    // Show backfill or sync progress
+    if (syncProgress) {
+        if (data.backfill && data.backfill.running) {
+            const pct = data.backfill.total > 0 ? Math.round(100 * data.backfill.progress / data.backfill.total) : 0;
+            syncProgress.textContent = `Embedding: ${data.backfill.progress}/${data.backfill.total} (${pct}%)`;
+            syncProgress.classList.remove('hidden');
+        } else if (data.syncing) {
+            syncProgress.textContent = 'Syncing...';
+            syncProgress.classList.remove('hidden');
+        } else if (data.claudeMem && data.claudeMem.embeddingBacklog > 0) {
+            syncProgress.textContent = `${data.claudeMem.embeddingBacklog} pending embeddings`;
+            syncProgress.classList.remove('hidden');
+        } else {
+            syncProgress.classList.add('hidden');
+        }
+    }
 
     // Show/hide error
     if (data.syncError) {

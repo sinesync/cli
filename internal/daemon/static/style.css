@@ -883,3 +883,18 @@ body {
 .sync-error.hidden {
     display: none;
 }
+
+.sync-progress {
+    margin-top: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    background: rgba(100, 200, 255, 0.1);
+    border: 1px solid var(--accent-blue);
+    border-radius: 4px;
+    color: var(--accent-blue);
+    font-size: 0.8rem;
+    text-align: center;
+}
+
+.sync-progress.hidden {
+    display: none;
+}
