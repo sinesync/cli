@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/miclip/sinesync/internal/doctor"
 	"github.com/miclip/sinesync/internal/storage"
 	_ "modernc.org/sqlite"
 )
@@ -974,4 +975,293 @@ var getEmbedder func() (EmbedderInterface, error)
 // RegisterEmbedder sets the embedder factory function
 func RegisterEmbedder(factory func() (EmbedderInterface, error)) {
 	getEmbedder = factory
+}
+
+// DoctorChecks returns diagnostic checks for the claude-mem adapter
+func (a *ClaudeMemAdapter) DoctorChecks() []doctor.Check {
+	return []doctor.Check{
+		{
+			Name:     "Stuck SDK sessions",
+			Category: "claude-mem",
+			Severity: doctor.SeverityError,
+			Run:      a.checkStuckSessions,
+		},
+		{
+			Name:     "Orphaned pending messages",
+			Category: "claude-mem",
+			Severity: doctor.SeverityWarning,
+			Run:      a.checkOrphanedMessages,
+		},
+		{
+			Name:     "Embedding backlog",
+			Category: "claude-mem",
+			Severity: doctor.SeverityWarning,
+			Run:      a.checkEmbeddingBacklog,
+		},
+		{
+			Name:     "ChromaDB health",
+			Category: "claude-mem",
+			Severity: doctor.SeverityInfo,
+			Run:      a.checkChromaHealth,
+		},
+		{
+			Name:     "Observations with empty project",
+			Category: "claude-mem",
+			Severity: doctor.SeverityWarning,
+			Run:      a.checkEmptyProjects,
+		},
+	}
+}
+
+// checkStuckSessions finds active sessions with no recent activity
+func (a *ClaudeMemAdapter) checkStuckSessions(ctx context.Context, fix bool) doctor.CheckResult {
+	result := doctor.CheckResult{
+		Name:     "Stuck SDK sessions",
+		Category: "claude-mem",
+		Severity: doctor.SeverityError,
+		CanFix:   true,
+	}
+
+	// Find sessions active for >2 hours with pending messages piling up
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT s.id, s.content_session_id,
+			COALESCE(s.started_at_epoch, 0),
+			(SELECT COUNT(*) FROM pending_messages WHERE session_db_id = s.id AND status = 'pending') as pending
+		FROM sdk_sessions s
+		WHERE s.status = 'active'
+		AND s.started_at_epoch < ?
+	`, time.Now().Add(-2*time.Hour).UnixMilli())
+	if err != nil {
+		result.Status = doctor.StatusFail
+		result.Message = fmt.Sprintf("Query error: %v", err)
+		return result
+	}
+	defer rows.Close()
+
+	type stuckSession struct {
+		id        int64
+		sessionID string
+		age       time.Duration
+		pending   int
+	}
+	var stuck []stuckSession
+
+	for rows.Next() {
+		var s stuckSession
+		var epoch int64
+		if err := rows.Scan(&s.id, &s.sessionID, &epoch, &s.pending); err != nil {
+			continue
+		}
+		s.age = time.Since(time.UnixMilli(epoch))
+		stuck = append(stuck, s)
+	}
+
+	if len(stuck) == 0 {
+		result.Status = doctor.StatusPass
+		result.Message = "No stuck sessions"
+		return result
+	}
+
+	for _, s := range stuck {
+		displayID := s.sessionID
+		if len(displayID) > 8 {
+			displayID = displayID[:8]
+		}
+		detail := fmt.Sprintf("session %d (%s) active for %s, %d pending messages",
+			s.id, displayID, s.age.Round(time.Minute), s.pending)
+		result.Details = append(result.Details, detail)
+	}
+
+	if fix {
+		fixed := 0
+		for _, s := range stuck {
+			_, err := a.db.ExecContext(ctx, `UPDATE sdk_sessions SET status = 'completed' WHERE id = ?`, s.id)
+			if err == nil {
+				// Clear pending messages for completed session
+				a.db.ExecContext(ctx, `UPDATE pending_messages SET status = 'completed' WHERE session_db_id = ? AND status = 'pending'`, s.id)
+				fixed++
+			}
+		}
+		result.Status = doctor.StatusFixed
+		result.FixApplied = true
+		result.Message = fmt.Sprintf("Completed %d/%d stuck sessions", fixed, len(stuck))
+		return result
+	}
+
+	result.Status = doctor.StatusFail
+	result.Message = fmt.Sprintf("%d stuck sessions", len(stuck))
+	return result
+}
+
+// checkOrphanedMessages finds pending messages for non-existent or completed sessions
+func (a *ClaudeMemAdapter) checkOrphanedMessages(ctx context.Context, fix bool) doctor.CheckResult {
+	result := doctor.CheckResult{
+		Name:     "Orphaned pending messages",
+		Category: "claude-mem",
+		Severity: doctor.SeverityWarning,
+		CanFix:   true,
+	}
+
+	var orphanedCount int
+	err := a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM pending_messages pm
+		LEFT JOIN sdk_sessions s ON pm.session_db_id = s.id
+		WHERE pm.status = 'pending'
+		AND (s.id IS NULL OR s.status = 'completed')
+	`).Scan(&orphanedCount)
+	if err != nil {
+		result.Status = doctor.StatusFail
+		result.Message = fmt.Sprintf("Query error: %v", err)
+		return result
+	}
+
+	if orphanedCount == 0 {
+		result.Status = doctor.StatusPass
+		result.Message = "No orphaned messages"
+		return result
+	}
+
+	if fix {
+		res, err := a.db.ExecContext(ctx, `
+			UPDATE pending_messages SET status = 'completed'
+			WHERE status = 'pending'
+			AND session_db_id IN (
+				SELECT pm.session_db_id FROM pending_messages pm
+				LEFT JOIN sdk_sessions s ON pm.session_db_id = s.id
+				WHERE pm.status = 'pending'
+				AND (s.id IS NULL OR s.status = 'completed')
+			)
+		`)
+		if err == nil {
+			affected, _ := res.RowsAffected()
+			result.Status = doctor.StatusFixed
+			result.FixApplied = true
+			result.Message = fmt.Sprintf("Cleared %d orphaned messages", affected)
+			return result
+		}
+		result.Status = doctor.StatusFail
+		result.Message = fmt.Sprintf("Fix failed: %v", err)
+		return result
+	}
+
+	result.Status = doctor.StatusWarn
+	result.Message = fmt.Sprintf("%d orphaned pending messages", orphanedCount)
+	return result
+}
+
+// checkEmbeddingBacklog reports observations missing ChromaDB embeddings
+func (a *ClaudeMemAdapter) checkEmbeddingBacklog(ctx context.Context, fix bool) doctor.CheckResult {
+	result := doctor.CheckResult{
+		Name:     "Embedding backlog",
+		Category: "claude-mem",
+		Severity: doctor.SeverityWarning,
+		CanFix:   true,
+	}
+
+	backlog := a.GetEmbeddingBacklog()
+
+	if backlog == 0 {
+		result.Status = doctor.StatusPass
+		result.Message = "All observations have embeddings"
+		return result
+	}
+
+	if fix {
+		if getEmbedder == nil {
+			result.Status = doctor.StatusWarn
+			result.Message = fmt.Sprintf("%d observations without embeddings (embedder not available for fix)", backlog)
+			return result
+		}
+		processed, err := a.BackfillEmbeddings(100)
+		if err != nil {
+			result.Status = doctor.StatusWarn
+			result.Message = fmt.Sprintf("%d observations without embeddings, fix error: %v", backlog, err)
+			return result
+		}
+		result.Status = doctor.StatusFixed
+		result.FixApplied = true
+		result.Message = fmt.Sprintf("Embedded %d observations", processed)
+		return result
+	}
+
+	result.Status = doctor.StatusWarn
+	result.Message = fmt.Sprintf("%d observations without embeddings", backlog)
+	return result
+}
+
+// checkChromaHealth verifies ChromaDB is accessible and has data
+func (a *ClaudeMemAdapter) checkChromaHealth(ctx context.Context, fix bool) doctor.CheckResult {
+	result := doctor.CheckResult{
+		Name:     "ChromaDB health",
+		Category: "claude-mem",
+		Severity: doctor.SeverityInfo,
+		CanFix:   false,
+	}
+
+	totalEmbeddings, uniqueObs, available := a.getChromaEmbeddingCount()
+	if !available {
+		result.Status = doctor.StatusSkip
+		result.Message = "ChromaDB not available"
+		return result
+	}
+
+	// Get total observation count for comparison
+	var totalObs int
+	if err := a.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM observations").Scan(&totalObs); err != nil {
+		result.Status = doctor.StatusSkip
+		result.Message = fmt.Sprintf("Cannot query observations: %v", err)
+		return result
+	}
+
+	coverage := 0
+	if totalObs > 0 {
+		coverage = uniqueObs * 100 / totalObs
+	}
+
+	result.Status = doctor.StatusPass
+	result.Message = fmt.Sprintf("%d embeddings, %d/%d observations covered (%d%%)",
+		totalEmbeddings, uniqueObs, totalObs, coverage)
+
+	if coverage < 50 && totalObs > 10 {
+		result.Status = doctor.StatusWarn
+		result.Message = fmt.Sprintf("Low coverage: %d embeddings, %d/%d observations (%d%%)",
+			totalEmbeddings, uniqueObs, totalObs, coverage)
+	}
+
+	return result
+}
+
+// checkEmptyProjects reports observations with no project set
+func (a *ClaudeMemAdapter) checkEmptyProjects(ctx context.Context, fix bool) doctor.CheckResult {
+	result := doctor.CheckResult{
+		Name:     "Observations with empty project",
+		Category: "claude-mem",
+		Severity: doctor.SeverityWarning,
+		CanFix:   false,
+	}
+
+	var emptyCount, totalCount int
+	if err := a.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM observations").Scan(&totalCount); err != nil {
+		result.Status = doctor.StatusSkip
+		result.Message = fmt.Sprintf("Cannot query observations: %v", err)
+		return result
+	}
+	if err := a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM observations
+		WHERE project IS NULL OR project = ''
+	`).Scan(&emptyCount); err != nil {
+		result.Status = doctor.StatusSkip
+		result.Message = fmt.Sprintf("Cannot query observations: %v", err)
+		return result
+	}
+
+	if emptyCount == 0 {
+		result.Status = doctor.StatusPass
+		result.Message = fmt.Sprintf("All %d observations have a project", totalCount)
+		return result
+	}
+
+	result.Status = doctor.StatusWarn
+	result.Message = fmt.Sprintf("%d/%d observations have no project", emptyCount, totalCount)
+	return result
 }

@@ -3,6 +3,7 @@ package adapters
 import (
 	"context"
 
+	"github.com/miclip/sinesync/internal/doctor"
 	"github.com/miclip/sinesync/internal/storage"
 )
 
@@ -49,6 +50,15 @@ type EmbeddingConfig struct {
 	Model     string // e.g., "all-MiniLM-L6-v2"
 	Tokenizer string // e.g., "wordpiece-hf"
 	Dims      int    // e.g., 384
+}
+
+// Diagnosable extends Adapter with diagnostic capabilities
+// Adapters that support health checks should implement this
+type Diagnosable interface {
+	Adapter
+
+	// DoctorChecks returns the diagnostic checks this adapter provides
+	DoctorChecks() []doctor.Check
 }
 
 // EmbeddingAwareAdapter extends Adapter with embedding configuration
