@@ -46,7 +46,8 @@ sinesync status
 
 The setup command automatically configures:
 - MCP server for memory tools
-- Session hooks for import/export with claude-mem
+- Session hooks for context injection and observation capture
+- Background daemon for cloud sync and claude-mem integration
 
 Or manually add to Claude Code:
 ```bash
@@ -87,6 +88,8 @@ cd web && npm install && npm run dev
 ```
 sinesync setup          # Configure with Claude Code
 sinesync status         # Show sync status
+sinesync doctor         # Run diagnostic health checks
+sinesync doctor --fix   # Auto-fix issues
 sinesync login          # Authenticate
 sinesync sync           # Push and pull observations
 sinesync import         # Import from claude-mem
