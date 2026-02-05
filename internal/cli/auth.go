@@ -839,18 +839,17 @@ func displayEmergencyKit(email, secretKey string) {
 	fmt.Println()
 }
 
-// promptSecretKey prompts the user to enter their secret key
+// promptSecretKey prompts the user to enter their secret key (hidden input)
 func promptSecretKey() (string, error) {
-	reader := bufio.NewReader(os.Stdin)
-
 	fmt.Print("Secret Key: ")
-	input, err := reader.ReadString('\n')
+	input, err := term.ReadPassword(int(syscall.Stdin))
+	fmt.Println()
 	if err != nil {
 		return "", err
 	}
 
 	// Normalize the secret key (remove whitespace, uppercase)
-	secretKey := crypto.NormalizeSecretKey(strings.TrimSpace(input))
+	secretKey := crypto.NormalizeSecretKey(strings.TrimSpace(string(input)))
 
 	if !crypto.ValidateSecretKey(secretKey) {
 		return "", fmt.Errorf("invalid secret key format")
