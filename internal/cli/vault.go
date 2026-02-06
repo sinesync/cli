@@ -15,6 +15,7 @@ import (
 
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/crypto"
+	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
@@ -1027,6 +1028,16 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\n✓ Synced %d vaults\n", len(localConfig.Vaults))
+
+	// Trigger daemon sync so it picks up the new vault config immediately
+	if running, info := daemon.IsRunning(); running {
+		if err := triggerDaemonSync(info.Port); err != nil {
+			fmt.Printf("warning: failed to trigger daemon sync: %v\n", err)
+		} else {
+			fmt.Println("✓ Daemon sync triggered")
+		}
+	}
+
 	return nil
 }
 
