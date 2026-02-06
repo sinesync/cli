@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -152,14 +154,15 @@ func getVaultKey(vaultID string, encMgr *encryption.Manager) []byte {
 
 // SyncManager handles background cloud sync
 type SyncManager struct {
-	localStorage *storage.LocalStorage
-	apiBase      string
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
-	mu           sync.Mutex
-	lastSync     time.Time
-	lastError    string
-	syncing      bool
+	backend  storage.StorageBackend
+	apiBase  string
+	mode     string // "standalone" or "adapter"
+	stopChan chan struct{}
+	wg       sync.WaitGroup
+	mu       sync.Mutex
+	lastSync  time.Time
+	lastError string
+	syncing   bool
 
 	// Backfill state
 	backfillMu        sync.Mutex
@@ -170,16 +173,17 @@ type SyncManager struct {
 }
 
 // NewSyncManager creates a new sync manager
-func NewSyncManager(localStorage *storage.LocalStorage) *SyncManager {
+func NewSyncManager(backend storage.StorageBackend, mode string) *SyncManager {
 	apiBase := os.Getenv("SINESYNC_API_URL")
 	if apiBase == "" {
 		apiBase = DefaultAPIBase
 	}
 
 	return &SyncManager{
-		localStorage: localStorage,
-		apiBase:      apiBase,
-		stopChan:     make(chan struct{}),
+		backend:  backend,
+		apiBase:  apiBase,
+		mode:     mode,
+		stopChan: make(chan struct{}),
 	}
 }
 
@@ -247,14 +251,15 @@ func (m *SyncManager) doSync() {
 		m.syncing = false
 		m.mu.Unlock()
 
-		// Always run backfills, even if sync failed
-		// First export missing observations to claude-mem, then backfill ChromaDB embeddings
-		m.wg.Add(1)
-		go func() {
-			defer m.wg.Done()
-			m.backfillClaudeMemExport()
-			m.backfillChromaEmbeddings()
-		}()
+		// Run claude-mem backfills only in adapter mode
+		if m.mode == "adapter" {
+			m.wg.Add(1)
+			go func() {
+				defer m.wg.Done()
+				m.backfillClaudeMemExport()
+				m.backfillChromaEmbeddings()
+			}()
+		}
 	}()
 
 	token, err := m.getAuthToken()
@@ -512,7 +517,7 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 	}
 
 	// Get local observations
-	observations, err := m.localStorage.ListObservations()
+	observations, err := m.backend.ListObservations()
 	if err != nil {
 		return 0, 0, fmt.Errorf("list observations: %w", err)
 	}
@@ -1075,6 +1080,36 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 	return count, uploaded, nil
 }
 
+// standardizeEmbedding ensures an observation's embedding is compatible with the local model.
+// Re-embeds if metadata is missing, unknown, or from a different model/tokenizer.
+func standardizeEmbedding(obs *storage.Observation) {
+	if obs.Embedding.IsCompatibleWith(embeddings.ModelName, embeddings.TokenizerType, embeddings.Dimensions) {
+		return
+	}
+
+	embedder, err := embeddings.GetProvider()
+	if err != nil {
+		log.Printf("[embed] WARNING: embedder unavailable for %s: %v", obs.ID, err)
+		return
+	}
+	if !embedder.IsReady() {
+		log.Printf("[embed] WARNING: embedder not ready, skipping %s", obs.ID)
+		return
+	}
+
+	text := obs.TextForEmbedding()
+	vector, err := embedder.Embed(text)
+	if err != nil {
+		log.Printf("[embed] WARNING: failed to embed %s: %v", obs.ID, err)
+		return
+	}
+
+	obs.Embedding.Vector = vector
+	obs.Embedding.Model = embeddings.ModelName
+	obs.Embedding.Tokenizer = embedder.TokenizerType()
+	obs.Embedding.Dims = embeddings.Dimensions
+}
+
 // exportToClaudeMemWithEmbedding exports an observation to claude-mem with embedding
 // Returns error if embedding or export fails - no fallback to export without embedding
 // This ensures observations are never in claude-mem SQLite without ChromaDB entry
@@ -1205,7 +1240,7 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, expectedChecksu
 	}
 
 	// Save to local storage
-	if err := m.localStorage.SaveObservation(obs); err != nil {
+	if err := m.backend.SaveObservation(obs); err != nil {
 		return err
 	}
 
@@ -1336,8 +1371,11 @@ func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum strin
 		}
 	}
 
+	// Standardize embedding for local search compatibility
+	standardizeEmbedding(obs)
+
 	// Save to local storage
-	if err := m.localStorage.SaveObservation(obs); err != nil {
+	if err := m.backend.SaveObservation(obs); err != nil {
 		return err
 	}
 
@@ -1375,14 +1413,17 @@ func (m *SyncManager) deleteFromCloud(token string, id string) error {
 
 func (m *SyncManager) deleteLocally(id string) error {
 	// Get observation first to get project/title for claude-mem deletion
-	obs, err := m.localStorage.GetObservation(id)
+	obs, err := m.backend.GetObservation(id)
 	if err != nil {
-		// Already deleted or doesn't exist - that's fine
-		return nil
+		if errors.Is(err, sql.ErrNoRows) {
+			// Already deleted or doesn't exist - that's fine
+			return nil
+		}
+		return fmt.Errorf("failed to get observation %s: %w", id, err)
 	}
 
 	// Delete from local sinesync storage
-	if err := m.localStorage.Delete("observation", id); err != nil {
+	if err := m.backend.DeleteObservation(id); err != nil {
 		return fmt.Errorf("delete from storage: %w", err)
 	}
 
@@ -1443,7 +1484,7 @@ func (m *SyncManager) backfillClaudeMemExport() {
 	}()
 
 	// Get all local observations
-	observations, err := m.localStorage.ListObservations()
+	observations, err := m.backend.ListObservations()
 	if err != nil {
 		log.Printf("[export-backfill] Failed to list observations: %v", err)
 		return

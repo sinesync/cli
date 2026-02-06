@@ -595,10 +595,7 @@ var Verbose = false
 // Embed generates an embedding for text using ONNX model
 func (p *Provider) Embed(text string) ([]float32, error) {
 	if !p.ready || p.session == nil || p.tokenizer == nil {
-		if Verbose {
-			fmt.Fprintf(os.Stderr, "ONNX: not ready (ready=%v, session=%v, tokenizer=%v)\n", p.ready, p.session != nil, p.tokenizer != nil)
-		}
-		return FallbackEmbed(text), nil
+		return nil, fmt.Errorf("ONNX not ready (ready=%v, session=%v, tokenizer=%v)", p.ready, p.session != nil, p.tokenizer != nil)
 	}
 
 	// Tokenize text using WordPiece tokenizer
@@ -620,28 +617,19 @@ func (p *Provider) Embed(text string) ([]float32, error) {
 
 	inputIDsTensor, err := ort.NewTensor(shape, inputIDs)
 	if err != nil {
-		if Verbose {
-			fmt.Fprintf(os.Stderr, "ONNX: inputIDs tensor failed: %v\n", err)
-		}
-		return FallbackEmbed(text), nil
+		return nil, fmt.Errorf("inputIDs tensor: %w", err)
 	}
 	defer inputIDsTensor.Destroy()
 
 	attentionTensor, err := ort.NewTensor(shape, attentionMask)
 	if err != nil {
-		if Verbose {
-			fmt.Fprintf(os.Stderr, "ONNX: attention tensor failed: %v\n", err)
-		}
-		return FallbackEmbed(text), nil
+		return nil, fmt.Errorf("attention tensor: %w", err)
 	}
 	defer attentionTensor.Destroy()
 
 	tokenTypeTensor, err := ort.NewTensor(shape, tokenTypeIDs)
 	if err != nil {
-		if Verbose {
-			fmt.Fprintf(os.Stderr, "ONNX: tokenType tensor failed: %v\n", err)
-		}
-		return FallbackEmbed(text), nil
+		return nil, fmt.Errorf("tokenType tensor: %w", err)
 	}
 	defer tokenTypeTensor.Destroy()
 
@@ -658,10 +646,7 @@ func (p *Provider) Embed(text string) ([]float32, error) {
 	// Run inference
 	err = p.session.Run(inputs, outputs)
 	if err != nil {
-		if Verbose {
-			fmt.Fprintf(os.Stderr, "ONNX: session.Run failed: %v\n", err)
-		}
-		return FallbackEmbed(text), nil
+		return nil, fmt.Errorf("session.Run: %w", err)
 	}
 	defer func() {
 		for _, o := range outputs {
@@ -672,61 +657,51 @@ func (p *Provider) Embed(text string) ([]float32, error) {
 	}()
 
 	// Extract embedding from output tensor
-	if outputs[0] != nil {
-		outputTensor, ok := outputs[0].(*ort.Tensor[float32])
-		if ok {
-			data := outputTensor.GetData()
-			shape := outputTensor.GetShape()
-
-			if p.needsPooling {
-				// last_hidden_state output: shape [1, seq_len, hidden_size]
-				// Need to mean pool across sequence dimension
-				if len(shape) == 3 && shape[2] == int64(Dimensions) {
-					seqLen := int(shape[1])
-					embedding := make([]float32, Dimensions)
-
-					// Mean pooling with attention mask
-					for i := 0; i < Dimensions; i++ {
-						var sum float32
-						validTokens := 0
-						for j := 0; j < seqLen && j < len(tokenIDs); j++ {
-							if attentionMask[j] == 1 {
-								sum += data[j*Dimensions+i]
-								validTokens++
-							}
-						}
-						if validTokens > 0 {
-							embedding[i] = sum / float32(validTokens)
-						}
-					}
-					return embedding, nil
-				}
-				if Verbose {
-					fmt.Fprintf(os.Stderr, "ONNX: unexpected shape for pooling: %v\n", shape)
-				}
-			} else {
-				// sentence_embedding output: shape [1, hidden_size]
-				if len(data) >= Dimensions {
-					embedding := make([]float32, Dimensions)
-					copy(embedding, data[:Dimensions])
-					return embedding, nil
-				}
-				if Verbose {
-					fmt.Fprintf(os.Stderr, "ONNX: output data too small: %d < %d\n", len(data), Dimensions)
-				}
-			}
-		} else {
-			if Verbose {
-				fmt.Fprintf(os.Stderr, "ONNX: output not float32 tensor\n")
-			}
-		}
-	} else {
-		if Verbose {
-			fmt.Fprintf(os.Stderr, "ONNX: output[0] is nil\n")
-		}
+	if outputs[0] == nil {
+		return nil, fmt.Errorf("ONNX output is nil")
 	}
 
-	return FallbackEmbed(text), nil
+	outputTensor, ok := outputs[0].(*ort.Tensor[float32])
+	if !ok {
+		return nil, fmt.Errorf("ONNX output is not float32 tensor")
+	}
+
+	data := outputTensor.GetData()
+	outputShape := outputTensor.GetShape()
+
+	if p.needsPooling {
+		// last_hidden_state output: shape [1, seq_len, hidden_size]
+		// Need to mean pool across sequence dimension
+		if len(outputShape) != 3 || outputShape[2] != int64(Dimensions) {
+			return nil, fmt.Errorf("unexpected shape for pooling: %v", outputShape)
+		}
+		poolSeqLen := int(outputShape[1])
+		embedding := make([]float32, Dimensions)
+
+		// Mean pooling with attention mask
+		for i := 0; i < Dimensions; i++ {
+			var sum float32
+			validTokens := 0
+			for j := 0; j < poolSeqLen && j < len(tokenIDs); j++ {
+				if attentionMask[j] == 1 {
+					sum += data[j*Dimensions+i]
+					validTokens++
+				}
+			}
+			if validTokens > 0 {
+				embedding[i] = sum / float32(validTokens)
+			}
+		}
+		return embedding, nil
+	}
+
+	// sentence_embedding output: shape [1, hidden_size]
+	if len(data) < Dimensions {
+		return nil, fmt.Errorf("output data too small: %d < %d", len(data), Dimensions)
+	}
+	embedding := make([]float32, Dimensions)
+	copy(embedding, data[:Dimensions])
+	return embedding, nil
 }
 
 

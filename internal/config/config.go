@@ -8,7 +8,10 @@ import (
 
 // Config represents the sinesync configuration
 type Config struct {
-	ClaudeMemMode bool        `json:"claudeMemMode"`
+	Mode string `json:"mode,omitempty"` // "standalone" or "adapter"
+
+	// Deprecated: use Mode instead. Kept for backwards compatibility with old configs.
+	ClaudeMemMode bool        `json:"claudeMemMode,omitempty"`
 	Sync          *SyncConfig `json:"sync,omitempty"`
 
 	// Multi-vault support (like 1Password)
@@ -93,6 +96,12 @@ func Load() (*Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+
+	// Backwards compat: migrate old ClaudeMemMode to Mode
+	if cfg.Mode == "" && cfg.ClaudeMemMode {
+		cfg.Mode = "adapter"
+		cfg.ClaudeMemMode = false
 	}
 
 	// Ensure defaults

@@ -3,18 +3,19 @@ module github.com/miclip/sinesync
 go 1.25.0
 
 require (
+	github.com/asg017/sqlite-vec-go-bindings v0.1.6
 	github.com/aws/aws-sdk-go-v2 v1.32.7
 	github.com/aws/aws-sdk-go-v2/config v1.28.7
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.48
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.71.1
 	github.com/google/uuid v1.6.0
+	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
 	github.com/spf13/cobra v1.10.2
 	github.com/yalue/onnxruntime_go v1.25.0
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/crypto v0.47.0
 	golang.org/x/term v0.39.0
 	golang.org/x/text v0.33.0
-	modernc.org/sqlite v1.44.3
 )
 
 require (
@@ -34,17 +35,11 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.33.3 // indirect
 	github.com/aws/smithy-go v1.22.1 // indirect
 	github.com/danieljoos/wincred v1.2.2 // indirect
-	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/stretchr/testify v1.10.0 // indirect
-	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/sys v0.40.0 // indirect
-	modernc.org/libc v1.67.6 // indirect
-	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/mutecomm/go-sqlcipher/v4 => github.com/miclip/go-sqlcipher/v4 v4.4.3-0.20260206041350-916b992ab334

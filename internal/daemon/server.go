@@ -22,6 +22,7 @@ import (
 	"github.com/miclip/sinesync/internal/adapters"
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/embeddings"
+	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/zalando/go-keyring"
 )
@@ -31,13 +32,13 @@ var staticFiles embed.FS
 
 // Server is the unified daemon server (dashboard + hook API)
 type Server struct {
-	port         int
-	localStorage *storage.LocalStorage
-	config       *config.Config
-	embedder     *embeddings.Provider
-	httpServer   *http.Server
-	mode         string // "standalone" or "adapter"
-	syncManager  *SyncManager
+	port     int
+	backend  storage.StorageBackend
+	config   *config.Config
+	embedder *embeddings.Provider
+	httpServer *http.Server
+	mode       string // "standalone" or "adapter"
+	syncManager *SyncManager
 
 	// Observation cache
 	obsCache      []storage.Observation
@@ -54,23 +55,118 @@ func NewServer(port int) *Server {
 
 	cfg, _ := config.Load()
 
-	// Detect mode
-	mode := "standalone"
-	if adapters.IsClaudeMemInstalled() {
-		mode = "adapter"
+	// Determine mode from config, fall back to auto-detect for unconfigured installs
+	mode := cfg.Mode
+	if mode == "" {
+		if adapters.IsClaudeMemInstalled() {
+			mode = "adapter"
+		} else {
+			mode = "standalone"
+		}
 	}
 
 	embedder, _ := embeddings.NewProvider()
-	localStorage := storage.NewLocalStorage()
+
+	// Try SQLCipher backend first, fall back to LocalStorage
+	var backend storage.StorageBackend
+	sqlBackend := initSQLCipherBackend()
+	if sqlBackend != nil {
+		backend = sqlBackend
+
+		// Auto-migrate legacy JSON observations if they exist
+		if storage.HasLegacyObservations(config.DataDir()) {
+			localSource := storage.NewLocalStorage()
+			migrated, err := storage.MigrateLocalToSQLCipher(localSource, sqlBackend)
+			if err != nil {
+				log.Printf("[daemon] Migration error: %v", err)
+			} else if migrated > 0 {
+				log.Printf("[daemon] Migrated %d observations from JSON to SQLCipher", migrated)
+				if err := storage.RenameLegacyDir(config.DataDir()); err != nil {
+					log.Printf("[daemon] Failed to rename legacy dir: %v", err)
+				}
+
+				// Backfill embeddings for migrated observations in background
+				if embedder != nil {
+					go backfillEmbeddings(sqlBackend, embedder)
+				}
+			}
+		}
+	} else {
+		log.Printf("[daemon] Falling back to JSON file storage")
+		backend = storage.NewLocalStorage()
+	}
 
 	return &Server{
-		port:         port,
-		localStorage: localStorage,
-		config:       cfg,
-		embedder:     embedder,
-		mode:         mode,
-		syncManager:  NewSyncManager(localStorage),
-		obsCacheTTL:  30 * time.Second, // Cache for 30 seconds
+		port:        port,
+		backend:     backend,
+		config:      cfg,
+		embedder:    embedder,
+		mode:        mode,
+		syncManager: NewSyncManager(backend, mode),
+		obsCacheTTL: 30 * time.Second, // Cache for 30 seconds
+	}
+}
+
+// initSQLCipherBackend attempts to create a SQLCipher storage backend.
+// Returns nil if key is unavailable or database creation fails.
+func initSQLCipherBackend() *storage.SQLCipherStorage {
+	dbPath := filepath.Join(config.DataDir(), "memory.db")
+
+	key, err := keychain.GetOrCreateDBKey()
+	if err != nil {
+		log.Printf("[daemon] Failed to resolve DB key: %v", err)
+		return nil
+	}
+
+	db, err := storage.NewSQLCipherStorage(dbPath, key)
+	if err != nil {
+		log.Printf("[daemon] SQLCipher init failed: %v", err)
+		return nil
+	}
+
+	log.Printf("[daemon] Using SQLCipher encrypted storage")
+	return db
+}
+
+// backfillEmbeddings generates embeddings for observations that lack them.
+func backfillEmbeddings(backend *storage.SQLCipherStorage, embedder *embeddings.Provider) {
+	if !embedder.IsReady() {
+		return
+	}
+
+	observations, err := backend.ListObservations()
+	if err != nil {
+		log.Printf("[migrate] Failed to list observations for embedding backfill: %v", err)
+		return
+	}
+
+	backfilled := 0
+	failed := 0
+	for _, obs := range observations {
+		if obs.Embedding.IsCompatibleWith(embeddings.ModelName, embeddings.TokenizerType, embeddings.Dimensions) {
+			continue
+		}
+		obsCopy := obs
+		text := obsCopy.TextForEmbedding()
+		vec, err := embedder.Embed(text)
+		if err != nil {
+			failed++
+			if failed <= 3 {
+				log.Printf("[migrate] WARNING: embedding failed for %s: %v", obsCopy.ID, err)
+			}
+			continue
+		}
+		obsCopy.Embedding.Vector = vec
+		obsCopy.Embedding.Model = embeddings.ModelName
+		obsCopy.Embedding.Tokenizer = embedder.TokenizerType()
+		obsCopy.Embedding.Dims = embeddings.Dimensions
+		if err := backend.SaveObservation(&obsCopy); err == nil {
+			backfilled++
+		}
+	}
+
+	if backfilled > 0 || failed > 0 {
+		log.Printf("[migrate] Backfill complete: %d embedded, %d failed", backfilled, failed)
 	}
 }
 
@@ -82,7 +178,7 @@ func (s *Server) getObservations() []storage.Observation {
 	if time.Since(s.obsCacheTime) > s.obsCacheTTL || s.obsCache == nil {
 		log.Printf("[cache] Loading observations into cache...")
 		start := time.Now()
-		s.obsCache, _ = s.localStorage.ListObservations()
+		s.obsCache, _ = s.backend.ListObservations()
 		s.obsCacheTime = time.Now()
 		log.Printf("[cache] Cached %d observations in %v", len(s.obsCache), time.Since(start))
 	}
@@ -108,6 +204,7 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/context", s.handleContext)
 	mux.HandleFunc("/api/capture", s.handleCapture)
 	mux.HandleFunc("/api/summarize", s.handleSummarize)
+	mux.HandleFunc("/api/prompt", s.handlePrompt)
 
 	// Dashboard API endpoints
 	mux.HandleFunc("/api/stats", s.handleStats)
@@ -118,6 +215,11 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/sync", s.handleSync)
 	mux.HandleFunc("/api/vaults", s.handleVaults)
+
+	// MCP API endpoints (3-layer workflow)
+	mux.HandleFunc("/api/mcp/search", s.handleMCPSearch)
+	mux.HandleFunc("/api/mcp/timeline", s.handleMCPTimeline)
+	mux.HandleFunc("/api/mcp/observations", s.handleMCPGetObservations)
 
 	// Static files for dashboard
 	staticFS, _ := fs.Sub(staticFiles, "static")
@@ -155,6 +257,9 @@ func (s *Server) Run() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.httpServer.Shutdown(ctx)
+		if err := s.backend.Close(); err != nil {
+			log.Printf("[daemon] Error closing storage backend: %v", err)
+		}
 		RemovePIDFile()
 	}()
 
@@ -164,7 +269,10 @@ func (s *Server) Run() error {
 	log.Printf("[daemon]   Hook API: http://%s/api/", addr)
 	log.Printf("[daemon]   Cloud sync: every %v", SyncInterval)
 
-	return s.httpServer.ListenAndServe()
+	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
 // === Health endpoints ===
@@ -177,7 +285,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	itemCount, storageBytes, _ := s.localStorage.GetStatus()
+	itemCount, storageBytes, _ := s.backend.GetStatus()
 
 	status := map[string]interface{}{
 		"mode":    s.mode,
@@ -211,7 +319,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	project := r.URL.Query().Get("project")
+	sessionID := r.URL.Query().Get("session_id")
 	limit := 20
+
+	// Ensure session exists in SQLCipher
+	if sessionID != "" {
+		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+			_ = sqlBackend.EnsureSession(sessionID, project, time.Now().Unix())
+		}
+	}
 
 	observations := s.getObservations()
 
@@ -330,11 +446,11 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var hookInput struct {
-		SessionID    string `json:"session_id"`
-		ToolName     string `json:"tool_name"`
-		ToolInput    string `json:"tool_input"`
-		ToolResponse string `json:"tool_response"`
-		CWD          string `json:"cwd"`
+		SessionID    string          `json:"session_id"`
+		ToolName     string          `json:"tool_name"`
+		ToolInput    json.RawMessage `json:"tool_input"`
+		ToolResponse json.RawMessage `json:"tool_response"`
+		CWD          string          `json:"cwd"`
 	}
 
 	if err := json.Unmarshal(body, &hookInput); err != nil {
@@ -362,12 +478,19 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	// Extract project from CWD
 	project := filepath.Base(hookInput.CWD)
 
-	// Parse tool input for context
+	// Parse tool input for context (handles both string and object)
 	var toolInputData map[string]interface{}
-	json.Unmarshal([]byte(hookInput.ToolInput), &toolInputData)
+	json.Unmarshal(hookInput.ToolInput, &toolInputData)
+
+	// Convert tool response to string (handles both string and object JSON)
+	var toolResponse string
+	if err := json.Unmarshal(hookInput.ToolResponse, &toolResponse); err != nil {
+		// Not a JSON string — use raw JSON as the string representation
+		toolResponse = string(hookInput.ToolResponse)
+	}
 
 	// Determine observation type and extract details
-	obs := s.extractObservation(hookInput.ToolName, toolInputData, hookInput.ToolResponse, project)
+	obs := s.extractObservation(hookInput.ToolName, toolInputData, toolResponse, project)
 	if obs == nil {
 		writeJSON(w, map[string]interface{}{"status": "skipped", "reason": "no observation extracted"})
 		return
@@ -382,20 +505,29 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 			obs.Embedding.Model = embeddings.ModelName
 			obs.Embedding.Tokenizer = s.embedder.TokenizerType()
 			obs.Embedding.Dims = embeddings.Dimensions
+		} else {
+			log.Printf("[capture] WARNING: embedding failed for %s: %v", obs.ID, err)
 		}
 	} else {
-		obs.Embedding.Vector = embeddings.FallbackEmbed(textForEmbedding)
-		obs.Embedding.Model = "fallback"
-		obs.Embedding.Tokenizer = "hash-simple"
-		obs.Embedding.Dims = embeddings.Dimensions
+		log.Printf("[capture] WARNING: embedder not available, observation %s will have no embedding", obs.ID)
 	}
 
+	// Set session ID on observation
+	obs.Core.SessionID = hookInput.SessionID
+
 	// Save observation
-	if err := s.localStorage.SaveObservation(obs); err != nil {
+	if err := s.backend.SaveObservation(obs); err != nil {
 		http.Error(w, "Failed to save observation", http.StatusInternalServerError)
 		return
 	}
 	s.invalidateCache()
+
+	// Increment session observation count if using SQLCipher
+	if hookInput.SessionID != "" {
+		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+			_ = sqlBackend.IncrementSessionObservationCount(hookInput.SessionID)
+		}
+	}
 
 	writeJSON(w, map[string]interface{}{
 		"status": "captured",
@@ -426,7 +558,10 @@ func (s *Server) extractObservation(toolName string, toolInput map[string]interf
 		obs.Core.Type = "change"
 		obs.Core.Title = fmt.Sprintf("Created file: %s", filepath.Base(filePath))
 		obs.Core.Summary = fmt.Sprintf("Created new file at %s", filePath)
+		obs.Core.Content = truncate(toolResponse, 500)
 		obs.Structured.Files.Modified = []string{filePath}
+		obs.Structured.CodeRefs = []string{filePath}
+		obs.Structured.Concepts = extractConceptsFromPath(filePath)
 
 	case "Edit":
 		filePath, _ := toolInput["file_path"].(string)
@@ -434,17 +569,18 @@ func (s *Server) extractObservation(toolName string, toolInput map[string]interf
 		newString, _ := toolInput["new_string"].(string)
 		obs.Core.Type = "change"
 		obs.Core.Title = fmt.Sprintf("Modified file: %s", filepath.Base(filePath))
-		// Truncate for summary
 		oldSnippet := truncate(oldString, 50)
 		newSnippet := truncate(newString, 50)
 		obs.Core.Summary = fmt.Sprintf("Changed '%s' to '%s'", oldSnippet, newSnippet)
+		obs.Core.Content = truncate(toolResponse, 500)
 		obs.Structured.Files.Modified = []string{filePath}
+		obs.Structured.CodeRefs = []string{filePath}
+		obs.Structured.Concepts = extractConceptsFromPath(filePath)
 
 	case "Bash":
 		command, _ := toolInput["command"].(string)
 		description, _ := toolInput["description"].(string)
 
-		// Determine type based on command
 		obs.Core.Type = "change"
 		if strings.Contains(command, "test") || strings.Contains(command, "pytest") || strings.Contains(command, "jest") {
 			obs.Core.Type = "discovery"
@@ -460,6 +596,7 @@ func (s *Server) extractObservation(toolName string, toolInput map[string]interf
 			obs.Core.Title = fmt.Sprintf("Ran command: %s", truncate(command, 40))
 		}
 		obs.Core.Summary = truncate(command, 100)
+		obs.Core.Content = truncate(toolResponse, 500)
 
 		// Check if command failed
 		if strings.Contains(toolResponse, "error") || strings.Contains(toolResponse, "Error") {
@@ -467,26 +604,39 @@ func (s *Server) extractObservation(toolName string, toolInput map[string]interf
 			obs.Structured.Facts = append(obs.Structured.Facts, "Command encountered errors")
 		}
 
+		// Extract concepts from command
+		obs.Structured.Concepts = extractConceptsFromCommand(command)
+
 	case "Task":
 		prompt, _ := toolInput["prompt"].(string)
 		obs.Core.Type = "discovery"
-		obs.Core.Title = fmt.Sprintf("Delegated task")
+		obs.Core.Title = "Delegated task"
 		obs.Core.Summary = truncate(prompt, 100)
+		obs.Core.Content = truncate(toolResponse, 500)
 
 	case "WebFetch", "WebSearch":
 		obs.Core.Type = "discovery"
-		if url, ok := toolInput["url"].(string); ok {
-			obs.Core.Title = fmt.Sprintf("Fetched: %s", truncate(url, 50))
+		if urlStr, ok := toolInput["url"].(string); ok {
+			obs.Core.Title = fmt.Sprintf("Fetched: %s", truncate(urlStr, 50))
 		} else if query, ok := toolInput["query"].(string); ok {
 			obs.Core.Title = fmt.Sprintf("Searched: %s", truncate(query, 50))
 		}
 		obs.Core.Summary = truncate(toolResponse, 100)
+		obs.Core.Content = truncate(toolResponse, 500)
+
+	case "NotebookEdit":
+		notebookPath, _ := toolInput["notebook_path"].(string)
+		obs.Core.Type = "change"
+		obs.Core.Title = fmt.Sprintf("Edited notebook: %s", filepath.Base(notebookPath))
+		obs.Core.Summary = truncate(toolResponse, 100)
+		obs.Structured.Files.Modified = []string{notebookPath}
+		obs.Structured.Concepts = []string{"jupyter", "notebook"}
 
 	default:
-		// Generic handling for other tools
 		obs.Core.Type = "change"
 		obs.Core.Title = fmt.Sprintf("Used tool: %s", toolName)
 		obs.Core.Summary = truncate(toolResponse, 100)
+		obs.Core.Content = truncate(toolResponse, 500)
 	}
 
 	// Skip if we couldn't generate a meaningful title
@@ -495,6 +645,82 @@ func (s *Server) extractObservation(toolName string, toolInput map[string]interf
 	}
 
 	return obs
+}
+
+// extractConceptsFromPath extracts language/framework concepts from a file path.
+func extractConceptsFromPath(filePath string) []string {
+	var concepts []string
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	switch ext {
+	case ".go":
+		concepts = append(concepts, "go")
+	case ".ts", ".tsx":
+		concepts = append(concepts, "typescript")
+	case ".js", ".jsx":
+		concepts = append(concepts, "javascript")
+	case ".py":
+		concepts = append(concepts, "python")
+	case ".rs":
+		concepts = append(concepts, "rust")
+	case ".svelte":
+		concepts = append(concepts, "svelte")
+	case ".sql":
+		concepts = append(concepts, "sql")
+	case ".tf":
+		concepts = append(concepts, "terraform")
+	case ".yaml", ".yml":
+		concepts = append(concepts, "yaml")
+	case ".json":
+		concepts = append(concepts, "json")
+	}
+
+	// Extract directory-based concepts
+	dir := strings.ToLower(filePath)
+	if strings.Contains(dir, "test") || strings.Contains(dir, "_test.") {
+		concepts = append(concepts, "testing")
+	}
+	if strings.Contains(dir, "api") || strings.Contains(dir, "routes") {
+		concepts = append(concepts, "api")
+	}
+	if strings.Contains(dir, "config") {
+		concepts = append(concepts, "configuration")
+	}
+	if strings.Contains(dir, "migration") {
+		concepts = append(concepts, "migration")
+	}
+
+	return concepts
+}
+
+// extractConceptsFromCommand extracts concepts from a shell command.
+func extractConceptsFromCommand(command string) []string {
+	var concepts []string
+	cmd := strings.ToLower(command)
+
+	if strings.Contains(cmd, "go ") {
+		concepts = append(concepts, "go")
+	}
+	if strings.Contains(cmd, "npm ") || strings.Contains(cmd, "yarn ") || strings.Contains(cmd, "pnpm ") {
+		concepts = append(concepts, "nodejs")
+	}
+	if strings.Contains(cmd, "docker") {
+		concepts = append(concepts, "docker")
+	}
+	if strings.Contains(cmd, "git ") {
+		concepts = append(concepts, "git")
+	}
+	if strings.Contains(cmd, "terraform") || strings.Contains(cmd, "tf ") {
+		concepts = append(concepts, "terraform")
+	}
+	if strings.Contains(cmd, "test") || strings.Contains(cmd, "pytest") || strings.Contains(cmd, "jest") {
+		concepts = append(concepts, "testing")
+	}
+	if strings.Contains(cmd, "build") || strings.Contains(cmd, "compile") {
+		concepts = append(concepts, "build")
+	}
+
+	return concepts
 }
 
 func truncate(s string, maxLen int) string {
@@ -618,20 +844,28 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 			summary.Embedding.Model = embeddings.ModelName
 			summary.Embedding.Tokenizer = s.embedder.TokenizerType()
 			summary.Embedding.Dims = embeddings.Dimensions
+		} else {
+			log.Printf("[summarize] WARNING: embedding failed for summary %s: %v", summary.ID, err)
 		}
 	} else {
-		summary.Embedding.Vector = embeddings.FallbackEmbed(textForEmbedding)
-		summary.Embedding.Model = "fallback"
-		summary.Embedding.Tokenizer = "hash-simple"
-		summary.Embedding.Dims = embeddings.Dimensions
+		log.Printf("[summarize] WARNING: embedder not available, summary %s will have no embedding", summary.ID)
 	}
 
 	// Save
-	if err := s.localStorage.SaveObservation(summary); err != nil {
+	if err := s.backend.SaveObservation(summary); err != nil {
 		http.Error(w, "Failed to save summary", http.StatusInternalServerError)
 		return
 	}
 	s.invalidateCache()
+
+	// Complete session in SQLCipher
+	if hookInput.SessionID != "" {
+		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+			summaryText := fmt.Sprintf("Session included %s across %d files", strings.Join(summaryParts, ", "), len(files))
+			_ = sqlBackend.CompleteSession(hookInput.SessionID, time.Now(), summaryText, len(sessionObs))
+			_ = sqlBackend.InsertSessionSummary(hookInput.SessionID, project, summaryText, len(sessionObs), files, time.Now().Unix())
+		}
+	}
 
 	writeJSON(w, map[string]interface{}{
 		"status":           "summarized",
@@ -639,6 +873,69 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 		"observationCount": len(sessionObs),
 		"fileCount":        len(files),
 		"project":          project,
+	})
+}
+
+func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	var hookInput struct {
+		SessionID string `json:"session_id"`
+		Prompt    string `json:"prompt"`
+		CWD       string `json:"cwd"`
+	}
+
+	if err := json.Unmarshal(body, &hookInput); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if hookInput.Prompt == "" {
+		writeJSON(w, map[string]interface{}{"status": "skipped", "reason": "empty prompt"})
+		return
+	}
+
+	project := filepath.Base(hookInput.CWD)
+
+	// Track in SQLCipher if available
+	if hookInput.SessionID != "" {
+		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+			_ = sqlBackend.EnsureSession(hookInput.SessionID, project, time.Now().Unix())
+
+			// Get next prompt number for this session
+			promptNumber := 1
+			if err := sqlBackend.DB().QueryRow(
+				"SELECT COALESCE(MAX(prompt_number), 0) + 1 FROM user_prompts WHERE session_id = ?",
+				hookInput.SessionID,
+			).Scan(&promptNumber); err != nil {
+				log.Printf("[prompt] Failed to get prompt number for session=%s: %v", hookInput.SessionID, err)
+			}
+
+			_ = sqlBackend.InsertUserPrompt(
+				hookInput.SessionID,
+				hookInput.Prompt,
+				project,
+				promptNumber,
+				time.Now().Unix(),
+			)
+		}
+	}
+
+	log.Printf("[prompt] Recorded prompt for session=%s project=%s", hookInput.SessionID, project)
+
+	writeJSON(w, map[string]interface{}{
+		"status":  "recorded",
+		"session": hookInput.SessionID,
+		"project": project,
 	})
 }
 
@@ -657,7 +954,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"tagged":            countIf(observations, func(o storage.Observation) bool { return len(o.Meta.Tags) > 0 }),
 	}
 
-	itemCount, storageBytes, _ := s.localStorage.GetStatus()
+	itemCount, storageBytes, _ := s.backend.GetStatus()
 	stats["storageItems"] = itemCount
 	stats["storageBytes"] = storageBytes
 
@@ -809,7 +1106,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	authenticated := s.isAuthenticated()
 
 	// Get local observation count
-	localCount, _, _ := s.localStorage.GetStatus()
+	localCount, _, _ := s.backend.GetStatus()
 
 	status := map[string]interface{}{
 		"syncing":       syncing,
@@ -939,7 +1236,7 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		obs, err := s.localStorage.GetObservation(id)
+		obs, err := s.backend.GetObservation(id)
 		if err != nil {
 			http.Error(w, "Not found", http.StatusNotFound)
 			return
@@ -956,14 +1253,14 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request, id string) {
 	// Get observation first to get project/title for claude-mem deletion
-	obs, err := s.localStorage.GetObservation(id)
+	obs, err := s.backend.GetObservation(id)
 	if err != nil {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
 	}
 
 	// Delete from local sinesync storage
-	if err := s.localStorage.Delete("observation", id); err != nil {
+	if err := s.backend.DeleteObservation(id); err != nil {
 		http.Error(w, "Failed to delete: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1078,7 +1375,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	var queryEmbedding []float32
 	if s.embedder != nil && s.embedder.IsReady() {
-		queryEmbedding, _ = s.embedder.Embed(query)
+		if vec, err := s.embedder.Embed(query); err == nil {
+			queryEmbedding = vec
+		} else {
+			queryEmbedding = embeddings.FallbackEmbed(query)
+		}
 	} else {
 		queryEmbedding = embeddings.FallbackEmbed(query)
 	}
@@ -1143,6 +1444,210 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		"hasPrev":      page > 1,
 		"query":        query,
 	})
+}
+
+// === MCP API endpoints (3-layer workflow) ===
+
+func (s *Server) handleMCPSearch(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("query")
+	if query == "" {
+		writeJSON(w, map[string]interface{}{"results": []interface{}{}, "total": 0})
+		return
+	}
+
+	limit := 20
+	fmt.Sscanf(r.URL.Query().Get("limit"), "%d", &limit)
+	if limit < 1 || limit > 200 {
+		limit = 20
+	}
+
+	// Build filters
+	filters := storage.SearchFilters{
+		Project: r.URL.Query().Get("project"),
+		Type:    r.URL.Query().Get("type"),
+	}
+	if ds := r.URL.Query().Get("dateStart"); ds != "" {
+		if t, err := time.Parse(time.RFC3339, ds); err == nil {
+			filters.DateStart = &t
+		}
+	}
+	if de := r.URL.Query().Get("dateEnd"); de != "" {
+		if t, err := time.Parse(time.RFC3339, de); err == nil {
+			filters.DateEnd = &t
+		}
+	}
+
+	// Try SQLCipher hybrid search first
+	if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+		var queryVec []float32
+		if s.embedder != nil && s.embedder.IsReady() {
+			queryVec, _ = s.embedder.Embed(query)
+		}
+
+		results, err := sqlBackend.HybridSearch(query, queryVec, limit, filters)
+		if err == nil {
+			writeJSON(w, map[string]interface{}{
+				"results": results,
+				"total":   len(results),
+				"query":   query,
+			})
+			return
+		}
+	}
+
+	// Fallback: brute-force search for LocalStorage backend
+	observations := s.getObservations()
+	var queryEmbedding []float32
+	if s.embedder != nil && s.embedder.IsReady() {
+		if vec, err := s.embedder.Embed(query); err == nil {
+			queryEmbedding = vec
+		} else {
+			queryEmbedding = embeddings.FallbackEmbed(query)
+		}
+	} else {
+		queryEmbedding = embeddings.FallbackEmbed(query)
+	}
+
+	type scoredResult struct {
+		obs   storage.Observation
+		score float32
+	}
+	var scored []scoredResult
+	for _, obs := range observations {
+		if filters.Project != "" && obs.Core.Project != filters.Project {
+			continue
+		}
+		if filters.Type != "" && obs.Core.Type != filters.Type {
+			continue
+		}
+		if filters.DateStart != nil && obs.Core.CreatedAt.Before(*filters.DateStart) {
+			continue
+		}
+		if filters.DateEnd != nil && obs.Core.CreatedAt.After(*filters.DateEnd) {
+			continue
+		}
+		if len(obs.Embedding.Vector) > 0 {
+			score := embeddings.CosineSimilarity(queryEmbedding, obs.Embedding.Vector)
+			scored = append(scored, scoredResult{obs: obs, score: score})
+		} else if strings.Contains(strings.ToLower(obs.Core.Title+" "+obs.Core.Summary+" "+obs.Core.Content), strings.ToLower(query)) {
+			// Text match fallback for observations without embeddings
+			scored = append(scored, scoredResult{obs: obs, score: 0.1})
+		}
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+	if len(scored) > limit {
+		scored = scored[:limit]
+	}
+
+	results := make([]storage.SearchResult, len(scored))
+	for i, sr := range scored {
+		results[i] = storage.SearchResult{
+			ID:        sr.obs.ID,
+			Title:     sr.obs.Core.Title,
+			Summary:   sr.obs.Core.Summary,
+			Type:      sr.obs.Core.Type,
+			Project:   sr.obs.Core.Project,
+			CreatedAt: sr.obs.Core.CreatedAt.Format(time.RFC3339),
+			Score:     float64(sr.score),
+		}
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"results": results,
+		"total":   len(results),
+		"query":   query,
+	})
+}
+
+func (s *Server) handleMCPTimeline(w http.ResponseWriter, r *http.Request) {
+	anchorID := r.URL.Query().Get("anchor")
+	query := r.URL.Query().Get("query")
+
+	depthBefore := 5
+	depthAfter := 5
+	fmt.Sscanf(r.URL.Query().Get("depth_before"), "%d", &depthBefore)
+	fmt.Sscanf(r.URL.Query().Get("depth_after"), "%d", &depthAfter)
+	if depthBefore < 0 {
+		depthBefore = 0
+	} else if depthBefore > 50 {
+		depthBefore = 50
+	}
+	if depthAfter < 0 {
+		depthAfter = 0
+	} else if depthAfter > 50 {
+		depthAfter = 50
+	}
+
+	sqlBackend, ok := s.backend.(*storage.SQLCipherStorage)
+	if !ok {
+		// Fallback for LocalStorage: just return recent observations
+		observations := s.getObservations()
+		total := depthBefore + depthAfter + 1
+		if total > len(observations) {
+			total = len(observations)
+		}
+		result := make([]map[string]interface{}, total)
+		for i := 0; i < total; i++ {
+			result[i] = observationToMap(observations[i])
+		}
+		writeJSON(w, map[string]interface{}{"observations": result})
+		return
+	}
+
+	var observations []storage.Observation
+	var err error
+
+	if anchorID != "" {
+		observations, err = sqlBackend.TimelineSearch(anchorID, depthBefore, depthAfter)
+	} else if query != "" {
+		var queryVec []float32
+		if s.embedder != nil && s.embedder.IsReady() {
+			queryVec, _ = s.embedder.Embed(query)
+		}
+		observations, err = sqlBackend.TimelineSearchByQuery(query, queryVec, depthBefore, depthAfter)
+	} else {
+		writeJSON(w, map[string]interface{}{"error": "anchor or query required"})
+		return
+	}
+
+	if err != nil {
+		writeJSON(w, map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	result := make([]map[string]interface{}, len(observations))
+	for i, obs := range observations {
+		result[i] = observationToMap(obs)
+	}
+	writeJSON(w, map[string]interface{}{"observations": result})
+}
+
+func (s *Server) handleMCPGetObservations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	observations := make([]map[string]interface{}, 0, len(req.IDs))
+	for _, id := range req.IDs {
+		obs, err := s.backend.GetObservation(id)
+		if err != nil {
+			continue
+		}
+		observations = append(observations, observationToMap(*obs))
+	}
+
+	writeJSON(w, map[string]interface{}{"observations": observations})
 }
 
 // === Helpers ===

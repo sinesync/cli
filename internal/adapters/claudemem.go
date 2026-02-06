@@ -14,7 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/miclip/sinesync/internal/doctor"
 	"github.com/miclip/sinesync/internal/storage"
-	_ "modernc.org/sqlite"
+	_ "github.com/mutecomm/go-sqlcipher/v4"
 )
 
 const ClaudeMemAdapterName = "claude-mem"
@@ -74,7 +74,7 @@ func NewClaudeMemAdapter(readonly bool) (*ClaudeMemAdapter, error) {
 		mode = ""
 	}
 
-	db, err := sql.Open("sqlite", claudeMemDBPath()+mode)
+	db, err := sql.Open("sqlite3", claudeMemDBPath()+mode)
 	if err != nil {
 		return nil, err
 	}
@@ -545,7 +545,7 @@ func (a *ClaudeMemAdapter) getChromaEmbeddingCount() (int, int, bool) {
 		return 0, 0, false
 	}
 
-	chromaDB, err := sql.Open("sqlite", chromaDBPath+"?mode=ro")
+	chromaDB, err := sql.Open("sqlite3", chromaDBPath+"?mode=ro")
 	if err != nil {
 		return 0, 0, false
 	}
@@ -630,7 +630,7 @@ func (a *ClaudeMemAdapter) insertChromaEmbedding(obsID int64, obs *storage.Obser
 		return nil
 	}
 
-	chromaDB, err := sql.Open("sqlite", chromaDBPath)
+	chromaDB, err := sql.Open("sqlite3", chromaDBPath)
 	if err != nil {
 		return fmt.Errorf("open ChromaDB: %w", err)
 	}
@@ -762,7 +762,7 @@ func (a *ClaudeMemAdapter) GetEmbeddingBacklog() int {
 		return 0
 	}
 
-	chromaDB, err := sql.Open("sqlite", chromaDBPath+"?mode=ro")
+	chromaDB, err := sql.Open("sqlite3", chromaDBPath+"?mode=ro")
 	if err != nil {
 		return 0
 	}
@@ -801,7 +801,11 @@ func (a *ClaudeMemAdapter) GetEmbeddingBacklog() int {
 	var totalObs int
 	a.db.QueryRow("SELECT COUNT(*) FROM observations").Scan(&totalObs)
 
-	return totalObs - len(existingIDs)
+	backlog := totalObs - len(existingIDs)
+	if backlog < 0 {
+		return 0
+	}
+	return backlog
 }
 
 // BackfillEmbeddings generates embeddings for observations missing from ChromaDB
@@ -818,7 +822,7 @@ func (a *ClaudeMemAdapter) BackfillEmbeddings(limit int) (int, error) {
 		return 0, nil
 	}
 
-	chromaDB, err := sql.Open("sqlite", chromaDBPath)
+	chromaDB, err := sql.Open("sqlite3", chromaDBPath)
 	if err != nil {
 		return 0, err
 	}

@@ -266,6 +266,16 @@ func (s *LocalStorage) ListObservations() ([]Observation, error) {
 	return observations, nil
 }
 
+// DeleteObservation deletes an observation by ID
+func (s *LocalStorage) DeleteObservation(id string) error {
+	return s.Delete("observation", id)
+}
+
+// Close is a no-op for file-based storage
+func (s *LocalStorage) Close() error {
+	return nil
+}
+
 // ObservationExists checks if an observation exists by source
 func (s *LocalStorage) ObservationExists(obs *Observation) (bool, error) {
 	if obs.Source.Adapter != "" && obs.Source.ID != "" {

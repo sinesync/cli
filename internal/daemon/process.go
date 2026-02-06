@@ -160,6 +160,9 @@ func Start(port int) error {
 }
 
 func startUnix(exePath string, port int) error {
+	if err := os.MkdirAll(LogDir(), 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
 	logFile := filepath.Join(LogDir(), fmt.Sprintf("daemon-%s.log", time.Now().Format("2006-01-02")))
 
 	// Open log file
@@ -191,6 +194,9 @@ func startUnix(exePath string, port int) error {
 }
 
 func startWindows(exePath string, port int) error {
+	if err := os.MkdirAll(LogDir(), 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
 	logFile := filepath.Join(LogDir(), fmt.Sprintf("daemon-%s.log", time.Now().Format("2006-01-02")))
 
 	// Use PowerShell to start detached process

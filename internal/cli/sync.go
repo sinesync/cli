@@ -58,14 +58,9 @@ func init() {
 }
 
 func runSync(cmd *cobra.Command, args []string) error {
-	authCfg, err := loadAuthConfig()
-	if err != nil || authCfg == nil {
-		return fmt.Errorf("not logged in - run 'sinesync login' first")
-	}
-
-	token := authCfg.DeviceToken
-	if token == "" {
-		token = authCfg.Token
+	token, err := getAuthToken()
+	if err != nil {
+		return err
 	}
 
 	// Get encryption manager
@@ -85,7 +80,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Get cloud manifest once for both operations
 	fmt.Println("Fetching cloud manifest...")
-	manifest, err := getCloudManifest(apiBase, token)
+	manifest, err := withTokenRefresh(apiBase, &token, func(t string) (*manifestResponse, error) {
+		return getCloudManifest(apiBase, t)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get cloud manifest: %w", err)
 	}
@@ -363,14 +360,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 }
 
 func runSyncPush(cmd *cobra.Command, args []string) error {
-	authCfg, err := loadAuthConfig()
-	if err != nil || authCfg == nil {
-		return fmt.Errorf("not logged in - run 'sinesync login' first")
-	}
-
-	token := authCfg.DeviceToken
-	if token == "" {
-		token = authCfg.Token
+	token, err := getAuthToken()
+	if err != nil {
+		return err
 	}
 
 	// Get encryption manager
@@ -397,7 +389,9 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 
 	// Get cloud manifest to see what's already synced
 	fmt.Println("Fetching cloud manifest...")
-	manifest, err := getCloudManifest(apiBase, token)
+	manifest, err := withTokenRefresh(apiBase, &token, func(t string) (*manifestResponse, error) {
+		return getCloudManifest(apiBase, t)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get cloud manifest: %w", err)
 	}
@@ -463,14 +457,9 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 }
 
 func runSyncPull(cmd *cobra.Command, args []string) error {
-	authCfg, err := loadAuthConfig()
-	if err != nil || authCfg == nil {
-		return fmt.Errorf("not logged in - run 'sinesync login' first")
-	}
-
-	token := authCfg.DeviceToken
-	if token == "" {
-		token = authCfg.Token
+	token, err := getAuthToken()
+	if err != nil {
+		return err
 	}
 
 	// Get encryption manager
@@ -483,7 +472,9 @@ func runSyncPull(cmd *cobra.Command, args []string) error {
 	localStorage := storage.NewLocalStorage()
 
 	fmt.Println("Fetching cloud manifest...")
-	manifest, err := getCloudManifest(apiBase, token)
+	manifest, err := withTokenRefresh(apiBase, &token, func(t string) (*manifestResponse, error) {
+		return getCloudManifest(apiBase, t)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to get cloud manifest: %w", err)
 	}
@@ -550,48 +541,20 @@ func runSyncPull(cmd *cobra.Command, args []string) error {
 }
 
 func runSyncStatus(cmd *cobra.Command, args []string) error {
-	authCfg, err := loadAuthConfig()
-	if err != nil || authCfg == nil {
-		return fmt.Errorf("not logged in - run 'sinesync login' first")
-	}
-
-	token := authCfg.DeviceToken
-	if token == "" {
-		token = authCfg.Token
+	token, err := getAuthToken()
+	if err != nil {
+		return err
 	}
 
 	apiBase := getAPIBase()
 
 	fmt.Println("Fetching sync status...")
 
-	req, err := http.NewRequest("GET", apiBase+"/sync/status", nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	status, err := withTokenRefresh(apiBase, &token, func(t string) (*syncStatus, error) {
+		return fetchSyncStatus(apiBase, t)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to fetch status: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	var status struct {
-		LastSync         *string `json:"lastSync"`
-		ItemCount        int     `json:"itemCount"`
-		StorageUsedBytes int64   `json:"storageUsedBytes"`
-		StorageLimitBytes int64  `json:"storageLimitBytes"`
-		DeviceCount      int     `json:"deviceCount"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		return err
 	}
 
 	fmt.Println()
@@ -606,6 +569,58 @@ func runSyncStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+type syncStatus struct {
+	LastSync          *string `json:"lastSync"`
+	ItemCount         int     `json:"itemCount"`
+	StorageUsedBytes  int64   `json:"storageUsedBytes"`
+	StorageLimitBytes int64   `json:"storageLimitBytes"`
+	DeviceCount       int     `json:"deviceCount"`
+}
+
+func fetchSyncStatus(apiBase, token string) (*syncStatus, error) {
+	req, err := http.NewRequest("GET", apiBase+"/sync/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var status syncStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+// withTokenRefresh wraps an API call with automatic token refresh on 401.
+// Returns the (possibly refreshed) token and the result of the last call.
+func withTokenRefresh[T any](apiBase string, token *string, fn func(string) (T, error)) (T, error) {
+	result, err := fn(*token)
+	if err != nil && isUnauthorizedError(err) {
+		fmt.Println("Token expired, refreshing...")
+		newToken, refreshErr := refreshAccessToken(apiBase)
+		if refreshErr != nil {
+			var zero T
+			return zero, fmt.Errorf("token expired and refresh failed: %w\nRun 'sinesync login' to re-authenticate", refreshErr)
+		}
+		*token = newToken
+		time.Sleep(2 * time.Second) // brief pause to avoid rate limiting
+		return fn(newToken)
+	}
+	return result, err
 }
 
 // Cloud API helpers

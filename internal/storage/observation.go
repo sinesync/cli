@@ -34,6 +34,7 @@ type Core struct {
 	Content   string    `json:"content,omitempty"` // Full narrative/details
 	Type      string    `json:"type"`              // discovery, decision, bugfix, feature, refactor, change
 	Project   string    `json:"project,omitempty"`
+	SessionID string    `json:"sessionId,omitempty"` // Claude Code session ID
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }

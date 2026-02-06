@@ -34,7 +34,11 @@ var configShowCmd = &cobra.Command{
 
 		fmt.Println("\nsine~sync configuration")
 		fmt.Println("────────────────────────────────────────")
-		fmt.Printf("\nClaude-mem mode: %v\n", cfg.ClaudeMemMode)
+		mode := cfg.Mode
+		if mode == "" {
+			mode = "standalone"
+		}
+		fmt.Printf("\nMode: %s\n", mode)
 
 		if cfg.Sync != nil {
 			fmt.Println("\nSync settings:")

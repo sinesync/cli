@@ -436,8 +436,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	embedder, _ := embeddings.NewProvider()
 	var queryEmbedding []float32
 	if embedder != nil && embedder.IsReady() {
-		queryEmbedding, _ = embedder.Embed(query)
 		defer embedder.Close()
+		if vec, err := embedder.Embed(query); err == nil {
+			queryEmbedding = vec
+		} else {
+			queryEmbedding = embeddings.FallbackEmbed(query)
+		}
 	} else {
 		queryEmbedding = embeddings.FallbackEmbed(query)
 	}

@@ -52,6 +52,13 @@ type EmbeddingConfig struct {
 	Dims      int    // e.g., 384
 }
 
+// Countable extends Adapter with observation counting
+// Adapters that can efficiently report observation count should implement this
+type Countable interface {
+	Adapter
+	GetObservationCount() (int, error)
+}
+
 // Diagnosable extends Adapter with diagnostic capabilities
 // Adapters that support health checks should implement this
 type Diagnosable interface {

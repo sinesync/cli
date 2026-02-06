@@ -179,6 +179,14 @@ func (m *SyncManifest) MarkSeenBatch(ids []string) {
 	}
 }
 
+// ClearSeenIDs resets the seen list so cloud sync re-pulls all missing observations.
+// Used during mode migration (e.g., adapter → standalone) when the local backend changes.
+func (m *SyncManifest) ClearSeenIDs() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SeenIDs = make(map[string]bool)
+}
+
 // RemoveFromSeen removes an ID from seen list (after confirmed cloud deletion)
 func (m *SyncManifest) RemoveFromSeen(id string) {
 	m.mu.Lock()

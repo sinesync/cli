@@ -5,13 +5,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/miclip/sinesync/internal/adapters"
+	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/daemon"
 )
 
@@ -53,7 +54,7 @@ type ServerInfo struct {
 }
 
 type Capabilities struct {
-	Tools map[string]interface{} `json:"tools,omitempty"`
+	Tools map[string]interface{} `json:"tools"`
 }
 
 type InitializeResult struct {
@@ -73,12 +74,12 @@ type Server struct {
 var syncTools = []Tool{
 	{
 		Name:        "sinesync_status",
-		Description: "Check sine~sync status: storage, mode, daemon status",
+		Description: "Check sine~sync daemon status including storage size, observation count, embedding model, and operating mode",
 		InputSchema: InputSchema{Type: "object", Properties: map[string]interface{}{}},
 	},
 	{
 		Name:        "sinesync_search",
-		Description: "Search memories with semantic similarity",
+		Description: "Quick semantic search across all observations. Use the 'search' tool instead for filtered queries (by project, type, or date range)",
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]interface{}{
@@ -90,37 +91,55 @@ var syncTools = []Tool{
 	},
 	{
 		Name:        "sinesync_projects",
-		Description: "List projects with observation counts",
+		Description: "List all projects and the number of observations in each. Useful for discovering available projects before filtering searches",
 		InputSchema: InputSchema{Type: "object", Properties: map[string]interface{}{}},
 	},
 }
 
-// Memory tools (standalone mode only)
+// Memory tools (standalone mode only) — 3-layer workflow matching claude-mem
 var memoryTools = []Tool{
 	{
-		Name:        "memory_store",
-		Description: "Store an observation/memory",
+		Name:        "search",
+		Description: "Search observations by semantic similarity. Returns matching IDs, titles, summaries, and scores. Supports filtering by project, type (discovery, decision, bugfix, feature, change, refactor), and date range. Use 'get_observations' to fetch full details for specific IDs",
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]interface{}{
-				"type":    map[string]interface{}{"type": "string", "enum": []string{"bugfix", "feature", "decision", "discovery", "change", "refactor"}},
-				"title":   map[string]interface{}{"type": "string", "description": "Short title"},
-				"summary": map[string]interface{}{"type": "string", "description": "Brief summary"},
-				"content": map[string]interface{}{"type": "string", "description": "Detailed content"},
-				"project": map[string]interface{}{"type": "string", "description": "Project name"},
+				"query":     map[string]interface{}{"type": "string", "description": "Search query"},
+				"limit":     map[string]interface{}{"type": "number", "description": "Max results (default 20)"},
+				"project":   map[string]interface{}{"type": "string", "description": "Filter by project"},
+				"type":      map[string]interface{}{"type": "string", "description": "Filter by type (discovery, decision, bugfix, etc.)"},
+				"dateStart": map[string]interface{}{"type": "string", "description": "Filter start date (ISO 8601)"},
+				"dateEnd":   map[string]interface{}{"type": "string", "description": "Filter end date (ISO 8601)"},
 			},
-			Required: []string{"type", "title", "summary"},
+			Required: []string{"query"},
 		},
 	},
 	{
-		Name:        "memory_get",
-		Description: "Get a specific memory by ID",
+		Name:        "timeline",
+		Description: "View observations surrounding a specific point in time. Provide an observation ID as anchor, or a query to find one automatically. Returns neighboring observations with full details, useful for understanding what happened before and after a specific event",
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]interface{}{
-				"id": map[string]interface{}{"type": "string", "description": "Observation ID"},
+				"anchor":       map[string]interface{}{"type": "string", "description": "Observation ID to center timeline on"},
+				"query":        map[string]interface{}{"type": "string", "description": "Search query to find anchor automatically"},
+				"depth_before": map[string]interface{}{"type": "number", "description": "Observations before anchor (default 5)"},
+				"depth_after":  map[string]interface{}{"type": "number", "description": "Observations after anchor (default 5)"},
 			},
-			Required: []string{"id"},
+		},
+	},
+	{
+		Name:        "get_observations",
+		Description: "Fetch full observation details by ID. Returns complete content, facts, concepts, files, and metadata. Use after 'search' to get the full context for specific results",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]interface{}{
+				"ids": map[string]interface{}{
+					"type":        "array",
+					"items":       map[string]interface{}{"type": "string"},
+					"description": "Array of observation IDs to fetch (required)",
+				},
+			},
+			Required: []string{"ids"},
 		},
 	},
 }
@@ -134,10 +153,15 @@ func StartServer() error {
 		return err
 	}
 
-	// Detect mode
-	mode := "standalone"
-	if adapters.IsClaudeMemInstalled() {
-		mode = "adapter"
+	// Determine mode from config, fall back to auto-detect for unconfigured installs
+	cfg, _ := config.Load()
+	mode := cfg.Mode
+	if mode == "" {
+		if adapters.IsClaudeMemInstalled() {
+			mode = "adapter"
+		} else {
+			mode = "standalone"
+		}
 	}
 
 	server := &Server{
@@ -226,10 +250,12 @@ func (s *Server) handleToolCall(params json.RawMessage) interface{} {
 		return s.handleSearch(call.Arguments)
 	case "sinesync_projects":
 		return s.handleProjects()
-	case "memory_store":
-		return s.handleMemoryStore(call.Arguments)
-	case "memory_get":
-		return s.handleMemoryGet(call.Arguments)
+	case "search":
+		return s.handleMCPSearch(call.Arguments)
+	case "timeline":
+		return s.handleMCPTimeline(call.Arguments)
+	case "get_observations":
+		return s.handleMCPGetObservations(call.Arguments)
 	default:
 		return errorResult(fmt.Sprintf("Unknown tool: %s", call.Name))
 	}
@@ -314,78 +340,128 @@ func (s *Server) handleProjects() interface{} {
 	return textResult(map[string]interface{}{"projects": projects})
 }
 
-func (s *Server) handleMemoryStore(args map[string]interface{}) interface{} {
-	if s.mode == "adapter" {
-		return errorResult("Use claude-mem for memory storage in adapter mode")
+func (s *Server) handleMCPSearch(args map[string]interface{}) interface{} {
+	query, _ := args["query"].(string)
+	if query == "" {
+		return errorResult("Query required")
 	}
 
-	// Get current working directory for project
-	cwd, _ := os.Getwd()
-	project := filepath.Base(cwd)
+	limit := 20
+	if l, ok := args["limit"].(float64); ok {
+		limit = int(l)
+	}
+
+	// Build query params
+	params := url.Values{}
+	params.Set("query", query)
+	params.Set("limit", fmt.Sprintf("%d", limit))
 	if p, ok := args["project"].(string); ok && p != "" {
-		project = p
+		params.Set("project", p)
+	}
+	if t, ok := args["type"].(string); ok && t != "" {
+		params.Set("type", t)
+	}
+	if ds, ok := args["dateStart"].(string); ok && ds != "" {
+		params.Set("dateStart", ds)
+	}
+	if de, ok := args["dateEnd"].(string); ok && de != "" {
+		params.Set("dateEnd", de)
 	}
 
-	obsType, _ := args["type"].(string)
-	title, _ := args["title"].(string)
-	summary, _ := args["summary"].(string)
-	content, _ := args["content"].(string)
-
-	// Create capture request
-	captureReq := map[string]interface{}{
-		"session_id": "mcp-manual",
-		"tool_name":  "ManualStore",
-		"tool_input": fmt.Sprintf(`{"type":"%s","title":"%s","summary":"%s","content":"%s"}`,
-			obsType, title, summary, content),
-		"tool_response": "Manual observation",
-		"cwd":           cwd,
-	}
-
-	body, _ := json.Marshal(captureReq)
-	resp, err := s.httpClient.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/capture", s.daemonPort),
-		"application/json",
-		bytes.NewReader(body),
-	)
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/mcp/search?%s", s.daemonPort, params.Encode())
+	resp, err := s.httpClient.Get(apiURL)
 	if err != nil {
-		return errorResult(fmt.Sprintf("Store error: %v", err))
+		return errorResult(fmt.Sprintf("Search error: %v", err))
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return errorResult(fmt.Sprintf("Search failed (%d): %s", resp.StatusCode, string(body)))
+	}
 
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-
-	return textResult(map[string]interface{}{
-		"stored":  true,
-		"id":      result["id"],
-		"title":   title,
-		"type":    obsType,
-		"project": project,
-	})
-}
-
-func (s *Server) handleMemoryGet(args map[string]interface{}) interface{} {
-	id, _ := args["id"].(string)
-	if id == "" {
-		return errorResult("ID required")
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return errorResult("Failed to parse search results")
 	}
 
-	resp, err := s.httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/observations/%s", s.daemonPort, id))
+	return textResult(result)
+}
+
+func (s *Server) handleMCPTimeline(args map[string]interface{}) interface{} {
+	// Build query params
+	params := url.Values{}
+	if anchor, ok := args["anchor"].(string); ok && anchor != "" {
+		params.Set("anchor", anchor)
+	}
+	if query, ok := args["query"].(string); ok && query != "" {
+		params.Set("query", query)
+	}
+	if db, ok := args["depth_before"].(float64); ok {
+		params.Set("depth_before", fmt.Sprintf("%d", int(db)))
+	}
+	if da, ok := args["depth_after"].(float64); ok {
+		params.Set("depth_after", fmt.Sprintf("%d", int(da)))
+	}
+
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/mcp/timeline?%s", s.daemonPort, params.Encode())
+	resp, err := s.httpClient.Get(apiURL)
 	if err != nil {
-		return errorResult(fmt.Sprintf("Get error: %v", err))
+		return errorResult(fmt.Sprintf("Timeline error: %v", err))
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
-		return errorResult("Observation not found")
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return errorResult(fmt.Sprintf("Timeline failed (%d): %s", resp.StatusCode, string(body)))
 	}
 
-	var obs map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&obs); err != nil {
-		return errorResult("Failed to parse observation")
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return errorResult("Failed to parse timeline results")
 	}
 
-	return textResult(obs)
+	return textResult(result)
+}
+
+func (s *Server) handleMCPGetObservations(args map[string]interface{}) interface{} {
+	idsRaw, ok := args["ids"].([]interface{})
+	if !ok || len(idsRaw) == 0 {
+		return errorResult("ids array required")
+	}
+
+	ids := make([]string, 0, len(idsRaw))
+	for _, id := range idsRaw {
+		if s, ok := id.(string); ok {
+			ids = append(ids, s)
+		}
+	}
+	if len(ids) == 0 {
+		return errorResult("ids array must contain at least one string")
+	}
+
+	reqBody, _ := json.Marshal(map[string]interface{}{"ids": ids})
+	resp, err := s.httpClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/mcp/observations", s.daemonPort),
+		"application/json",
+		bytes.NewReader(reqBody),
+	)
+	if err != nil {
+		return errorResult(fmt.Sprintf("Get observations error: %v", err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return errorResult(fmt.Sprintf("Get observations failed (%d): %s", resp.StatusCode, string(body)))
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return errorResult("Failed to parse observations")
+	}
+
+	return textResult(result)
 }
 
 func textResult(data interface{}) interface{} {

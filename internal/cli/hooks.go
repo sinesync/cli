@@ -39,10 +39,18 @@ var summarizeCmd = &cobra.Command{
 	RunE:   runSummarize,
 }
 
+var promptCmd = &cobra.Command{
+	Use:    "prompt",
+	Short:  "Record user prompt (UserPromptSubmit hook)",
+	Hidden: true, // Internal command called by hooks
+	RunE:   runPrompt,
+}
+
 func init() {
 	rootCmd.AddCommand(contextCmd)
 	rootCmd.AddCommand(captureCmd)
 	rootCmd.AddCommand(summarizeCmd)
+	rootCmd.AddCommand(promptCmd)
 }
 
 // HookInput is the JSON structure received from Claude Code hooks
@@ -91,7 +99,8 @@ func runContext(cmd *cobra.Command, args []string) error {
 	}
 
 	// Call daemon API
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/context?project=%s", info.Port, url.QueryEscape(project))
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/context?project=%s&session_id=%s",
+		info.Port, url.QueryEscape(project), url.QueryEscape(input.SessionID))
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(apiURL)
@@ -176,6 +185,34 @@ func runSummarize(cmd *cobra.Command, args []string) error {
 	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/summarize", info.Port)
 
 	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(apiURL, "application/json", bytes.NewReader(inputData))
+	if err != nil {
+		return fmt.Errorf("failed to call daemon: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Forward response to stdout
+	_, err = io.Copy(os.Stdout, resp.Body)
+	return err
+}
+
+func runPrompt(cmd *cobra.Command, args []string) error {
+	// Ensure daemon is running
+	info, err := daemon.EnsureRunning()
+	if err != nil {
+		return fmt.Errorf("failed to start daemon: %w", err)
+	}
+
+	// Read hook input from stdin
+	inputData, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fmt.Errorf("failed to read stdin: %w", err)
+	}
+
+	// Call daemon API
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/prompt", info.Port)
+
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Post(apiURL, "application/json", bytes.NewReader(inputData))
 	if err != nil {
 		return fmt.Errorf("failed to call daemon: %w", err)

@@ -797,6 +797,78 @@ func loadAuthConfig() (*AuthConfig, error) {
 	return &cfg, nil
 }
 
+// getAuthToken returns the best available auth token from the stored config.
+func getAuthToken() (string, error) {
+	authCfg, err := loadAuthConfig()
+	if err != nil || authCfg == nil {
+		return "", fmt.Errorf("not logged in - run 'sinesync login' first")
+	}
+	token := authCfg.DeviceToken
+	if token == "" {
+		token = authCfg.Token
+	}
+	if token == "" {
+		return "", fmt.Errorf("no token found - run 'sinesync login' first")
+	}
+	return token, nil
+}
+
+// refreshAccessToken uses the stored refresh token to obtain a new access token.
+func refreshAccessToken(apiBase string) (string, error) {
+	authCfg, err := loadAuthConfig()
+	if err != nil {
+		return "", fmt.Errorf("cannot load auth config: %w", err)
+	}
+
+	refreshToken := authCfg.RefreshToken
+	if refreshToken == "" {
+		return "", fmt.Errorf("no refresh token available - run 'sinesync login'")
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	reqBody, _ := json.Marshal(map[string]string{
+		"refreshToken": refreshToken,
+	})
+
+	req, err := http.NewRequest("POST", apiBase+"/auth/refresh", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("token refresh failed: %d - %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	// Save new token to keyring
+	_ = kr.Set(keyringService, "token", result.Token)
+
+	return result.Token, nil
+}
+
+// isUnauthorizedError checks if an error indicates an expired or invalid token.
+func isUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "401") || strings.Contains(s, "INVALID_TOKEN") || strings.Contains(s, "unauthorized")
+}
+
 func removeAuthConfig() error {
 	// Remove from keychain
 	_ = kr.Delete(keyringService, "token")

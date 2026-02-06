@@ -2,21 +2,25 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/miclip/sinesync/internal/adapters"
 	"github.com/miclip/sinesync/internal/config"
+	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "sinesync",
-	Short: "End-to-end encrypted cross-device sync for AI memories",
+	Use:          "sinesync",
+	SilenceUsage: true,
+	Short:        "End-to-end encrypted cross-device sync for AI memories",
 	Long: `sine~sync securely syncs your AI conversation memories across devices.
 
 Features:
@@ -186,19 +190,27 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	cfg, _ := config.Load()
 
-	// Mode
-	claudeMemInstalled := adapters.IsClaudeMemInstalled()
-	if claudeMemInstalled {
-		fmt.Println("\nMode: claude-mem")
-		fmt.Println("  • Memory tools: claude-mem")
+	// Mode from config, fall back to auto-detect
+	mode := cfg.Mode
+	if mode == "" {
+		if adapters.IsClaudeMemInstalled() {
+			mode = "adapter"
+		} else {
+			mode = "standalone"
+		}
+	}
+
+	if mode == "adapter" {
+		fmt.Println("\nMode: adapter")
+		fmt.Println("  • Memory tools: adapter")
 		fmt.Println("  • Sync tools: sinesync")
 	} else {
 		fmt.Println("\nMode: standalone")
 		fmt.Println("  • Memory + sync tools: sinesync")
 	}
 
-	// Claude-mem status
-	if claudeMemInstalled {
+	// Adapter status
+	if mode == "adapter" && adapters.IsClaudeMemInstalled() {
 		adapter, err := adapters.NewClaudeMemAdapter(true)
 		if err == nil && adapter != nil {
 			defer adapter.Close()
@@ -229,12 +241,38 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Local storage
-	localStorage := storage.NewLocalStorage()
-	itemCount, storageBytes, _ := localStorage.GetStatus()
-	fmt.Printf("\nLocal storage:\n")
-	fmt.Printf("  • Observations: %d\n", itemCount)
-	fmt.Printf("  • Storage: %s\n", formatBytes(storageBytes))
+	// Local storage — query daemon for memory.db stats in standalone mode
+	if mode == "standalone" {
+		gotStats := false
+		info, err := daemon.EnsureRunning()
+		if err == nil {
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/stats", info.Port))
+			if err == nil {
+				defer resp.Body.Close()
+				var stats struct {
+					TotalObservations int   `json:"totalObservations"`
+					StorageBytes      int64 `json:"storageBytes"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&stats) == nil {
+					fmt.Printf("\nLocal storage:\n")
+					fmt.Printf("  • Observations: %d\n", stats.TotalObservations)
+					fmt.Printf("  • Storage: %s\n", formatBytes(stats.StorageBytes))
+					gotStats = true
+				}
+			}
+		}
+		if !gotStats {
+			fmt.Printf("\nLocal storage:\n")
+			fmt.Printf("  • Daemon unavailable — run 'sinesync daemon start'\n")
+		}
+	} else {
+		localStorage := storage.NewLocalStorage()
+		itemCount, storageBytes, _ := localStorage.GetStatus()
+		fmt.Printf("\nLocal storage:\n")
+		fmt.Printf("  • Observations: %d\n", itemCount)
+		fmt.Printf("  • Storage: %s\n", formatBytes(storageBytes))
+	}
 
 	// Embeddings
 	embedder, _ := embeddings.NewProvider()
@@ -359,12 +397,11 @@ func runImport(cmd *cobra.Command, args []string) error {
 				obs.Embedding.Model = embeddings.ModelName
 				obs.Embedding.Tokenizer = embedder.TokenizerType()
 				obs.Embedding.Dims = embeddings.Dimensions
+			} else {
+				fmt.Fprintf(os.Stderr, "[reembed] WARNING: embedding failed for %s: %v\n", obs.ID, err)
 			}
 		} else {
-			obs.Embedding.Vector = embeddings.FallbackEmbed(textForEmbedding)
-			obs.Embedding.Model = "fallback"
-			obs.Embedding.Tokenizer = "hash-simple"
-			obs.Embedding.Dims = embeddings.Dimensions
+			fmt.Fprintf(os.Stderr, "[reembed] WARNING: embedder not available, skipping %s\n", obs.ID)
 		}
 
 		// Save to local storage

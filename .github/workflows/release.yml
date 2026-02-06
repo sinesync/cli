@@ -11,7 +11,7 @@ on:
         required: true
 
 env:
-  GO_VERSION: '1.22'
+  GO_VERSION: '1.25'
   BINARY_NAME: sinesync
 
 jobs:
@@ -56,15 +56,40 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Install Linux cross-compilation tools
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Windows cross-compilation tools
+        if: matrix.os == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+
       - name: Build binary
         shell: bash
         env:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
-          CGO_ENABLED: 0
+          CGO_ENABLED: 1
         run: |
           VERSION=${{ steps.version.outputs.version }}
           LDFLAGS="-s -w -X main.version=${VERSION}"
+
+          # Set cross-compiler for Linux ARM64
+          if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
+            export CC=aarch64-linux-gnu-gcc
+          fi
+
+          # Set compiler for Windows (MSYS2 MinGW-w64)
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
+            export CC=gcc
+          fi
 
           if [ "${{ matrix.os }}" = "windows" ]; then
             go build -ldflags "${LDFLAGS}" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
