@@ -610,9 +610,17 @@ func fetchSyncStatus(apiBase, token string) (*syncStatus, error) {
 func withTokenRefresh[T any](apiBase string, token *string, fn func(string) (T, error)) (T, error) {
 	result, err := fn(*token)
 	if err != nil && isUnauthorizedError(err) {
+		if isAccountDeletedError(err) {
+			var zero T
+			return zero, fmt.Errorf("your account has been deleted. Local data is preserved")
+		}
 		fmt.Println("Token expired, refreshing...")
 		newToken, refreshErr := refreshAccessToken(apiBase)
 		if refreshErr != nil {
+			if isAccountDeletedError(refreshErr) {
+				var zero T
+				return zero, fmt.Errorf("your account has been deleted. Local data is preserved")
+			}
 			var zero T
 			return zero, fmt.Errorf("token expired and refresh failed: %w\nRun 'sinesync login' to re-authenticate", refreshErr)
 		}

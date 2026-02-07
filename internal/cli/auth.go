@@ -211,6 +211,9 @@ func runLogin(cmd *cobra.Command, args []string) error {
 
 	deviceResp, err := registerDevice(apiBase, loginResp.Token, hostname, platform)
 	if err != nil {
+		if isAccountDeletedError(err) {
+			return fmt.Errorf("this account has been deleted")
+		}
 		return fmt.Errorf("device registration failed: %w", err)
 	}
 
@@ -867,6 +870,24 @@ func isUnauthorizedError(err error) bool {
 	}
 	s := err.Error()
 	return strings.Contains(s, "401") || strings.Contains(s, "INVALID_TOKEN") || strings.Contains(s, "unauthorized")
+}
+
+// isAccountDeletedError checks if an error indicates the user's account has been deleted.
+func isAccountDeletedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Prefer structured detection: server errors include JSON body with "code" field
+	if i := strings.Index(msg, "{"); i != -1 {
+		var payload struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal([]byte(msg[i:]), &payload) == nil && payload.Code == "ACCOUNT_DELETED" {
+			return true
+		}
+	}
+	return strings.Contains(msg, "ACCOUNT_DELETED")
 }
 
 func removeAuthConfig() error {

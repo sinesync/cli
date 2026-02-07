@@ -160,9 +160,10 @@ type SyncManager struct {
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 	mu       sync.Mutex
-	lastSync  time.Time
-	lastError string
-	syncing   bool
+	lastSync       time.Time
+	lastError      string
+	syncing        bool
+	accountDeleted bool
 
 	// Backfill state
 	backfillMu        sync.Mutex
@@ -220,6 +221,12 @@ func (m *SyncManager) syncLoop() {
 	select {
 	case <-time.After(30 * time.Second):
 		m.doSync()
+		m.mu.Lock()
+		deleted := m.accountDeleted
+		m.mu.Unlock()
+		if deleted {
+			return
+		}
 	case <-m.stopChan:
 		return
 	}
@@ -231,6 +238,12 @@ func (m *SyncManager) syncLoop() {
 		select {
 		case <-ticker.C:
 			m.doSync()
+			m.mu.Lock()
+			deleted := m.accountDeleted
+			m.mu.Unlock()
+			if deleted {
+				return
+			}
 		case <-m.stopChan:
 			return
 		}
@@ -239,7 +252,7 @@ func (m *SyncManager) syncLoop() {
 
 func (m *SyncManager) doSync() {
 	m.mu.Lock()
-	if m.syncing {
+	if m.syncing || m.accountDeleted {
 		m.mu.Unlock()
 		return
 	}
@@ -275,9 +288,26 @@ func (m *SyncManager) doSync() {
 	if err != nil {
 		// Check if it's a 401 error - try to refresh token
 		if isUnauthorizedError(err) {
+			if isAccountDeletedError(err) {
+				m.setError("Your account has been deleted. Local data is preserved.")
+				log.Printf("[sync] Account deleted. Stopping sync. Local data is preserved.")
+				m.mu.Lock()
+				m.accountDeleted = true
+				m.mu.Unlock()
+				return
+			}
+
 			log.Printf("[sync] Token expired, attempting refresh...")
 			newToken, refreshErr := m.refreshAccessToken()
 			if refreshErr != nil {
+				if isAccountDeletedError(refreshErr) {
+					m.setError("Your account has been deleted. Local data is preserved.")
+					log.Printf("[sync] Account deleted. Stopping sync. Local data is preserved.")
+					m.mu.Lock()
+					m.accountDeleted = true
+					m.mu.Unlock()
+					return
+				}
 				m.setError(fmt.Sprintf("token refresh failed: %v", refreshErr))
 				log.Printf("[sync] Token refresh failed: %v", refreshErr)
 				return
@@ -311,6 +341,23 @@ func isUnauthorizedError(err error) bool {
 	}
 	errStr := err.Error()
 	return strings.Contains(errStr, "401") || strings.Contains(errStr, "unauthorized") || strings.Contains(errStr, "Unauthorized")
+}
+
+func isAccountDeletedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Prefer structured detection: server errors include JSON body with "code" field
+	if i := strings.Index(msg, "{"); i != -1 {
+		var payload struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal([]byte(msg[i:]), &payload) == nil && payload.Code == "ACCOUNT_DELETED" {
+			return true
+		}
+	}
+	return strings.Contains(msg, "ACCOUNT_DELETED")
 }
 
 func (m *SyncManager) setError(err string) {
