@@ -317,9 +317,8 @@ func runVaultList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch vaults: %w", err)
 	}
@@ -380,9 +379,8 @@ func runVaultCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to create vault: %w", err)
 	}
@@ -436,9 +434,8 @@ func runVaultDelete(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to delete vault: %w", err)
 	}
@@ -651,15 +648,13 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 	if fromVaultID != toVaultID {
 		// Remove from old vault
 		delReq, _ := http.NewRequest("DELETE", apiBase+"/vaults/"+fromVaultID+"/projects/"+url.PathEscape(projectName), nil)
-		delReq.Header.Set("Authorization", "Bearer "+token)
-		client.Do(delReq)
+		doVaultRequest(client, delReq, &token)
 
 		// Add to new vault
 		addBody, _ := json.Marshal(map[string]string{"projectName": projectName})
 		addReq, _ := http.NewRequest("POST", apiBase+"/vaults/"+toVaultID+"/projects", bytes.NewReader(addBody))
 		addReq.Header.Set("Content-Type", "application/json")
-		addReq.Header.Set("Authorization", "Bearer "+token)
-		client.Do(addReq)
+		doVaultRequest(client, addReq, &token)
 
 		// Update local config
 		removeProjectFromLocalVault(fromVaultID, projectName)
@@ -963,9 +958,8 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch vaults: %w", err)
 	}
@@ -993,9 +987,8 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  Warning: failed to create key request for vault %s: %v\n", v.Name, err)
 			continue
 		}
-		keyReq.Header.Set("Authorization", "Bearer "+token)
 
-		keyResp, err := client.Do(keyReq)
+		keyResp, err := doVaultRequest(client, keyReq, &token)
 		if err != nil {
 			fmt.Printf("  Warning: failed to get key for vault %s: %v\n", v.Name, err)
 			continue
@@ -1061,6 +1054,39 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 }
 
 // Helper functions
+
+// doVaultRequest performs an authenticated HTTP request with automatic token refresh on 401.
+// It sets the Authorization header, executes the request, and if a 401 is returned,
+// refreshes the access token and retries once. The token pointer is updated on refresh.
+func doVaultRequest(client *http.Client, req *http.Request, token *string) (*http.Response, error) {
+	req.Header.Set("Authorization", "Bearer "+*token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		fmt.Println("Token expired, refreshing...")
+		newToken, refreshErr := refreshAccessToken(getAPIBase())
+		if refreshErr != nil {
+			return nil, fmt.Errorf("token expired and refresh failed: %w\nRun 'sinesync login' to re-authenticate", refreshErr)
+		}
+		*token = newToken
+
+		// Rebuild the request for retry (original body may be consumed)
+		retryReq := req.Clone(req.Context())
+		retryReq.Header.Set("Authorization", "Bearer "+*token)
+		if req.GetBody != nil {
+			retryReq.Body, _ = req.GetBody()
+		}
+
+		time.Sleep(2 * time.Second)
+		return client.Do(retryReq)
+	}
+
+	return resp, nil
+}
 
 func getAuthTokenForVault() (string, error) {
 	// Check keyring
@@ -1155,9 +1181,8 @@ func runVaultSetupKey(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to get vault: %w", err)
 	}
@@ -1461,9 +1486,8 @@ func runVaultShare(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	inviteReq.Header.Set("Content-Type", "application/json")
-	inviteReq.Header.Set("Authorization", "Bearer "+token)
 
-	inviteResp, err := client.Do(inviteReq)
+	inviteResp, err := doVaultRequest(client, inviteReq, &token)
 	if err != nil {
 		return fmt.Errorf("failed to create invite: %w", err)
 	}
@@ -1511,9 +1535,8 @@ func runVaultPendingConfirm(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch invites: %w", err)
 	}
@@ -1575,9 +1598,8 @@ func runVaultConfirm(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch invites: %w", err)
 	}
@@ -1643,9 +1665,8 @@ func runVaultConfirm(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	confirmReq.Header.Set("Content-Type", "application/json")
-	confirmReq.Header.Set("Authorization", "Bearer "+token)
 
-	confirmResp, err := client.Do(confirmReq)
+	confirmResp, err := doVaultRequest(client, confirmReq, &token)
 	if err != nil {
 		return fmt.Errorf("failed to confirm invite: %w", err)
 	}
@@ -1677,9 +1698,8 @@ func runVaultInvites(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch invites: %w", err)
 	}
@@ -1736,9 +1756,8 @@ func runVaultCancelInvite(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	inviteReq.Header.Set("Authorization", "Bearer "+token)
 
-	inviteResp, err := client.Do(inviteReq)
+	inviteResp, err := doVaultRequest(client, inviteReq, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch invite: %w", err)
 	}
@@ -1762,9 +1781,8 @@ func runVaultCancelInvite(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	vaultsReq.Header.Set("Authorization", "Bearer "+token)
 
-	vaultsResp, err := client.Do(vaultsReq)
+	vaultsResp, err := doVaultRequest(client, vaultsReq, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch vaults: %w", err)
 	}
@@ -1788,9 +1806,8 @@ func runVaultCancelInvite(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			continue
 		}
-		invitesReq.Header.Set("Authorization", "Bearer "+token)
 
-		invitesResp, err := client.Do(invitesReq)
+		invitesResp, err := doVaultRequest(client, invitesReq, &token)
 		if err != nil || invitesResp.StatusCode != http.StatusOK {
 			if invitesResp != nil {
 				invitesResp.Body.Close()
@@ -1828,9 +1845,8 @@ func runVaultCancelInvite(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	cancelReq.Header.Set("Authorization", "Bearer "+token)
 
-	cancelResp, err := client.Do(cancelReq)
+	cancelResp, err := doVaultRequest(client, cancelReq, &token)
 	if err != nil {
 		return fmt.Errorf("failed to cancel invite: %w", err)
 	}
@@ -1862,9 +1878,8 @@ func runVaultAccept(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	inviteReq.Header.Set("Authorization", "Bearer "+token)
 
-	inviteResp, err := client.Do(inviteReq)
+	inviteResp, err := doVaultRequest(client, inviteReq, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch invite: %w", err)
 	}
@@ -1895,9 +1910,8 @@ func runVaultAccept(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	acceptReq.Header.Set("Authorization", "Bearer "+token)
 
-	acceptResp, err := client.Do(acceptReq)
+	acceptResp, err := doVaultRequest(client, acceptReq, &token)
 	if err != nil {
 		return fmt.Errorf("failed to accept invite: %w", err)
 	}
@@ -1931,9 +1945,8 @@ func runVaultPending(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := doVaultRequest(client, req, &token)
 	if err != nil {
 		return fmt.Errorf("failed to fetch pending invites: %w", err)
 	}
