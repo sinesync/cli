@@ -9,11 +9,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/miclip/sinesync/internal/config"
 )
+
+// findProcess wraps os.FindProcess for use by platform-specific code
+func findProcess(pid int) (*os.Process, error) {
+	return os.FindProcess(pid)
+}
 
 // PIDInfo stores daemon process information
 type PIDInfo struct {
@@ -81,19 +85,7 @@ func RemovePIDFile() {
 
 // IsProcessAlive checks if a process is running
 func IsProcessAlive(pid int) bool {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-
-	// On Unix, FindProcess always succeeds, so we need to send signal 0
-	if runtime.GOOS != "windows" {
-		err = process.Signal(syscall.Signal(0))
-		return err == nil
-	}
-
-	// On Windows, FindProcess succeeds only if process exists
-	return true
+	return isProcessAlive(pid)
 }
 
 // IsHealthy checks if the daemon is responding to health checks
@@ -174,9 +166,7 @@ func startUnix(exePath string, port int) error {
 	cmd := exec.Command(exePath, "daemon", "run", "--port", strconv.Itoa(port))
 	cmd.Stdout = logFd
 	cmd.Stderr = logFd
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Create new session, detach from terminal
-	}
+	cmd.SysProcAttr = sysProcAttr()
 
 	if err := cmd.Start(); err != nil {
 		logFd.Close()
@@ -252,20 +242,13 @@ func Stop() error {
 		return nil
 	}
 
-	// Send SIGTERM (or equivalent on Windows)
-	if runtime.GOOS == "windows" {
-		// On Windows, Kill() is the only option
+	// Send SIGTERM (or Kill on Windows)
+	signalTerminate(info.PID)
+
+	// Wait a bit for graceful shutdown, then force kill
+	time.Sleep(2 * time.Second)
+	if IsProcessAlive(info.PID) {
 		process.Kill()
-	} else {
-		process.Signal(syscall.SIGTERM)
-
-		// Wait a bit for graceful shutdown
-		time.Sleep(2 * time.Second)
-
-		// Force kill if still running
-		if IsProcessAlive(info.PID) {
-			process.Kill()
-		}
 	}
 
 	RemovePIDFile()
