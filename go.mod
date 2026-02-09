@@ -42,4 +42,4 @@ require (
 	golang.org/x/sys v0.40.0 // indirect
 )
 
-replace github.com/mutecomm/go-sqlcipher/v4 => github.com/miclip/go-sqlcipher/v4 v4.4.3-0.20260206041350-916b992ab334
+replace github.com/mutecomm/go-sqlcipher/v4 => github.com/miclip/go-sqlcipher/v4 v4.4.3-0.20260209174302-6c54764c1ca4
