@@ -1359,36 +1359,43 @@ func (m *SyncManager) pullBatch(token string, items []manifestItem, encMgr *encr
 		}
 
 		manifestItem := itemMap[urlItem.ID]
-		if err := m.downloadAndProcess(urlItem.DownloadURL, urlItem.ID, manifestItem.Checksum, encMgr); err != nil {
+		updatedAt, err := m.downloadAndProcess(urlItem.DownloadURL, urlItem.ID, manifestItem.Checksum, encMgr)
+		if err != nil {
 			log.Printf("[sync] Pull error for %s: %v", urlItem.ID, err)
 			continue
 		}
 
 		pulled++
 		syncManifest.MarkSeen(urlItem.ID)
+		// Record the cloud checksum so we don't re-push this item.
+		// Re-encryption produces different ciphertexts (random nonce), so without
+		// this the local checksum would never match the cloud checksum.
+		syncManifest.SetLocalUpload(urlItem.ID, manifestItem.Checksum, updatedAt)
 	}
 
 	return pulled, nil
 }
 
-// downloadAndProcess downloads encrypted data from a signed URL and processes it
-func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum string, encMgr *encryption.Manager) error {
+// downloadAndProcess downloads encrypted data from a signed URL and processes it.
+// Returns the observation's UpdatedAt time on success for sync manifest tracking.
+func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum string, encMgr *encryption.Manager) (time.Time, error) {
+	var zero time.Time
 	client := &http.Client{Timeout: 60 * time.Second}
 
 	dlReq, _ := http.NewRequest("GET", downloadURL, nil)
 	dlResp, err := client.Do(dlReq)
 	if err != nil {
-		return err
+		return zero, err
 	}
 	defer dlResp.Body.Close()
 
 	if dlResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: %d", dlResp.StatusCode)
+		return zero, fmt.Errorf("download failed: %d", dlResp.StatusCode)
 	}
 
 	encryptedData, err := io.ReadAll(dlResp.Body)
 	if err != nil {
-		return err
+		return zero, err
 	}
 
 	// Note: Checksum verification skipped - decryption success is the real validation
@@ -1418,7 +1425,7 @@ func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum strin
 		var err error
 		obs, err = encMgr.DecryptObservation(encryptedData)
 		if err != nil {
-			return fmt.Errorf("decrypt failed: %w", err)
+			return zero, fmt.Errorf("decrypt failed: %w", err)
 		}
 	}
 
@@ -1431,7 +1438,7 @@ func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum strin
 
 	// Save to local storage
 	if err := m.backend.SaveObservation(obs); err != nil {
-		return err
+		return zero, err
 	}
 
 	// Export to claude-mem with re-embedding if needed
@@ -1440,7 +1447,7 @@ func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum strin
 		log.Printf("[sync] Failed to export to claude-mem: %v", err)
 	}
 
-	return nil
+	return obs.Core.UpdatedAt, nil
 }
 
 func (m *SyncManager) deleteFromCloud(token string, id string) error {
