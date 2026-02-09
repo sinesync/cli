@@ -62,7 +62,11 @@ Use this after:
 }
 
 func runReembed(cmd *cobra.Command, args []string) error {
-	localStorage := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
 
 	// Initialize embedder
 	embedder, err := embeddings.NewProvider()
@@ -82,7 +86,7 @@ func runReembed(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	// Get all observations
-	observations, err := localStorage.ListObservations()
+	observations, err := backend.ListObservations()
 	if err != nil {
 		return fmt.Errorf("failed to list observations: %w", err)
 	}
@@ -105,7 +109,7 @@ func runReembed(cmd *cobra.Command, args []string) error {
 		obs.Embedding.Dims = embeddings.Dimensions
 		obs.Core.UpdatedAt = time.Now()
 
-		if err := localStorage.SaveObservation(&obs); err != nil {
+		if err := backend.SaveObservation(&obs); err != nil {
 			continue
 		}
 		updated++
@@ -267,11 +271,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  • Daemon unavailable — run 'sinesync daemon start'\n")
 		}
 	} else {
-		localStorage := storage.NewLocalStorage()
-		itemCount, storageBytes, _ := localStorage.GetStatus()
-		fmt.Printf("\nLocal storage:\n")
-		fmt.Printf("  • Observations: %d\n", itemCount)
-		fmt.Printf("  • Storage: %s\n", formatBytes(storageBytes))
+		backend, err := storage.ResolveBackend()
+		if err == nil {
+			defer backend.Close()
+			itemCount, storageBytes, _ := backend.GetStatus()
+			fmt.Printf("\nLocal storage:\n")
+			fmt.Printf("  • Observations: %d\n", itemCount)
+			fmt.Printf("  • Storage: %s\n", formatBytes(storageBytes))
+		} else {
+			fmt.Printf("\nLocal storage:\n")
+			fmt.Printf("  • Storage unavailable: %v\n", err)
+		}
 	}
 
 	// Embeddings
@@ -359,7 +369,11 @@ func runImport(cmd *cobra.Command, args []string) error {
 	defer adapter.Close()
 
 	// Initialize local storage
-	localStorage := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
 
 	// Initialize embedder (silently)
 	embedder, _ := embeddings.NewProvider()
@@ -382,7 +396,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 
 		// Check if already imported (by source adapter + machine + ID)
-		exists, _ := localStorage.ExistsBySource(obs.Source.Adapter, obs.Source.Machine, obs.Source.ID)
+		exists, _ := backend.ExistsBySource(obs.Source.Adapter, obs.Source.Machine, obs.Source.ID)
 		if exists {
 			skipped++
 			continue
@@ -405,7 +419,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 
 		// Save to local storage
-		if err := localStorage.SaveObservation(&obs); err != nil {
+		if err := backend.SaveObservation(&obs); err != nil {
 			continue
 		}
 		imported++
@@ -468,8 +482,12 @@ func runExport(cmd *cobra.Command, args []string) error {
 	defer adapter.Close()
 
 	// Get local observations
-	localStorage := storage.NewLocalStorage()
-	observations, err := localStorage.ListObservations()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
+	observations, err := backend.ListObservations()
 	if err != nil {
 		return fmt.Errorf("failed to list local observations: %w", err)
 	}

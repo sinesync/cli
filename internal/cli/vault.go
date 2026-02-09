@@ -608,10 +608,14 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get local storage
-	localStorage := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
 
 	// Get observations for this project
-	observations, err := localStorage.ListObservations()
+	observations, err := backend.ListObservations()
 	if err != nil {
 		return fmt.Errorf("failed to load observations: %w", err)
 	}
@@ -715,10 +719,14 @@ func runVaultReencrypt(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get local storage
-	localStorage := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
 
 	// Get observations
-	observations, err := localStorage.ListObservations()
+	observations, err := backend.ListObservations()
 	if err != nil {
 		return fmt.Errorf("failed to load observations: %w", err)
 	}
@@ -1300,10 +1308,14 @@ func migrateProjectObservations(projectName, toVaultID, token string) error {
 	}
 
 	// Get local storage
-	localStorage := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
 
 	// Get observations for this project
-	observations, err := localStorage.ListObservations()
+	observations, err := backend.ListObservations()
 	if err != nil {
 		return fmt.Errorf("failed to load observations: %w", err)
 	}

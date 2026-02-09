@@ -47,7 +47,7 @@ func NewSQLCipherStorage(dbPath string, key []byte) (*SQLCipherStorage, error) {
 	// new connection. This avoids the problem where database/sql reopens a
 	// connection that lacks the encryption key.
 	hexKey := hex.EncodeToString(key)
-	dsn := fmt.Sprintf("%s?_pragma_key=%s&_pragma_cipher_plaintext_header_size=0&_foreign_keys=1",
+	dsn := fmt.Sprintf("%s?_pragma_key=%s&_pragma_cipher_plaintext_header_size=0&_foreign_keys=1&_pragma_journal_mode=WAL&_pragma_busy_timeout=5000",
 		dbPath, url.QueryEscape("x'"+hexKey+"'"))
 
 	db, err := sql.Open("sqlite3", dsn)

@@ -76,7 +76,11 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	apiBase := getAPIBase()
-	localStorage := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
 
 	// Get cloud manifest once for both operations
 	fmt.Println("Fetching cloud manifest...")
@@ -94,7 +98,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	// Load local observations
 	fmt.Println("Loading local observations...")
-	observations, err := localStorage.ListObservations()
+	observations, err := backend.ListObservations()
 	if err != nil {
 		return fmt.Errorf("failed to load local observations: %w", err)
 	}
@@ -306,7 +310,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		if err := localStorage.SaveObservation(obs); err != nil {
+		if err := backend.SaveObservation(obs); err != nil {
 			pullErrors++
 			lastPullError = fmt.Sprintf("save %s: %v", item.ID, err)
 			if pullErrors == 1 {
@@ -378,10 +382,14 @@ func runSyncPush(cmd *cobra.Command, args []string) error {
 	}
 
 	apiBase := getAPIBase()
-	localStorage := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
 
 	fmt.Println("Loading local observations...")
-	observations, err := localStorage.ListObservations()
+	observations, err := backend.ListObservations()
 	if err != nil {
 		return fmt.Errorf("failed to load local observations: %w", err)
 	}
@@ -469,7 +477,11 @@ func runSyncPull(cmd *cobra.Command, args []string) error {
 	}
 
 	apiBase := getAPIBase()
-	localStorage := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		return fmt.Errorf("failed to open storage: %w", err)
+	}
+	defer backend.Close()
 
 	fmt.Println("Fetching cloud manifest...")
 	manifest, err := withTokenRefresh(apiBase, &token, func(t string) (*manifestResponse, error) {
@@ -492,8 +504,8 @@ func runSyncPull(cmd *cobra.Command, args []string) error {
 		}
 
 		// Check if already exists locally
-		exists, _ := localStorage.Exists("observation", item.ID)
-		if exists {
+		_, getErr := backend.GetObservation(item.ID)
+		if getErr == nil {
 			skipped++
 			continue
 		}
@@ -513,7 +525,7 @@ func runSyncPull(cmd *cobra.Command, args []string) error {
 		}
 
 		// Save locally
-		if err := localStorage.SaveObservation(obs); err != nil {
+		if err := backend.SaveObservation(obs); err != nil {
 			errors++
 			continue
 		}

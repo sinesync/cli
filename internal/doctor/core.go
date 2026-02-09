@@ -127,7 +127,7 @@ func checkJSONIntegrity(ctx context.Context, fix bool) CheckResult {
 	return result
 }
 
-// checkSourceIndex verifies the source index matches actual files on disk
+// checkSourceIndex verifies the source index matches actual observations
 func checkSourceIndex(ctx context.Context, fix bool) CheckResult {
 	result := CheckResult{
 		Name:     "Source index consistency",
@@ -136,10 +136,15 @@ func checkSourceIndex(ctx context.Context, fix bool) CheckResult {
 		CanFix:   true,
 	}
 
-	ls := storage.NewLocalStorage()
+	backend, err := storage.ResolveBackend()
+	if err != nil {
+		result.Status = StatusFail
+		result.Message = fmt.Sprintf("Cannot open storage: %v", err)
+		return result
+	}
+	defer backend.Close()
 
-	// Build index from disk
-	items, err := ls.List("observation")
+	observations, err := backend.ListObservations()
 	if err != nil {
 		result.Status = StatusFail
 		result.Message = fmt.Sprintf("Cannot list observations: %v", err)
@@ -148,24 +153,24 @@ func checkSourceIndex(ctx context.Context, fix bool) CheckResult {
 
 	// Count observations with source info
 	withSource := 0
-	for _, item := range items {
-		dataBytes, _ := json.Marshal(item.Data)
-		var obs storage.Observation
-		if err := json.Unmarshal(dataBytes, &obs); err == nil {
-			if obs.Source.Adapter != "" && obs.Source.ID != "" {
-				withSource++
-			}
+	for _, obs := range observations {
+		if obs.Source.Adapter != "" && obs.Source.ID != "" {
+			withSource++
 		}
 	}
 
 	result.Status = StatusPass
-	result.Message = fmt.Sprintf("%d observations on disk, %d with source tracking", len(items), withSource)
+	result.Message = fmt.Sprintf("%d observations, %d with source tracking", len(observations), withSource)
 
 	if fix {
-		// Invalidate and rebuild the source index
-		ls.InvalidateSourceIndex()
-		ls.ExistsBySource("__doctor_check__", "", "0")
-		result.Message += " (index rebuilt)"
+		// Source index rebuild only applies to JSON file storage
+		if ls, ok := backend.(*storage.LocalStorage); ok {
+			ls.InvalidateSourceIndex()
+			ls.ExistsBySource("__doctor_check__", "", "0")
+			result.Message += " (index rebuilt)"
+		} else {
+			result.Message += " (SQLCipher — no index rebuild needed)"
+		}
 	}
 
 	return result

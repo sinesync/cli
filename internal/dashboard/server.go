@@ -29,10 +29,10 @@ const (
 
 // Server is the dashboard HTTP server
 type Server struct {
-	port         int
-	localStorage *storage.LocalStorage
-	config       *config.Config
-	httpServer   *http.Server
+	port       int
+	backend    storage.StorageBackend
+	config     *config.Config
+	httpServer *http.Server
 }
 
 // NewServer creates a new dashboard server
@@ -43,10 +43,18 @@ func NewServer(port int) *Server {
 
 	cfg, _ := config.Load()
 
+	// Try SQLCipher backend, fall back to JSON (dashboard is best-effort)
+	var backend storage.StorageBackend
+	if b, err := storage.ResolveBackend(); err == nil {
+		backend = b
+	} else {
+		backend = storage.NewLocalStorage()
+	}
+
 	return &Server{
-		port:         port,
-		localStorage: storage.NewLocalStorage(),
-		config:       cfg,
+		port:    port,
+		backend: backend,
+		config:  cfg,
 	}
 }
 
@@ -103,7 +111,7 @@ func (s *Server) Stop() error {
 // API Handlers
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	observations, _ := s.localStorage.ListObservations()
+	observations, _ := s.backend.ListObservations()
 
 	// Calculate stats
 	stats := map[string]interface{}{
@@ -117,7 +125,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Storage stats
-	itemCount, storageBytes, _ := s.localStorage.GetStatus()
+	itemCount, storageBytes, _ := s.backend.GetStatus()
 	stats["storageItems"] = itemCount
 	stats["storageBytes"] = storageBytes
 
@@ -165,7 +173,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleObservations(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		observations, _ := s.localStorage.ListObservations()
+		observations, _ := s.backend.ListObservations()
 
 		// Apply filters from query params
 		query := r.URL.Query()
@@ -288,7 +296,7 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
-		obs, err := s.localStorage.GetObservation(id)
+		obs, err := s.backend.GetObservation(id)
 		if err != nil {
 			http.Error(w, "Not found", http.StatusNotFound)
 			return
@@ -297,7 +305,7 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 
 	case "PATCH":
 		// Update observation metadata
-		obs, err := s.localStorage.GetObservation(id)
+		obs, err := s.backend.GetObservation(id)
 		if err != nil {
 			http.Error(w, "Not found", http.StatusNotFound)
 			return
@@ -334,7 +342,7 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 
 		obs.Core.UpdatedAt = time.Now()
 
-		if err := s.localStorage.SaveObservation(obs); err != nil {
+		if err := s.backend.SaveObservation(obs); err != nil {
 			http.Error(w, "Failed to save", http.StatusInternalServerError)
 			return
 		}
@@ -342,7 +350,7 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, observationToMap(*obs, false))
 
 	case "DELETE":
-		if err := s.localStorage.Delete("observation", id); err != nil {
+		if err := s.backend.DeleteObservation(id); err != nil {
 			http.Error(w, "Failed to delete", http.StatusInternalServerError)
 			return
 		}
@@ -354,7 +362,7 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
-	observations, _ := s.localStorage.ListObservations()
+	observations, _ := s.backend.ListObservations()
 
 	projects := make(map[string]int)
 	for _, obs := range observations {
@@ -387,7 +395,7 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
-	observations, _ := s.localStorage.ListObservations()
+	observations, _ := s.backend.ListObservations()
 
 	tags := make(map[string]int)
 	for _, obs := range observations {
@@ -430,7 +438,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	observations, _ := s.localStorage.ListObservations()
+	observations, _ := s.backend.ListObservations()
 
 	// Generate query embedding using ONNX if available
 	embedder, _ := embeddings.NewProvider()
