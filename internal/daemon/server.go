@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,6 +46,11 @@ type Server struct {
 	obsCacheTime  time.Time
 	obsCacheTTL   time.Duration
 	obsCacheMu    sync.Mutex
+
+	// Async hook processing queue
+	hookQueue    chan func()
+	hookDone     chan struct{}
+	hookShutdown atomic.Bool
 }
 
 // NewServer creates a new daemon server
@@ -192,6 +198,35 @@ func (s *Server) invalidateCache() {
 	s.obsCacheMu.Unlock()
 }
 
+// processHookQueue drains the async work queue with panic recovery.
+func (s *Server) processHookQueue() {
+	defer close(s.hookDone)
+	for work := range s.hookQueue {
+		s.safeExec(work)
+	}
+}
+
+func (s *Server) safeExec(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[hook] Panic in queued work: %v", r)
+		}
+	}()
+	fn()
+}
+
+// enqueueHook submits work to the async queue. Drops if shutting down or full.
+func (s *Server) enqueueHook(fn func()) {
+	if s.hookShutdown.Load() {
+		return
+	}
+	select {
+	case s.hookQueue <- fn:
+	default:
+		log.Printf("[hook] Queue full, dropping work item")
+	}
+}
+
 // Run starts the server and blocks until shutdown
 func (s *Server) Run() error {
 	mux := http.NewServeMux()
@@ -243,6 +278,11 @@ func (s *Server) Run() error {
 		return fmt.Errorf("failed to write PID file: %w", err)
 	}
 
+	// Start async hook processing queue
+	s.hookQueue = make(chan func(), 256)
+	s.hookDone = make(chan struct{})
+	go s.processHookQueue()
+
 	// Start background sync
 	s.syncManager.Start()
 
@@ -254,9 +294,12 @@ func (s *Server) Run() error {
 		<-sigChan
 		log.Printf("[daemon] Shutting down...")
 		s.syncManager.Stop()
+		s.hookShutdown.Store(true)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		s.httpServer.Shutdown(ctx)
+		s.httpServer.Shutdown(ctx) // stop accepting, wait for in-flight handlers
+		close(s.hookQueue)
+		<-s.hookDone // drain queued work
 		if err := s.backend.Close(); err != nil {
 			log.Printf("[daemon] Error closing storage backend: %v", err)
 		}
@@ -437,10 +480,8 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read hook input
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("[capture] Failed to read body: %v", err)
 		http.Error(w, "Failed to read body", http.StatusBadRequest)
 		return
 	}
@@ -454,49 +495,49 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.Unmarshal(body, &hookInput); err != nil {
-		log.Printf("[capture] Invalid JSON: %v", err)
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("[capture] Received: tool=%s session=%s cwd=%s", hookInput.ToolName, hookInput.SessionID, hookInput.CWD)
-
 	// Skip tools that don't produce meaningful observations
 	skipTools := map[string]bool{
-		"Read": true, "Glob": true, "Grep": true, // Read-only tools
+		"Read": true, "Glob": true, "Grep": true,
 		"ListMcpResourcesTool": true, "SlashCommand": true,
 		"Skill": true, "TodoWrite": true, "AskUserQuestion": true,
 		"TaskList": true, "TaskGet": true,
 	}
 
 	if skipTools[hookInput.ToolName] {
-		log.Printf("[capture] Skipped: read-only tool %s", hookInput.ToolName)
-		writeJSON(w, map[string]interface{}{"status": "skipped", "reason": "read-only tool"})
+		writeJSON(w, map[string]interface{}{"status": "skipped"})
 		return
 	}
 
-	// Extract project from CWD
-	project := filepath.Base(hookInput.CWD)
+	// Ack immediately — do heavy work (extraction, embedding, save) async
+	writeJSON(w, map[string]interface{}{"status": "accepted"})
 
-	// Parse tool input for context (handles both string and object)
+	s.enqueueHook(func() {
+		s.processCapture(hookInput.SessionID, hookInput.ToolName, hookInput.ToolInput, hookInput.ToolResponse, hookInput.CWD)
+	})
+}
+
+// processCapture does the actual observation extraction, embedding, and save.
+func (s *Server) processCapture(sessionID, toolName string, toolInput, toolResponse json.RawMessage, cwd string) {
+	project := filepath.Base(cwd)
+	log.Printf("[capture] Processing: tool=%s session=%s project=%s", toolName, sessionID, project)
+
 	var toolInputData map[string]interface{}
-	json.Unmarshal(hookInput.ToolInput, &toolInputData)
+	json.Unmarshal(toolInput, &toolInputData)
 
-	// Convert tool response to string (handles both string and object JSON)
-	var toolResponse string
-	if err := json.Unmarshal(hookInput.ToolResponse, &toolResponse); err != nil {
-		// Not a JSON string — use raw JSON as the string representation
-		toolResponse = string(hookInput.ToolResponse)
+	var toolResponseStr string
+	if err := json.Unmarshal(toolResponse, &toolResponseStr); err != nil {
+		toolResponseStr = string(toolResponse)
 	}
 
-	// Determine observation type and extract details
-	obs := s.extractObservation(hookInput.ToolName, toolInputData, toolResponse, project)
+	obs := s.extractObservation(toolName, toolInputData, toolResponseStr, project)
 	if obs == nil {
-		writeJSON(w, map[string]interface{}{"status": "skipped", "reason": "no observation extracted"})
 		return
 	}
 
-	// Generate embedding with metadata
 	textForEmbedding := obs.TextForEmbedding()
 	if s.embedder != nil && s.embedder.IsReady() {
 		embedding, err := s.embedder.Embed(textForEmbedding)
@@ -512,29 +553,21 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[capture] WARNING: embedder not available, observation %s will have no embedding", obs.ID)
 	}
 
-	// Set session ID on observation
-	obs.Core.SessionID = hookInput.SessionID
+	obs.Core.SessionID = sessionID
 
-	// Save observation
 	if err := s.backend.SaveObservation(obs); err != nil {
-		http.Error(w, "Failed to save observation", http.StatusInternalServerError)
+		log.Printf("[capture] Failed to save observation: %v", err)
 		return
 	}
 	s.invalidateCache()
 
-	// Increment session observation count if using SQLCipher
-	if hookInput.SessionID != "" {
+	if sessionID != "" {
 		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
-			_ = sqlBackend.IncrementSessionObservationCount(hookInput.SessionID)
+			_ = sqlBackend.IncrementSessionObservationCount(sessionID)
 		}
 	}
 
-	writeJSON(w, map[string]interface{}{
-		"status": "captured",
-		"id":     obs.ID,
-		"title":  obs.Core.Title,
-		"type":   obs.Core.Type,
-	})
+	log.Printf("[capture] Saved: id=%s title=%s type=%s", obs.ID, obs.Core.Title, obs.Core.Type)
 }
 
 func (s *Server) extractObservation(toolName string, toolInput map[string]interface{}, toolResponse, project string) *storage.Observation {
@@ -746,7 +779,6 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read hook input
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read body", http.StatusBadRequest)
@@ -760,13 +792,22 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.Unmarshal(body, &hookInput); err != nil {
-		// Use defaults if parsing fails
 		hookInput.CWD, _ = os.Getwd()
 	}
 
+	// Ack immediately — queue summary generation
+	writeJSON(w, map[string]interface{}{"status": "accepted"})
+
+	sessionID := hookInput.SessionID
 	project := filepath.Base(hookInput.CWD)
 
-	// Get recent observations from this session (last hour as proxy)
+	s.enqueueHook(func() {
+		s.processSummarize(sessionID, project)
+	})
+}
+
+// processSummarize generates and saves a session summary observation.
+func (s *Server) processSummarize(sessionID, project string) {
 	observations := s.getObservations()
 	hourAgo := time.Now().Add(-1 * time.Hour)
 
@@ -778,18 +819,11 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(sessionObs) == 0 {
-		writeJSON(w, map[string]interface{}{
-			"status":  "skipped",
-			"reason":  "no observations in session",
-			"project": project,
-		})
+		log.Printf("[summarize] No observations for session=%s project=%s", sessionID, project)
 		return
 	}
 
-	// Create session summary observation
 	now := time.Now()
-
-	// Collect stats
 	typeCount := make(map[string]int)
 	var files []string
 	var titles []string
@@ -806,7 +840,6 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build summary text
 	var summaryParts []string
 	for t, c := range typeCount {
 		summaryParts = append(summaryParts, fmt.Sprintf("%d %s", c, t))
@@ -815,7 +848,7 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 	summary := &storage.Observation{
 		ID: generateID(),
 		Core: storage.Core{
-			Type:      "decision", // Session summaries are like decisions/milestones
+			Type:      "decision",
 			Title:     fmt.Sprintf("Session summary: %s", project),
 			Summary:   fmt.Sprintf("Session included %s across %d files", strings.Join(summaryParts, ", "), len(files)),
 			Project:   project,
@@ -830,12 +863,11 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 		},
 		Source: storage.Source{
 			Adapter: "sinesync",
-			ID:      hookInput.SessionID,
+			ID:      sessionID,
 			Epoch:   now.Unix(),
 		},
 	}
 
-	// Generate embedding with metadata
 	textForEmbedding := summary.TextForEmbedding()
 	if s.embedder != nil && s.embedder.IsReady() {
 		embedding, err := s.embedder.Embed(textForEmbedding)
@@ -847,33 +879,24 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Printf("[summarize] WARNING: embedding failed for summary %s: %v", summary.ID, err)
 		}
-	} else {
-		log.Printf("[summarize] WARNING: embedder not available, summary %s will have no embedding", summary.ID)
 	}
 
-	// Save
 	if err := s.backend.SaveObservation(summary); err != nil {
-		http.Error(w, "Failed to save summary", http.StatusInternalServerError)
+		log.Printf("[summarize] Failed to save summary: %v", err)
 		return
 	}
 	s.invalidateCache()
 
-	// Complete session in SQLCipher
-	if hookInput.SessionID != "" {
+	if sessionID != "" {
 		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
 			summaryText := fmt.Sprintf("Session included %s across %d files", strings.Join(summaryParts, ", "), len(files))
-			_ = sqlBackend.CompleteSession(hookInput.SessionID, time.Now(), summaryText, len(sessionObs))
-			_ = sqlBackend.InsertSessionSummary(hookInput.SessionID, project, summaryText, len(sessionObs), files, time.Now().Unix())
+			_ = sqlBackend.CompleteSession(sessionID, time.Now(), summaryText, len(sessionObs))
+			_ = sqlBackend.InsertSessionSummary(sessionID, project, summaryText, len(sessionObs), files, time.Now().Unix())
 		}
 	}
 
-	writeJSON(w, map[string]interface{}{
-		"status":           "summarized",
-		"id":               summary.ID,
-		"observationCount": len(sessionObs),
-		"fileCount":        len(files),
-		"project":          project,
-	})
+	log.Printf("[summarize] Saved summary for session=%s project=%s (%d observations, %d files)",
+		sessionID, project, len(sessionObs), len(files))
 }
 
 func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
@@ -900,42 +923,38 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hookInput.Prompt == "" {
-		writeJSON(w, map[string]interface{}{"status": "skipped", "reason": "empty prompt"})
+		writeJSON(w, map[string]interface{}{"status": "skipped"})
 		return
 	}
 
+	// Ack immediately — queue DB writes
+	writeJSON(w, map[string]interface{}{"status": "accepted"})
+
+	sessionID := hookInput.SessionID
+	prompt := hookInput.Prompt
 	project := filepath.Base(hookInput.CWD)
 
-	// Track in SQLCipher if available
-	if hookInput.SessionID != "" {
-		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
-			_ = sqlBackend.EnsureSession(hookInput.SessionID, project, time.Now().Unix())
-
-			// Get next prompt number for this session
-			promptNumber := 1
-			if err := sqlBackend.DB().QueryRow(
-				"SELECT COALESCE(MAX(prompt_number), 0) + 1 FROM user_prompts WHERE session_id = ?",
-				hookInput.SessionID,
-			).Scan(&promptNumber); err != nil {
-				log.Printf("[prompt] Failed to get prompt number for session=%s: %v", hookInput.SessionID, err)
-			}
-
-			_ = sqlBackend.InsertUserPrompt(
-				hookInput.SessionID,
-				hookInput.Prompt,
-				project,
-				promptNumber,
-				time.Now().Unix(),
-			)
+	s.enqueueHook(func() {
+		if sessionID == "" {
+			return
 		}
-	}
+		sqlBackend, ok := s.backend.(*storage.SQLCipherStorage)
+		if !ok {
+			return
+		}
 
-	log.Printf("[prompt] Recorded prompt for session=%s project=%s", hookInput.SessionID, project)
+		_ = sqlBackend.EnsureSession(sessionID, project, time.Now().Unix())
 
-	writeJSON(w, map[string]interface{}{
-		"status":  "recorded",
-		"session": hookInput.SessionID,
-		"project": project,
+		promptNumber := 1
+		if err := sqlBackend.DB().QueryRow(
+			"SELECT COALESCE(MAX(prompt_number), 0) + 1 FROM user_prompts WHERE session_id = ?",
+			sessionID,
+		).Scan(&promptNumber); err != nil {
+			log.Printf("[prompt] Failed to get prompt number for session=%s: %v", sessionID, err)
+		}
+
+		_ = sqlBackend.InsertUserPrompt(sessionID, prompt, project, promptNumber, time.Now().Unix())
+		log.Printf("[prompt] Recorded prompt for session=%s project=%s", sessionID, project)
 	})
 }
 

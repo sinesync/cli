@@ -16,7 +16,9 @@ import (
 )
 
 // Hook commands - thin CLI wrappers that call daemon API
-// These are called by Claude Code hooks
+// These are called by Claude Code hooks.
+// They POST directly to the daemon's known port without checking if it's
+// running — the daemon is already started by "sinesync setup".
 
 var contextCmd = &cobra.Command{
 	Use:    "context",
@@ -75,48 +77,47 @@ type HookInput struct {
 	Prompt string `json:"prompt,omitempty"`
 }
 
-func runContext(cmd *cobra.Command, args []string) error {
-	// Ensure daemon is running
-	info, err := daemon.EnsureRunning()
-	if err != nil {
-		return fmt.Errorf("failed to start daemon: %w", err)
-	}
+func daemonURL(path string) string {
+	return fmt.Sprintf("http://127.0.0.1:%d%s", daemon.DefaultPort, path)
+}
 
-	// Read hook input from stdin
+// hookClient is a shared HTTP client with a short timeout for fire-and-forget hooks.
+var hookClient = &http.Client{Timeout: 3 * time.Second}
+
+// contextClient has a longer timeout since context injection reads the full response.
+var contextClient = &http.Client{Timeout: 10 * time.Second}
+
+// runContext needs the response (injected into Claude Code's context via stdout),
+// so it waits for the full response. Uses a longer timeout than fire-and-forget hooks.
+func runContext(cmd *cobra.Command, args []string) error {
 	var input HookInput
 	if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil {
-		// If no stdin, use defaults
 		input.CWD, _ = os.Getwd()
 	}
 
-	// Extract project name from CWD
 	project := filepath.Base(input.CWD)
 
-	// Check auth status and print user-visible message
-	authStatus := checkAuthStatus(info.Port)
+	// Check auth status
+	authStatus := checkAuthStatus()
 	if authStatus != "" {
 		fmt.Fprintf(os.Stderr, "\n[sine~sync] %s\n\n", authStatus)
 	}
 
-	// Call daemon API
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/context?project=%s&session_id=%s",
-		info.Port, url.QueryEscape(project), url.QueryEscape(input.SessionID))
+	apiURL := daemonURL(fmt.Sprintf("/api/context?project=%s&session_id=%s",
+		url.QueryEscape(project), url.QueryEscape(input.SessionID)))
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(apiURL)
+	resp, err := contextClient.Get(apiURL)
 	if err != nil {
-		return fmt.Errorf("failed to call daemon: %w", err)
+		return nil // Daemon not available — silently skip
 	}
 	defer resp.Body.Close()
 
-	// Forward response to stdout
 	_, err = io.Copy(os.Stdout, resp.Body)
 	return err
 }
 
-func checkAuthStatus(port int) string {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/sync", port))
+func checkAuthStatus() string {
+	resp, err := hookClient.Get(daemonURL("/api/sync"))
 	if err != nil {
 		return ""
 	}
@@ -125,7 +126,6 @@ func checkAuthStatus(port int) string {
 	var status struct {
 		Authenticated bool   `json:"authenticated"`
 		SyncError     string `json:"syncError"`
-		Syncing       bool   `json:"syncing"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		return ""
@@ -140,86 +140,51 @@ func checkAuthStatus(port int) string {
 	return ""
 }
 
-func runCapture(cmd *cobra.Command, args []string) error {
-	// Ensure daemon is running
-	info, err := daemon.EnsureRunning()
-	if err != nil {
-		return fmt.Errorf("failed to start daemon: %w", err)
-	}
+// Fire-and-forget hooks: POST to daemon, drain and close body for keep-alive.
 
-	// Read hook input from stdin
+func drainClose(resp *http.Response) {
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
+func runCapture(cmd *cobra.Command, args []string) error {
 	inputData, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		return fmt.Errorf("failed to read stdin: %w", err)
+		return nil
 	}
 
-	// Call daemon API
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/capture", info.Port)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(apiURL, "application/json", bytes.NewReader(inputData))
+	resp, err := hookClient.Post(daemonURL("/api/capture"), "application/json", bytes.NewReader(inputData))
 	if err != nil {
-		return fmt.Errorf("failed to call daemon: %w", err)
+		return nil // Daemon not available — silently skip
 	}
-	defer resp.Body.Close()
-
-	// Forward response to stdout
-	_, err = io.Copy(os.Stdout, resp.Body)
-	return err
+	drainClose(resp)
+	return nil
 }
 
 func runSummarize(cmd *cobra.Command, args []string) error {
-	// Ensure daemon is running
-	info, err := daemon.EnsureRunning()
-	if err != nil {
-		return fmt.Errorf("failed to start daemon: %w", err)
-	}
-
-	// Read hook input from stdin
 	inputData, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		return fmt.Errorf("failed to read stdin: %w", err)
+		return nil
 	}
 
-	// Call daemon API
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/summarize", info.Port)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(apiURL, "application/json", bytes.NewReader(inputData))
+	resp, err := hookClient.Post(daemonURL("/api/summarize"), "application/json", bytes.NewReader(inputData))
 	if err != nil {
-		return fmt.Errorf("failed to call daemon: %w", err)
+		return nil // Daemon not available — silently skip
 	}
-	defer resp.Body.Close()
-
-	// Forward response to stdout
-	_, err = io.Copy(os.Stdout, resp.Body)
-	return err
+	drainClose(resp)
+	return nil
 }
 
 func runPrompt(cmd *cobra.Command, args []string) error {
-	// Ensure daemon is running
-	info, err := daemon.EnsureRunning()
-	if err != nil {
-		return fmt.Errorf("failed to start daemon: %w", err)
-	}
-
-	// Read hook input from stdin
 	inputData, err := io.ReadAll(os.Stdin)
 	if err != nil {
-		return fmt.Errorf("failed to read stdin: %w", err)
+		return nil
 	}
 
-	// Call daemon API
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/prompt", info.Port)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(apiURL, "application/json", bytes.NewReader(inputData))
+	resp, err := hookClient.Post(daemonURL("/api/prompt"), "application/json", bytes.NewReader(inputData))
 	if err != nil {
-		return fmt.Errorf("failed to call daemon: %w", err)
+		return nil // Daemon not available — silently skip
 	}
-	defer resp.Body.Close()
-
-	// Forward response to stdout
-	_, err = io.Copy(os.Stdout, resp.Body)
-	return err
+	drainClose(resp)
+	return nil
 }
