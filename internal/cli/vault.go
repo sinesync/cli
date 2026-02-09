@@ -1013,6 +1013,17 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 		}
 		keyResp.Body.Close()
 
+		// Normalize the encrypted vault key to AES-GCM format
+		// Vault owners already have AES-GCM keys; invited members have X25519-sealed keys
+		if keyResult.EncryptedVaultKey != "" {
+			normalizedKey, err := normalizeVaultKey(keyResult.EncryptedVaultKey, token)
+			if err != nil {
+				fmt.Printf("  Warning: failed to normalize key for vault %s: %v\n", v.Name, err)
+			} else {
+				keyResult.EncryptedVaultKey = normalizedKey
+			}
+		}
+
 		// Preserve existing local project mappings
 		projects := existingProjects[v.ID]
 		if projects == nil {
@@ -1961,4 +1972,69 @@ func runVaultPending(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// normalizeVaultKey ensures the encrypted vault key is in AES-GCM format.
+// Vault owners already have AES-GCM keys. Invited members have X25519-sealed keys
+// from the invite confirmation flow. This converts X25519 keys to AES-GCM so that
+// vaults.json always contains a consistent format for the daemon and CLI.
+func normalizeVaultKey(encryptedKey string, token string) (string, error) {
+	encMgr := encryption.GetManager()
+
+	// Try AES-GCM first (vault owner case) — if it works, key is already normalized
+	if _, err := encMgr.DecryptVaultKey(encryptedKey); err == nil {
+		return encryptedKey, nil
+	}
+
+	// AES-GCM failed → try X25519 (invited member case)
+	privateKey, err := fetchAndDecryptPrivateKey(token)
+	if err != nil {
+		return "", fmt.Errorf("cannot decrypt X25519 vault key: %w", err)
+	}
+
+	vaultKeyBytes, err := crypto.X25519Open(encryptedKey, privateKey)
+	if err != nil {
+		return "", fmt.Errorf("X25519 decrypt failed: %w", err)
+	}
+
+	// Re-encrypt as AES-GCM so local storage always uses consistent format
+	normalized, err := encMgr.EncryptVaultKey(vaultKeyBytes)
+	if err != nil {
+		return "", fmt.Errorf("re-encrypt vault key: %w", err)
+	}
+
+	return normalized, nil
+}
+
+// fetchAndDecryptPrivateKey retrieves the user's encrypted X25519 private key
+// from the server and decrypts it with the local derived key.
+func fetchAndDecryptPrivateKey(token string) (string, error) {
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequest("GET", apiBase+"/users/keypair", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch keypair: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("keypair fetch returned status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		EncryptedPrivateKey string `json:"encryptedPrivateKey"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	encMgr := encryption.GetManager()
+	return encMgr.DecryptUserPrivateKey(result.EncryptedPrivateKey)
 }
