@@ -1286,6 +1286,10 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, expectedChecksu
 		}
 	}
 
+	// Clear session_id for pulled observations — the referenced session
+	// exists on the source device, not locally, and would violate the FK constraint
+	obs.Core.SessionID = ""
+
 	// Save to local storage
 	if err := m.backend.SaveObservation(obs); err != nil {
 		return err
@@ -1420,6 +1424,10 @@ func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum strin
 
 	// Standardize embedding for local search compatibility
 	standardizeEmbedding(obs)
+
+	// Clear session_id for pulled observations — the referenced session
+	// exists on the source device, not locally, and would violate the FK constraint
+	obs.Core.SessionID = ""
 
 	// Save to local storage
 	if err := m.backend.SaveObservation(obs); err != nil {
