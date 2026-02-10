@@ -14,6 +14,7 @@ import (
 
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/crypto"
+	"github.com/miclip/sinesync/internal/httputil"
 	"github.com/miclip/sinesync/internal/storage"
 )
 
@@ -143,6 +144,7 @@ func (c *Client) GetManifest() ([]ManifestItem, error) {
 
 	req.Header.Set("Authorization", "Bearer "+c.authToken)
 	req.Header.Set("X-Device-ID", c.deviceID)
+	httputil.SetClientHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -184,6 +186,7 @@ func (c *Client) Push(obs *storage.Observation) error {
 	req.Header.Set("Authorization", "Bearer "+c.authToken)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Device-ID", c.deviceID)
+	httputil.SetClientHeaders(req)
 	req.Header.Set("X-Item-ID", obs.ID)
 	req.Header.Set("X-Timestamp", obs.Core.UpdatedAt.Format(time.RFC3339))
 	req.Header.Set("X-Checksum", checksum)
@@ -214,6 +217,7 @@ func (c *Client) Pull(id string) (*storage.Observation, error) {
 
 	req.Header.Set("Authorization", "Bearer "+c.authToken)
 	req.Header.Set("X-Device-ID", c.deviceID)
+	httputil.SetClientHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -313,6 +317,7 @@ func (c *Client) GetStatus() (map[string]interface{}, error) {
 
 	req.Header.Set("Authorization", "Bearer "+c.authToken)
 	req.Header.Set("X-Device-ID", c.deviceID)
+	httputil.SetClientHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

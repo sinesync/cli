@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/miclip/sinesync/internal/config"
+	"github.com/miclip/sinesync/internal/httputil"
 )
 
 const (
@@ -66,6 +67,7 @@ func (p *SinesyncProvider) Push(ctx context.Context, id string, data []byte, met
 	req.Header.Set("X-Checksum", meta.Checksum)
 	req.Header.Set("X-Project", meta.Project)
 	req.Header.Set("X-Device-ID", meta.DeviceID)
+	httputil.SetClientHeaders(req)
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -90,6 +92,7 @@ func (p *SinesyncProvider) Pull(ctx context.Context, id string) ([]byte, error) 
 	}
 
 	req.Header.Set("Authorization", "Bearer "+p.authToken)
+	httputil.SetClientHeaders(req)
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -117,6 +120,7 @@ func (p *SinesyncProvider) Delete(ctx context.Context, id string) error {
 	}
 
 	req.Header.Set("Authorization", "Bearer "+p.authToken)
+	httputil.SetClientHeaders(req)
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -136,6 +140,7 @@ func (p *SinesyncProvider) GetManifest(ctx context.Context) ([]ManifestItem, err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+p.authToken)
+	httputil.SetClientHeaders(req)
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -166,6 +171,7 @@ func (p *SinesyncProvider) GetMetadata(ctx context.Context, id string) (*Metadat
 	}
 
 	req.Header.Set("Authorization", "Bearer "+p.authToken)
+	httputil.SetClientHeaders(req)
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {

@@ -17,6 +17,7 @@ import (
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/miclip/sinesync/internal/encryption"
+	"github.com/miclip/sinesync/internal/httputil"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
 	kr "github.com/zalando/go-keyring"
@@ -833,6 +834,7 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 		req, _ := http.NewRequest("POST", apiBase+"/sync/upload-urls", bytes.NewReader(bodyBytes))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(req)
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -899,6 +901,7 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 		confirmReq, _ := http.NewRequest("POST", apiBase+"/sync/confirm-uploads", bytes.NewReader(confirmBytes))
 		confirmReq.Header.Set("Content-Type", "application/json")
 		confirmReq.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(confirmReq)
 
 		confirmResp, err := client.Do(confirmReq)
 		if err != nil {
@@ -1060,6 +1063,7 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 // refreshes the access token and retries once. The token pointer is updated on refresh.
 func doVaultRequest(client *http.Client, req *http.Request, token *string) (*http.Response, error) {
 	req.Header.Set("Authorization", "Bearer "+*token)
+	httputil.SetClientHeaders(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1147,6 +1151,7 @@ func setupVaultKey(token, vaultID, vaultName string) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -2030,6 +2035,7 @@ func fetchAndDecryptPrivateKey(token string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {

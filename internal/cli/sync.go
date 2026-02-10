@@ -14,6 +14,7 @@ import (
 	"github.com/miclip/sinesync/internal/adapters"
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/encryption"
+	"github.com/miclip/sinesync/internal/httputil"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
 )
@@ -597,6 +598,7 @@ func fetchSyncStatus(apiBase, token string) (*syncStatus, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -683,6 +685,7 @@ func getCloudManifest(apiBase, token string) (*manifestResponse, error) {
 				return nil, reqErr
 			}
 			req.Header.Set("Authorization", "Bearer "+token)
+			httputil.SetClientHeaders(req)
 
 			resp, err = client.Do(req)
 			if err != nil {
@@ -775,6 +778,7 @@ func getUploadUrlsBatch(apiBase, token string, items []pendingItem) ([]uploadURL
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(req)
 
 		resp, err = client.Do(req)
 		if err != nil {
@@ -850,6 +854,7 @@ func confirmUploadsBatch(apiBase, token string, items []map[string]interface{}) 
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(req)
 
 		resp, err = client.Do(req)
 		if err != nil {
@@ -901,6 +906,7 @@ func pushToCloud(apiBase, token, id, itemType, vaultID string, data []byte) erro
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
@@ -957,6 +963,7 @@ func pushToCloud(apiBase, token, id, itemType, vaultID string, data []byte) erro
 	}
 	req3.Header.Set("Content-Type", "application/json")
 	req3.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req3)
 
 	resp3, err := client.Do(req3)
 	if err != nil {
@@ -981,6 +988,7 @@ func pullFromCloud(apiBase, token, id string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)

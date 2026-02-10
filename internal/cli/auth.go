@@ -17,6 +17,7 @@ import (
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/encryption"
+	"github.com/miclip/sinesync/internal/httputil"
 	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/srp"
 	"github.com/spf13/cobra"
@@ -400,6 +401,7 @@ func runLogout(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to create logout request: %v\n", err)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(req)
 		client := &http.Client{Timeout: 10 * time.Second}
 		client.Do(req) // Ignore response errors, we're logging out anyway
 	}
@@ -459,6 +461,7 @@ func generateAndUploadKeypair(token string, showSuccess bool) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -490,6 +493,7 @@ func checkAndGenerateKeypair(token string) error {
 		return nil // Don't fail login for this
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
@@ -556,6 +560,7 @@ func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
 		return nil, err
 	}
 	initReq.Header.Set("Content-Type", "application/json")
+	httputil.SetClientHeaders(initReq)
 	initResp, err := authHTTPClient.Do(initReq)
 	if err != nil {
 		return nil, err
@@ -592,6 +597,7 @@ func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
 		return nil, err
 	}
 	verifyReq.Header.Set("Content-Type", "application/json")
+	httputil.SetClientHeaders(verifyReq)
 	verifyResp, err := authHTTPClient.Do(verifyReq)
 	if err != nil {
 		return nil, err
@@ -642,6 +648,7 @@ func doSignup(apiBase, email, srpSalt, srpVerifier string) (*authResponse, error
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	httputil.SetClientHeaders(req)
 	resp, err := authHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -675,6 +682,7 @@ func doSignupWithKeypair(apiBase, email, srpSalt, srpVerifier, publicKey, encryp
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	httputil.SetClientHeaders(req)
 	resp, err := authHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -707,6 +715,7 @@ func registerDevice(apiBase, token, name, platform string) (*deviceResponse, err
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
@@ -838,6 +847,7 @@ func refreshAccessToken(apiBase string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -963,6 +973,7 @@ func storeSalt(apiBase, token string, salt []byte) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := authHTTPClient.Do(req)
 	if err != nil {
@@ -985,6 +996,7 @@ func fetchSalt(apiBase, token string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := authHTTPClient.Do(req)
 	if err != nil {
@@ -1019,6 +1031,7 @@ func storeTestBlob(apiBase, token string, testBlob []byte) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := authHTTPClient.Do(req)
 	if err != nil {
@@ -1041,6 +1054,7 @@ func fetchTestBlob(apiBase, token string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := authHTTPClient.Do(req)
 	if err != nil {

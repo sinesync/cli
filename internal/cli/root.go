@@ -14,8 +14,20 @@ import (
 	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/storage"
+	"github.com/miclip/sinesync/internal/version"
 	"github.com/spf13/cobra"
 )
+
+// SetVersion sets the version info from build-time ldflags.
+func SetVersion(ver, commit string) {
+	version.Set(ver, commit)
+	rootCmd.Version = version.Full()
+}
+
+// GetVersion returns the app version string.
+func GetVersion() string {
+	return version.Get()
+}
 
 var rootCmd = &cobra.Command{
 	Use:          "sinesync",

@@ -22,6 +22,7 @@ import (
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/encryption"
+	"github.com/miclip/sinesync/internal/httputil"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/zalando/go-keyring"
 )
@@ -542,6 +543,7 @@ func (m *SyncManager) refreshAccessToken() (string, error) {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -935,6 +937,7 @@ func (m *SyncManager) getCloudManifest(token string) (*manifestResponse, error) 
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(req)
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -998,6 +1001,7 @@ func (m *SyncManager) getManifestMeta(token string) (*manifestMeta, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1027,6 +1031,7 @@ func (m *SyncManager) getCloudManifestCached(token string) (*manifestResponse, e
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1126,6 +1131,7 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 		req, _ := http.NewRequest("POST", m.apiBase+"/sync/upload-urls", bytes.NewReader(bodyBytes))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(req)
 
 		resp, err = client.Do(req)
 		if err != nil {
@@ -1208,6 +1214,7 @@ func (m *SyncManager) pushBatchEncrypted(token string, batch []encryptedObsItem)
 	confirmReq, _ := http.NewRequest("POST", m.apiBase+"/sync/confirm-uploads", bytes.NewReader(confirmBytes))
 	confirmReq.Header.Set("Content-Type", "application/json")
 	confirmReq.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(confirmReq)
 
 	confirmResp, err := client.Do(confirmReq)
 	if err != nil {
@@ -1338,6 +1345,7 @@ func (m *SyncManager) pullItemEncrypted(token string, id string, expectedChecksu
 	// Get download URL (checksum comes from manifest, not this API call)
 	req, _ := http.NewRequest("GET", m.apiBase+"/sync/download-url/"+url.PathEscape(id), nil)
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1448,6 +1456,7 @@ func (m *SyncManager) pullBatch(token string, items []manifestItem, encMgr *encr
 	req, _ := http.NewRequest("POST", m.apiBase+"/sync/download-urls", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1579,6 +1588,7 @@ func (m *SyncManager) deleteFromCloud(token string, id string) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
