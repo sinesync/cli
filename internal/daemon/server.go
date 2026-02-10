@@ -324,7 +324,7 @@ func (s *Server) Run() error {
 	log.Printf("[daemon]   Mode: %s", s.mode)
 	log.Printf("[daemon]   Dashboard: http://%s", addr)
 	log.Printf("[daemon]   Hook API: http://%s/api/", addr)
-	log.Printf("[daemon]   Cloud sync: every %v", SyncInterval)
+	log.Printf("[daemon]   Cloud sync: adaptive (base: %v, max: 60m)", SyncInterval)
 
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
@@ -574,6 +574,7 @@ func (s *Server) processCapture(sessionID, toolName string, toolInput, toolRespo
 		return
 	}
 	s.invalidateCache()
+	s.syncManager.NotifyActivity()
 
 	if sessionID != "" {
 		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
@@ -900,6 +901,7 @@ func (s *Server) processSummarize(sessionID, project string) {
 		return
 	}
 	s.invalidateCache()
+	s.syncManager.NotifyActivity()
 
 	if sessionID != "" {
 		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
@@ -1322,6 +1324,7 @@ func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request,
 
 	// Clear observation cache to force refresh
 	s.obsCache = nil
+	s.syncManager.NotifyActivity()
 
 	log.Printf("[server] Deleted observation %s (project: %s, title: %s)", id, obs.Core.Project, obs.Core.Title)
 	writeJSON(w, map[string]bool{"success": true})

@@ -165,6 +165,10 @@ type SyncManager struct {
 	syncing        bool
 	accountDeleted bool
 
+	// Adaptive sync state
+	consecutiveEmpty int
+	activityChan     chan struct{}
+
 	// Backfill state
 	backfillMu        sync.Mutex
 	backfillRunning   bool
@@ -181,10 +185,11 @@ func NewSyncManager(backend storage.StorageBackend, mode string) *SyncManager {
 	}
 
 	return &SyncManager{
-		backend:  backend,
-		apiBase:  apiBase,
-		mode:     mode,
-		stopChan: make(chan struct{}),
+		backend:      backend,
+		apiBase:      apiBase,
+		mode:         mode,
+		stopChan:     make(chan struct{}),
+		activityChan: make(chan struct{}, 1),
 	}
 }
 
@@ -200,6 +205,40 @@ func (m *SyncManager) Stop() {
 	close(m.stopChan)
 	m.wg.Wait()
 	log.Printf("[sync] Background sync stopped")
+}
+
+// NotifyActivity signals that local data has changed (observation captured, deleted, etc.)
+// This triggers a debounced sync and resets the adaptive backoff.
+func (m *SyncManager) NotifyActivity() {
+	// Non-blocking send to wake the sync loop
+	select {
+	case m.activityChan <- struct{}{}:
+	default:
+	}
+}
+
+// calculateInterval returns the sync interval based on consecutive empty syncs.
+// Derives all intervals from SyncInterval so the schedule stays consistent
+// if the base constant is ever changed.
+func calculateInterval(consecutiveEmpty int) time.Duration {
+	maxInterval := 6 * SyncInterval // 60m with default 10m base
+
+	var interval time.Duration
+	switch {
+	case consecutiveEmpty <= 1:
+		interval = SyncInterval
+	case consecutiveEmpty == 2:
+		interval = 2 * SyncInterval
+	case consecutiveEmpty == 3:
+		interval = 3 * SyncInterval
+	default:
+		interval = maxInterval
+	}
+
+	if interval > maxInterval {
+		interval = maxInterval
+	}
+	return interval
 }
 
 // Status returns current sync status
@@ -231,12 +270,15 @@ func (m *SyncManager) syncLoop() {
 		return
 	}
 
-	ticker := time.NewTicker(SyncInterval)
-	defer ticker.Stop()
-
 	for {
+		m.mu.Lock()
+		interval := calculateInterval(m.consecutiveEmpty)
+		m.mu.Unlock()
+
+		timer := time.NewTimer(interval)
+
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			m.doSync()
 			m.mu.Lock()
 			deleted := m.accountDeleted
@@ -244,7 +286,50 @@ func (m *SyncManager) syncLoop() {
 			if deleted {
 				return
 			}
+
+		case <-m.activityChan:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			log.Printf("[sync] Activity detected, syncing 30s after last activity...")
+			// Debounce: wait 30s of inactivity to batch rapid captures into one sync
+			debounce := time.NewTimer(30 * time.Second)
+		activityDebounce:
+			for {
+				select {
+				case <-m.activityChan:
+					// New activity: reset debounce timer
+					if !debounce.Stop() {
+						select {
+						case <-debounce.C:
+						default:
+						}
+					}
+					debounce.Reset(30 * time.Second)
+				case <-debounce.C:
+					// 30s of quiet: perform a single sync for this burst
+					m.mu.Lock()
+					m.consecutiveEmpty = 0
+					m.mu.Unlock()
+					m.doSync()
+					m.mu.Lock()
+					deleted := m.accountDeleted
+					m.mu.Unlock()
+					if deleted {
+						return
+					}
+					break activityDebounce
+				case <-m.stopChan:
+					debounce.Stop()
+					return
+				}
+			}
+
 		case <-m.stopChan:
+			timer.Stop()
 			return
 		}
 	}
@@ -330,9 +415,18 @@ func (m *SyncManager) doSync() {
 	m.mu.Lock()
 	m.lastSync = time.Now()
 	m.lastError = ""
-	m.mu.Unlock()
-
-	log.Printf("[sync] Complete: pushed=%d, pulled=%d, duration=%v", pushed, pulled, time.Since(start))
+	if pushed == 0 && pulled == 0 {
+		m.consecutiveEmpty++
+		nextInterval := calculateInterval(m.consecutiveEmpty)
+		m.mu.Unlock()
+		log.Printf("[sync] Complete: pushed=0, pulled=0, duration=%v, next=%v (idle:%d)",
+			time.Since(start).Round(time.Millisecond), nextInterval, m.consecutiveEmpty)
+	} else {
+		m.consecutiveEmpty = 0
+		m.mu.Unlock()
+		log.Printf("[sync] Complete: pushed=%d, pulled=%d, duration=%v, next=%v (active)",
+			pushed, pulled, time.Since(start).Round(time.Millisecond), SyncInterval)
+	}
 }
 
 func isUnauthorizedError(err error) bool {
