@@ -9,11 +9,13 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -250,6 +252,18 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/search", s.handleSearch)
 	mux.HandleFunc("/api/sync", s.handleSync)
 	mux.HandleFunc("/api/vaults", s.handleVaults)
+
+	// Analytics API endpoints
+	mux.HandleFunc("/api/analytics/activity-heatmap", s.handleActivityHeatmap)
+	mux.HandleFunc("/api/analytics/activity-by-hour", s.handleActivityByHour)
+	mux.HandleFunc("/api/analytics/type-trend", s.handleTypeTrend)
+	mux.HandleFunc("/api/analytics/sessions", s.handleAnalyticsSessions)
+	mux.HandleFunc("/api/analytics/file-hotspots", s.handleFileHotspots)
+	mux.HandleFunc("/api/analytics/project-breakdown", s.handleProjectBreakdown)
+	mux.HandleFunc("/api/analytics/concepts", s.handleConcepts)
+	mux.HandleFunc("/api/analytics/summary", s.handleAnalyticsSummary)
+	mux.HandleFunc("/api/analytics/bugfix-ratio", s.handleBugfixRatio)
+	mux.HandleFunc("/api/analytics/devices", s.handleDevices)
 
 	// MCP API endpoints (3-layer workflow)
 	mux.HandleFunc("/api/mcp/search", s.handleMCPSearch)
@@ -567,7 +581,7 @@ func (s *Server) processCapture(sessionID, toolName string, toolInput, toolRespo
 		}
 	}
 
-	log.Printf("[capture] Saved: id=%s title=%s type=%s", obs.ID, obs.Core.Title, obs.Core.Type)
+	log.Printf("[capture] Saved: id=%s type=%s project=%s", obs.ID, obs.Core.Type, obs.Core.Project)
 }
 
 func (s *Server) extractObservation(toolName string, toolInput map[string]interface{}, toolResponse, project string) *storage.Observation {
@@ -1667,6 +1681,692 @@ func (s *Server) handleMCPGetObservations(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, map[string]interface{}{"observations": observations})
+}
+
+// === Analytics API endpoints ===
+
+// parseEpochRange extracts from/to epoch range from query params
+func parseEpochRange(r *http.Request) (from, to time.Time) {
+	if f := r.URL.Query().Get("from"); f != "" {
+		if epoch, err := strconv.ParseInt(f, 10, 64); err == nil {
+			from = time.Unix(epoch, 0)
+		}
+	}
+	if t := r.URL.Query().Get("to"); t != "" {
+		if epoch, err := strconv.ParseInt(t, 10, 64); err == nil {
+			to = time.Unix(epoch, 0)
+		}
+	}
+	return
+}
+
+// filterByDateRange filters observations by epoch range
+func filterByDateRange(observations []storage.Observation, from, to time.Time) []storage.Observation {
+	if from.IsZero() && to.IsZero() {
+		return observations
+	}
+	var filtered []storage.Observation
+	for _, obs := range observations {
+		if !from.IsZero() && obs.Core.CreatedAt.Before(from) {
+			continue
+		}
+		if !to.IsZero() && obs.Core.CreatedAt.After(to) {
+			continue
+		}
+		filtered = append(filtered, obs)
+	}
+	return filtered
+}
+
+func (s *Server) handleActivityHeatmap(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+
+	type dayEntry struct {
+		Date   string         `json:"date"`
+		Count  int            `json:"count"`
+		ByType map[string]int `json:"byType"`
+	}
+
+	dayMap := make(map[string]*dayEntry)
+	for _, obs := range observations {
+		date := obs.Core.CreatedAt.Format("2006-01-02")
+		if _, ok := dayMap[date]; !ok {
+			dayMap[date] = &dayEntry{Date: date, ByType: make(map[string]int)}
+		}
+		dayMap[date].Count++
+		dayMap[date].ByType[obs.Core.Type]++
+	}
+
+	days := make([]*dayEntry, 0, len(dayMap))
+	for _, d := range dayMap {
+		days = append(days, d)
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].Date < days[j].Date })
+
+	writeJSON(w, map[string]interface{}{"days": days})
+}
+
+func (s *Server) handleActivityByHour(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+
+	type hourEntry struct {
+		Hour   int            `json:"hour"`
+		Count  int            `json:"count"`
+		ByType map[string]int `json:"byType"`
+	}
+
+	hours := make([]*hourEntry, 24)
+	for i := 0; i < 24; i++ {
+		hours[i] = &hourEntry{Hour: i, ByType: make(map[string]int)}
+	}
+
+	for _, obs := range observations {
+		h := obs.Core.CreatedAt.Hour()
+		hours[h].Count++
+		hours[h].ByType[obs.Core.Type]++
+	}
+
+	writeJSON(w, map[string]interface{}{"hours": hours})
+}
+
+func (s *Server) handleTypeTrend(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+
+	type periodEntry struct {
+		Period    string         `json:"period"`
+		StartDate string        `json:"startDate"`
+		ByType   map[string]int `json:"byType"`
+	}
+
+	periodMap := make(map[string]*periodEntry)
+	for _, obs := range observations {
+		year, week := obs.Core.CreatedAt.ISOWeek()
+		key := fmt.Sprintf("%d-W%02d", year, week)
+		if _, ok := periodMap[key]; !ok {
+			// Find the Monday of this ISO week
+			jan1 := time.Date(year, 1, 1, 0, 0, 0, 0, obs.Core.CreatedAt.Location())
+			offset := int(time.Monday - jan1.Weekday())
+			if offset > 0 {
+				offset -= 7
+			}
+			weekStart := jan1.AddDate(0, 0, offset+(week-1)*7)
+			periodMap[key] = &periodEntry{
+				Period:    key,
+				StartDate: weekStart.Format("2006-01-02"),
+				ByType:   make(map[string]int),
+			}
+		}
+		periodMap[key].ByType[obs.Core.Type]++
+	}
+
+	series := make([]*periodEntry, 0, len(periodMap))
+	for _, p := range periodMap {
+		series = append(series, p)
+	}
+	sort.Slice(series, func(i, j int) bool { return series[i].Period < series[j].Period })
+
+	writeJSON(w, map[string]interface{}{"series": series})
+}
+
+func (s *Server) handleAnalyticsSessions(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+
+	sqlBackend, ok := s.backend.(*storage.SQLCipherStorage)
+	if !ok {
+		writeJSON(w, map[string]interface{}{"sessions": []interface{}{}})
+		return
+	}
+
+	// Query sessions with aggregated data (exclude empty sessions, use actual counts from linked tables)
+	query := `SELECT s.session_id, s.project, s.started_at_epoch, s.ended_at,
+		(SELECT COUNT(*) FROM observations o WHERE o.session_id = s.session_id) as obs_count,
+		s.summary, s.status,
+		(SELECT COUNT(*) FROM user_prompts up WHERE up.session_id = s.session_id) as prompt_count
+		FROM sessions s WHERE (
+			EXISTS (SELECT 1 FROM observations o WHERE o.session_id = s.session_id)
+			OR EXISTS (SELECT 1 FROM user_prompts up WHERE up.session_id = s.session_id)
+		)`
+	var args []interface{}
+
+	if !from.IsZero() {
+		query += " AND s.started_at_epoch >= ?"
+		args = append(args, from.Unix())
+	}
+	if !to.IsZero() {
+		query += " AND s.started_at_epoch <= ?"
+		args = append(args, to.Unix())
+	}
+	query += " ORDER BY s.started_at_epoch DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := sqlBackend.DB().Query(query, args...)
+	if err != nil {
+		writeJSON(w, map[string]interface{}{"sessions": []interface{}{}, "error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	type sessionEntry struct {
+		SessionID        string         `json:"sessionId"`
+		Project          string         `json:"project"`
+		StartedAt        int64          `json:"startedAt"`
+		EndedAt          *string        `json:"endedAt"`
+		DurationMinutes  float64        `json:"durationMinutes"`
+		ObservationCount int            `json:"observationCount"`
+		PromptCount      int            `json:"promptCount"`
+		Summary          *string        `json:"summary"`
+		TopTypes         map[string]int `json:"topTypes"`
+	}
+
+	var sessions []sessionEntry
+	for rows.Next() {
+		var se sessionEntry
+		var endedAt, summary, status *string
+		if err := rows.Scan(&se.SessionID, &se.Project, &se.StartedAt, &endedAt,
+			&se.ObservationCount, &summary, &status, &se.PromptCount); err != nil {
+			continue
+		}
+		se.EndedAt = endedAt
+		se.Summary = summary
+
+		// Calculate duration
+		startTime := time.Unix(se.StartedAt, 0)
+		if endedAt != nil && *endedAt != "" {
+			if endTime, err := time.Parse(time.RFC3339, *endedAt); err == nil {
+				se.DurationMinutes = endTime.Sub(startTime).Minutes()
+			}
+		} else {
+			se.DurationMinutes = 30 // default when ended_at is missing
+		}
+
+		se.TopTypes = make(map[string]int)
+		sessions = append(sessions, se)
+	}
+
+	if sessions == nil {
+		sessions = []sessionEntry{}
+	}
+
+	// Batch-fetch top types for all sessions in a single query (avoids N+1)
+	if len(sessions) > 0 {
+		placeholders := make([]string, len(sessions))
+		typeArgs := make([]interface{}, len(sessions))
+		sessionIdx := make(map[string]int, len(sessions))
+		for i, se := range sessions {
+			placeholders[i] = "?"
+			typeArgs[i] = se.SessionID
+			sessionIdx[se.SessionID] = i
+		}
+		typeQuery := fmt.Sprintf(
+			"SELECT session_id, type, COUNT(*) as cnt FROM observations WHERE session_id IN (%s) GROUP BY session_id, type",
+			strings.Join(placeholders, ","))
+		typeRows, err := sqlBackend.DB().Query(typeQuery, typeArgs...)
+		if err == nil {
+			for typeRows.Next() {
+				var sid, t string
+				var cnt int
+				if typeRows.Scan(&sid, &t, &cnt) == nil {
+					if idx, ok := sessionIdx[sid]; ok {
+						sessions[idx].TopTypes[t] = cnt
+					}
+				}
+			}
+			typeRows.Close()
+		}
+	}
+
+	writeJSON(w, map[string]interface{}{"sessions": sessions})
+}
+
+func (s *Server) handleFileHotspots(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+
+	type fileEntry struct {
+		Path          string         `json:"path"`
+		Project       string         `json:"project"`
+		Directory     string         `json:"directory"`
+		TotalCount    int            `json:"totalCount"`
+		ModifiedCount int            `json:"modifiedCount"`
+		ReadCount     int            `json:"readCount"`
+		ByType        map[string]int `json:"byType"`
+		DominantType  string         `json:"dominantType"`
+	}
+
+	fileMap := make(map[string]*fileEntry)
+
+	for _, obs := range observations {
+		for _, f := range obs.Structured.Files.Modified {
+			if _, ok := fileMap[f]; !ok {
+				fileMap[f] = &fileEntry{
+					Path:      f,
+					Project:   obs.Core.Project,
+					Directory: filepath.Dir(f),
+					ByType:    make(map[string]int),
+				}
+			}
+			fileMap[f].TotalCount++
+			fileMap[f].ModifiedCount++
+			fileMap[f].ByType[obs.Core.Type]++
+		}
+		for _, f := range obs.Structured.Files.Read {
+			if _, ok := fileMap[f]; !ok {
+				fileMap[f] = &fileEntry{
+					Path:      f,
+					Project:   obs.Core.Project,
+					Directory: filepath.Dir(f),
+					ByType:    make(map[string]int),
+				}
+			}
+			fileMap[f].TotalCount++
+			fileMap[f].ReadCount++
+			fileMap[f].ByType[obs.Core.Type]++
+		}
+	}
+
+	// Determine dominant type and collect
+	files := make([]*fileEntry, 0, len(fileMap))
+	for _, fe := range fileMap {
+		maxCount := 0
+		for t, c := range fe.ByType {
+			if c > maxCount {
+				maxCount = c
+				fe.DominantType = t
+			}
+		}
+		files = append(files, fe)
+	}
+
+	// Sort by total count desc
+	sort.Slice(files, func(i, j int) bool { return files[i].TotalCount > files[j].TotalCount })
+	if len(files) > limit {
+		files = files[:limit]
+	}
+
+	writeJSON(w, map[string]interface{}{"files": files})
+}
+
+func (s *Server) handleProjectBreakdown(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+
+	type projectEntry struct {
+		Name         string         `json:"name"`
+		Total        int            `json:"total"`
+		ByType       map[string]int `json:"byType"`
+		SessionCount int            `json:"sessionCount"`
+	}
+
+	projMap := make(map[string]*projectEntry)
+	projSessions := make(map[string]map[string]bool)
+
+	for _, obs := range observations {
+		p := obs.Core.Project
+		if p == "" {
+			p = "(none)"
+		}
+		if _, ok := projMap[p]; !ok {
+			projMap[p] = &projectEntry{Name: p, ByType: make(map[string]int)}
+			projSessions[p] = make(map[string]bool)
+		}
+		projMap[p].Total++
+		projMap[p].ByType[obs.Core.Type]++
+		if obs.Core.SessionID != "" {
+			projSessions[p][obs.Core.SessionID] = true
+		}
+	}
+
+	projects := make([]*projectEntry, 0, len(projMap))
+	for _, pe := range projMap {
+		pe.SessionCount = len(projSessions[pe.Name])
+		projects = append(projects, pe)
+	}
+
+	sort.Slice(projects, func(i, j int) bool { return projects[i].Total > projects[j].Total })
+
+	writeJSON(w, map[string]interface{}{"projects": projects})
+}
+
+func (s *Server) handleConcepts(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+	limit := 30
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+
+	type conceptEntry struct {
+		Name     string         `json:"name"`
+		Count    int            `json:"count"`
+		ByType   map[string]int `json:"byType"`
+		Projects []string       `json:"projects"`
+	}
+
+	conceptMap := make(map[string]*conceptEntry)
+	conceptProjects := make(map[string]map[string]bool)
+
+	for _, obs := range observations {
+		for _, c := range obs.Structured.Concepts {
+			if _, ok := conceptMap[c]; !ok {
+				conceptMap[c] = &conceptEntry{Name: c, ByType: make(map[string]int)}
+				conceptProjects[c] = make(map[string]bool)
+			}
+			conceptMap[c].Count++
+			conceptMap[c].ByType[obs.Core.Type]++
+			if obs.Core.Project != "" {
+				conceptProjects[c][obs.Core.Project] = true
+			}
+		}
+	}
+
+	concepts := make([]*conceptEntry, 0, len(conceptMap))
+	for _, ce := range conceptMap {
+		for p := range conceptProjects[ce.Name] {
+			ce.Projects = append(ce.Projects, p)
+		}
+		concepts = append(concepts, ce)
+	}
+
+	sort.Slice(concepts, func(i, j int) bool { return concepts[i].Count > concepts[j].Count })
+	if len(concepts) > limit {
+		concepts = concepts[:limit]
+	}
+
+	writeJSON(w, map[string]interface{}{"concepts": concepts})
+}
+
+func (s *Server) handleAnalyticsSummary(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+
+	// Sort by date for sparkline computation
+	sort.Slice(observations, func(i, j int) bool {
+		return observations[i].Core.CreatedAt.Before(observations[j].Core.CreatedAt)
+	})
+
+	// Use the 'to' param as reference so date range selections work correctly;
+	// fall back to the latest observation timestamp or time.Now()
+	now := to
+	if now.IsZero() && len(observations) > 0 {
+		now = observations[len(observations)-1].Core.CreatedAt
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	weekAgo := now.AddDate(0, 0, -7)
+	twoWeeksAgo := now.AddDate(0, 0, -14)
+
+	// Observations per day (7-day moving average)
+	var currentWeekObs, prevWeekObs int
+	dailyCounts := make(map[string]int)
+	for _, obs := range observations {
+		date := obs.Core.CreatedAt.Format("2006-01-02")
+		dailyCounts[date]++
+		if obs.Core.CreatedAt.After(weekAgo) {
+			currentWeekObs++
+		} else if obs.Core.CreatedAt.After(twoWeeksAgo) {
+			prevWeekObs++
+		}
+	}
+
+	obsPerDay := float64(currentWeekObs) / 7.0
+	prevObsPerDay := float64(prevWeekObs) / 7.0
+	obsPerDayDelta := obsPerDay - prevObsPerDay
+
+	// Build sparkline for last 30 days
+	obsSparkline := make([]int, 30)
+	for i := 29; i >= 0; i-- {
+		day := now.AddDate(0, 0, -i).Format("2006-01-02")
+		obsSparkline[29-i] = dailyCounts[day]
+	}
+
+	// Average session duration
+	var avgDuration float64
+	var prevAvgDuration float64
+	durationSparkline := make([]float64, 0)
+	if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+		row := sqlBackend.DB().QueryRow(`SELECT AVG(
+			CASE WHEN ended_at IS NOT NULL AND ended_at != ''
+			THEN (julianday(ended_at) - julianday(datetime(started_at_epoch, 'unixepoch'))) * 24 * 60
+			ELSE 30 END
+		) FROM sessions WHERE started_at_epoch >= ?`, weekAgo.Unix())
+		row.Scan(&avgDuration)
+
+		row = sqlBackend.DB().QueryRow(`SELECT AVG(
+			CASE WHEN ended_at IS NOT NULL AND ended_at != ''
+			THEN (julianday(ended_at) - julianday(datetime(started_at_epoch, 'unixepoch'))) * 24 * 60
+			ELSE 30 END
+		) FROM sessions WHERE started_at_epoch >= ? AND started_at_epoch < ?`, twoWeeksAgo.Unix(), weekAgo.Unix())
+		row.Scan(&prevAvgDuration)
+
+		// Weekly sparkline for sessions
+		rows, err := sqlBackend.DB().Query(`SELECT DATE(datetime(started_at_epoch, 'unixepoch')) as d,
+			AVG(CASE WHEN ended_at IS NOT NULL AND ended_at != ''
+			THEN (julianday(ended_at) - julianday(datetime(started_at_epoch, 'unixepoch'))) * 24 * 60
+			ELSE 30 END) as avg_dur
+			FROM sessions WHERE started_at_epoch >= ?
+			GROUP BY d ORDER BY d`, now.AddDate(0, 0, -30).Unix())
+		if err == nil {
+			for rows.Next() {
+				var d string
+				var dur float64
+				if rows.Scan(&d, &dur) == nil {
+					durationSparkline = append(durationSparkline, math.Round(dur*10)/10)
+				}
+			}
+			rows.Close()
+		}
+	}
+
+	// Bugfix ratio
+	var bugfixCount, totalCount int
+	var prevBugfixCount, prevTotalCount int
+	bugfixSparkline := make([]float64, 0)
+	weeklyBugfix := make(map[string][2]int) // [bugfix, total]
+
+	for _, obs := range observations {
+		if obs.Core.CreatedAt.After(weekAgo) {
+			totalCount++
+			if obs.Core.Type == "bugfix" {
+				bugfixCount++
+			}
+		} else if obs.Core.CreatedAt.After(twoWeeksAgo) {
+			prevTotalCount++
+			if obs.Core.Type == "bugfix" {
+				prevBugfixCount++
+			}
+		}
+		year, week := obs.Core.CreatedAt.ISOWeek()
+		key := fmt.Sprintf("%d-W%02d", year, week)
+		entry := weeklyBugfix[key]
+		entry[1]++
+		if obs.Core.Type == "bugfix" {
+			entry[0]++
+		}
+		weeklyBugfix[key] = entry
+	}
+
+	bugfixRatio := 0.0
+	if totalCount > 0 {
+		bugfixRatio = float64(bugfixCount) / float64(totalCount)
+	}
+	prevBugfixRatio := 0.0
+	if prevTotalCount > 0 {
+		prevBugfixRatio = float64(prevBugfixCount) / float64(prevTotalCount)
+	}
+
+	// Build bugfix sparkline from weekly data
+	type weekKey struct {
+		key  string
+		data [2]int
+	}
+	var weeks []weekKey
+	for k, v := range weeklyBugfix {
+		weeks = append(weeks, weekKey{k, v})
+	}
+	sort.Slice(weeks, func(i, j int) bool { return weeks[i].key < weeks[j].key })
+	for _, wk := range weeks {
+		if wk.data[1] > 0 {
+			bugfixSparkline = append(bugfixSparkline, math.Round(float64(wk.data[0])/float64(wk.data[1])*100)/100)
+		}
+	}
+
+	// Unique files per day
+	dailyFiles := make(map[string]map[string]bool)
+	for _, obs := range observations {
+		date := obs.Core.CreatedAt.Format("2006-01-02")
+		if dailyFiles[date] == nil {
+			dailyFiles[date] = make(map[string]bool)
+		}
+		for _, f := range obs.Structured.AllFiles() {
+			dailyFiles[date][f] = true
+		}
+	}
+
+	var currentWeekFiles, prevWeekFiles int
+	filesSparkline := make([]int, 30)
+	for i := 29; i >= 0; i-- {
+		day := now.AddDate(0, 0, -i)
+		dayStr := day.Format("2006-01-02")
+		cnt := len(dailyFiles[dayStr])
+		filesSparkline[29-i] = cnt
+		if day.After(weekAgo) {
+			currentWeekFiles += cnt
+		} else if day.After(twoWeeksAgo) {
+			prevWeekFiles += cnt
+		}
+	}
+
+	filesPerDay := float64(currentWeekFiles) / 7.0
+	prevFilesPerDay := float64(prevWeekFiles) / 7.0
+
+	writeJSON(w, map[string]interface{}{
+		"observationsPerDay": map[string]interface{}{
+			"current":   math.Round(obsPerDay*10) / 10,
+			"previous":  math.Round(prevObsPerDay*10) / 10,
+			"delta":     math.Round(obsPerDayDelta*10) / 10,
+			"sparkline": obsSparkline,
+		},
+		"avgSessionDuration": map[string]interface{}{
+			"current":   math.Round(avgDuration*10) / 10,
+			"previous":  math.Round(prevAvgDuration*10) / 10,
+			"delta":     math.Round((avgDuration-prevAvgDuration)*10) / 10,
+			"sparkline": durationSparkline,
+		},
+		"bugfixRatio": map[string]interface{}{
+			"current":   math.Round(bugfixRatio*100) / 100,
+			"previous":  math.Round(prevBugfixRatio*100) / 100,
+			"delta":     math.Round((bugfixRatio-prevBugfixRatio)*100) / 100,
+			"sparkline": bugfixSparkline,
+		},
+		"uniqueFilesPerDay": map[string]interface{}{
+			"current":   math.Round(filesPerDay*10) / 10,
+			"previous":  math.Round(prevFilesPerDay*10) / 10,
+			"delta":     math.Round((filesPerDay-prevFilesPerDay)*10) / 10,
+			"sparkline": filesSparkline,
+		},
+	})
+}
+
+func (s *Server) handleBugfixRatio(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+
+	type periodEntry struct {
+		Period       string  `json:"period"`
+		Total        int     `json:"total"`
+		BugfixCount  int     `json:"bugfixCount"`
+		FeatureCount int     `json:"featureCount"`
+		BugfixRatio  float64 `json:"bugfixRatio"`
+	}
+
+	periodMap := make(map[string]*periodEntry)
+	for _, obs := range observations {
+		year, week := obs.Core.CreatedAt.ISOWeek()
+		key := fmt.Sprintf("%d-W%02d", year, week)
+		if _, ok := periodMap[key]; !ok {
+			periodMap[key] = &periodEntry{Period: key}
+		}
+		periodMap[key].Total++
+		if obs.Core.Type == "bugfix" {
+			periodMap[key].BugfixCount++
+		}
+		if obs.Core.Type == "feature" {
+			periodMap[key].FeatureCount++
+		}
+	}
+
+	series := make([]*periodEntry, 0, len(periodMap))
+	for _, p := range periodMap {
+		if p.Total > 0 {
+			p.BugfixRatio = math.Round(float64(p.BugfixCount)/float64(p.Total)*100) / 100
+		}
+		series = append(series, p)
+	}
+
+	sort.Slice(series, func(i, j int) bool { return series[i].Period < series[j].Period })
+
+	writeJSON(w, map[string]interface{}{"series": series})
+}
+
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
+	from, to := parseEpochRange(r)
+	observations := filterByDateRange(s.getObservations(), from, to)
+
+	// Collect unique devices
+	deviceSet := make(map[string]bool)
+	type dayDeviceEntry struct {
+		Date     string         `json:"date"`
+		ByDevice map[string]int `json:"byDevice"`
+	}
+
+	dayMap := make(map[string]*dayDeviceEntry)
+	for _, obs := range observations {
+		machine := obs.Source.Machine
+		if machine == "" {
+			machine = "local"
+		}
+		deviceSet[machine] = true
+		date := obs.Core.CreatedAt.Format("2006-01-02")
+		if _, ok := dayMap[date]; !ok {
+			dayMap[date] = &dayDeviceEntry{Date: date, ByDevice: make(map[string]int)}
+		}
+		dayMap[date].ByDevice[machine]++
+	}
+
+	devices := make([]string, 0, len(deviceSet))
+	for d := range deviceSet {
+		devices = append(devices, d)
+	}
+	sort.Strings(devices)
+
+	series := make([]*dayDeviceEntry, 0, len(dayMap))
+	for _, d := range dayMap {
+		series = append(series, d)
+	}
+	sort.Slice(series, func(i, j int) bool { return series[i].Date < series[j].Date })
+
+	writeJSON(w, map[string]interface{}{
+		"devices": devices,
+		"series":  series,
+	})
 }
 
 // === Helpers ===

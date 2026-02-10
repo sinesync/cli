@@ -19,12 +19,34 @@
                 <nav class="nav">
                     <button class="nav-btn active" data-view="overview">Overview</button>
                     <button class="nav-btn" data-view="memories">Memories</button>
+                    <button class="nav-btn" data-view="activity">Activity</button>
+                    <button class="nav-btn" data-view="sessions">Sessions</button>
+                    <button class="nav-btn" data-view="codebase">Codebase</button>
+                    <button class="nav-btn" data-view="insights">Insights</button>
                     <button class="nav-btn" data-view="projects">Projects</button>
                     <button class="nav-btn" data-view="tags">Tags</button>
                 </nav>
             </div>
             <canvas id="sine-canvas" class="sine-canvas"></canvas>
         </header>
+
+        <!-- Date Range Picker (hidden by default, shown for analytics tabs) -->
+        <div class="date-range-bar" id="date-range-bar" style="display:none">
+            <div class="date-range-content">
+                <span class="date-range-label">Date Range:</span>
+                <div class="date-range-presets">
+                    <button class="preset-btn" data-days="7">7d</button>
+                    <button class="preset-btn" data-days="30">30d</button>
+                    <button class="preset-btn active" data-days="90">90d</button>
+                    <button class="preset-btn" data-days="0">All</button>
+                </div>
+                <div class="date-range-inputs">
+                    <input type="date" id="date-from" class="date-input">
+                    <span class="date-range-sep">to</span>
+                    <input type="date" id="date-to" class="date-input">
+                </div>
+            </div>
+        </div>
 
         <!-- Main content -->
         <main class="main">
@@ -132,6 +154,100 @@
                 </div>
             </section>
 
+            <!-- Activity View -->
+            <section id="view-activity" class="view">
+                <div class="analytics-section">
+                    <h3>Activity Heatmap <button class="chart-help" title="GitHub-style calendar showing daily observation counts. Darker = more activity. Hover for type breakdown." aria-label="Help">?</button></h3>
+                    <div id="chart-activity-heatmap" class="chart-container chart-wide"></div>
+                </div>
+                <div class="analytics-grid">
+                    <div class="analytics-section">
+                        <h3>Activity by Hour <button class="chart-help" aria-label="Help" title="When are you coding with AI? Each bar is an hour of the day, stacked by observation type. Reveals your productive rhythms.">?</button></h3>
+                        <div id="chart-activity-by-hour" class="chart-container"></div>
+                    </div>
+                    <div class="analytics-section">
+                        <h3>Type Mix Over Time <button class="chart-help" aria-label="Help" title="How your work composition shifts week by week. A growing bugfix area may signal accumulating tech debt.">?</button></h3>
+                        <div id="chart-type-trend" class="chart-container"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Sessions View -->
+            <section id="view-sessions" class="view">
+                <div class="analytics-section">
+                    <h3>Session Timeline <button class="chart-help" aria-label="Help" title="Each bar is a coding session. Width = duration, color = project. Grouped by project swim lanes. Hover for details.">?</button></h3>
+                    <div id="chart-session-timeline" class="chart-container chart-wide"></div>
+                </div>
+                <div class="analytics-grid">
+                    <div class="analytics-section">
+                        <h3>Session Size Distribution <button class="chart-help" aria-label="Help" title="How many observations do your sessions typically produce? Shows the distribution so you can see your typical session depth.">?</button></h3>
+                        <div id="chart-session-histogram" class="chart-container"></div>
+                    </div>
+                    <div class="analytics-section">
+                        <h3>Prompt Efficiency <button class="chart-help" aria-label="Help" title="X = prompts sent, Y = observations produced. Dots above the diagonal = efficient (more output per prompt). Size = duration, color = project.">?</button></h3>
+                        <div id="chart-prompt-scatter" class="chart-container"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Codebase View -->
+            <section id="view-codebase" class="view">
+                <div class="analytics-section">
+                    <h3>File Hotspots <button class="chart-help" aria-label="Help" title="Treemap of files sized by how often they appear in observations. Color = dominant type (red = bugfix hotspot, green = feature growth).">?</button></h3>
+                    <div id="chart-file-treemap" class="chart-container chart-wide chart-tall"></div>
+                </div>
+                <div class="analytics-grid">
+                    <div class="analytics-section">
+                        <h3>Project Comparison <button class="chart-help" aria-label="Help" title="Compare work distribution across projects. A mature project should have fewer bugfixes relative to features.">?</button></h3>
+                        <div id="chart-project-breakdown" class="chart-container"></div>
+                    </div>
+                    <div class="analytics-section">
+                        <h3>Technology Cloud <button class="chart-help" aria-label="Help" title="Concepts and technologies sized by frequency, colored by dominant type. Large 'testing' = good, large 'configuration' = too much infra work.">?</button></h3>
+                        <div id="chart-concept-cloud" class="chart-container"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Insights View -->
+            <section id="view-insights" class="view">
+                <div class="metrics-grid" id="metrics-cards">
+                    <div class="metric-card" id="metric-obs-per-day">
+                        <div class="metric-label">Observations / Day <button class="chart-help" aria-label="Help" title="7-day moving average of daily observations. Delta compares this week to last week.">?</button></div>
+                        <div class="metric-value">-</div>
+                        <div class="metric-delta"></div>
+                        <div class="metric-sparkline"></div>
+                    </div>
+                    <div class="metric-card" id="metric-session-duration">
+                        <div class="metric-label">Avg Session (min) <button class="chart-help" aria-label="Help" title="Average session duration in minutes. Delta compares this week to last week.">?</button></div>
+                        <div class="metric-value">-</div>
+                        <div class="metric-delta"></div>
+                        <div class="metric-sparkline"></div>
+                    </div>
+                    <div class="metric-card" id="metric-bugfix-ratio">
+                        <div class="metric-label">Bugfix Ratio <button class="chart-help" aria-label="Help" title="Percentage of observations that are bugfixes. Rising ratio may signal accumulating tech debt. Healthy range: 10-25%.">?</button></div>
+                        <div class="metric-value">-</div>
+                        <div class="metric-delta"></div>
+                        <div class="metric-sparkline"></div>
+                    </div>
+                    <div class="metric-card" id="metric-files-per-day">
+                        <div class="metric-label">Unique Files / Day <button class="chart-help" aria-label="Help" title="Average number of distinct files touched per day. Higher = broader changes, lower = focused deep work.">?</button></div>
+                        <div class="metric-value">-</div>
+                        <div class="metric-delta"></div>
+                        <div class="metric-sparkline"></div>
+                    </div>
+                </div>
+                <div class="analytics-grid">
+                    <div class="analytics-section">
+                        <h3>Bug Fix Ratio Trend <button class="chart-help" aria-label="Help" title="Weekly bugfix percentage over time. Green band = healthy zone (10-25%). Red dots = weeks above 25% — time to slow down and address tech debt.">?</button></h3>
+                        <div id="chart-bugfix-trend" class="chart-container"></div>
+                    </div>
+                    <div class="analytics-section">
+                        <h3>Cross-Device Activity <button class="chart-help" aria-label="Help" title="Daily observations stacked by source machine. Validates sync is working and reveals device-specific work patterns.">?</button></h3>
+                        <div id="chart-devices" class="chart-container"></div>
+                    </div>
+                </div>
+            </section>
+
             <!-- Projects View -->
             <section id="view-projects" class="view">
                 <div id="projects-list" class="projects-list">
@@ -147,6 +263,9 @@
             </section>
         </main>
 
+        <!-- D3 Tooltip -->
+        <div id="d3-tooltip" class="d3-tooltip"></div>
+
         <!-- Detail Modal -->
         <div id="modal" class="modal hidden">
             <div class="modal-backdrop"></div>
@@ -157,6 +276,8 @@
         </div>
     </div>
 
+    <script src="d3.min.js"></script>
+    <script src="charts.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

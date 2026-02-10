@@ -7,13 +7,21 @@ let stats = {};
 let pagination = { page: 1, limit: 50, total: 0, totalPages: 0 };
 let currentSearch = '';
 
+// Date range state (persists across tab switches)
+let dateRange = { from: null, to: null };
+
+// Cache for analytics data to avoid refetching on tab switch
+let analyticsCache = {};
+
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
     initSineWave();
     initNavigation();
+    initDateRange();
     initModal();
     initSearch();
     initSync();
+    initHelpTooltips();
     loadStats();
     loadSyncStatus();
     loadObservations();
@@ -61,6 +69,73 @@ function initSineWave() {
     draw();
 }
 
+// Date Range Picker
+function initDateRange() {
+    // Default: 90 days
+    setDatePreset(90);
+
+    // Preset buttons
+    document.querySelectorAll('.preset-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const days = parseInt(btn.dataset.days);
+            document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            setDatePreset(days);
+            onDateRangeChanged();
+        });
+    });
+
+    // Custom date inputs (both use local time via T00:00:00/T23:59:59)
+    document.getElementById('date-from').addEventListener('change', () => {
+        document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+        const fromVal = document.getElementById('date-from').value;
+        const toVal = document.getElementById('date-to').value;
+        dateRange.from = fromVal ? Math.floor(new Date(fromVal + 'T00:00:00').getTime() / 1000) : null;
+        dateRange.to = toVal ? Math.floor(new Date(toVal + 'T23:59:59').getTime() / 1000) : null;
+        onDateRangeChanged();
+    });
+    document.getElementById('date-to').addEventListener('change', () => {
+        document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+        const fromVal = document.getElementById('date-from').value;
+        const toVal = document.getElementById('date-to').value;
+        dateRange.from = fromVal ? Math.floor(new Date(fromVal + 'T00:00:00').getTime() / 1000) : null;
+        dateRange.to = toVal ? Math.floor(new Date(toVal + 'T23:59:59').getTime() / 1000) : null;
+        onDateRangeChanged();
+    });
+}
+
+function localDateStr(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function setDatePreset(days) {
+    const now = new Date();
+    if (days === 0) {
+        dateRange.from = null;
+        dateRange.to = null;
+        document.getElementById('date-from').value = '';
+        document.getElementById('date-to').value = '';
+    } else {
+        const fromDate = new Date(now.getTime() - days * 86400000);
+        dateRange.from = Math.floor(fromDate.getTime() / 1000);
+        dateRange.to = Math.floor(now.getTime() / 1000);
+        document.getElementById('date-from').value = localDateStr(fromDate);
+        document.getElementById('date-to').value = localDateStr(now);
+    }
+}
+
+function onDateRangeChanged() {
+    analyticsCache = {}; // Clear cache
+    loadCurrentView();
+}
+
+function getDateParams() {
+    const params = new URLSearchParams();
+    if (dateRange.from) params.set('from', dateRange.from);
+    if (dateRange.to) params.set('to', dateRange.to);
+    return params;
+}
+
 // Navigation
 function initNavigation() {
     document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -84,10 +159,26 @@ function showView(view) {
         v.classList.toggle('active', v.id === `view-${view}`);
     });
 
-    // Load view data
-    if (view === 'projects') loadProjects();
-    if (view === 'tags') loadTags();
-    if (view === 'memories') loadObservations();
+    // Show/hide date range bar for analytics views
+    const analyticsViews = ['activity', 'sessions', 'codebase', 'insights'];
+    const dateBar = document.getElementById('date-range-bar');
+    if (dateBar) {
+        dateBar.style.display = analyticsViews.includes(view) ? '' : 'none';
+    }
+
+    loadCurrentView();
+}
+
+function loadCurrentView() {
+    switch (currentView) {
+        case 'projects': loadProjects(); break;
+        case 'tags': loadTags(); break;
+        case 'memories': loadObservations(); break;
+        case 'activity': loadActivityTab(); break;
+        case 'sessions': loadSessionsTab(); break;
+        case 'codebase': loadCodebaseTab(); break;
+        case 'insights': loadInsightsTab(); break;
+    }
 }
 
 // Modal
@@ -214,6 +305,35 @@ function renderSyncStatus(data) {
     }
 }
 
+// Help Tooltips (replace unreliable native title attributes)
+function initHelpTooltips() {
+    const tt = document.getElementById('d3-tooltip');
+    if (!tt) return;
+
+    document.addEventListener('mouseenter', e => {
+        const help = e.target.closest('.chart-help');
+        if (!help) return;
+        const text = help.getAttribute('title') || help.dataset.help;
+        if (!text) return;
+        // Stash and remove title so native tooltip doesn't also show
+        if (help.getAttribute('title')) {
+            help.dataset.help = text;
+            help.removeAttribute('title');
+        }
+        tt.textContent = text;
+        tt.style.opacity = '1';
+        const rect = help.getBoundingClientRect();
+        tt.style.left = (rect.left + window.scrollX + rect.width / 2) + 'px';
+        tt.style.top = (rect.bottom + window.scrollY + 6) + 'px';
+    }, true);
+
+    document.addEventListener('mouseleave', e => {
+        if (e.target.closest('.chart-help')) {
+            tt.style.opacity = '0';
+        }
+    }, true);
+}
+
 // Search
 function initSearch() {
     const input = document.getElementById('search-input');
@@ -261,6 +381,108 @@ async function doSearch(query, page = 1) {
     } catch (e) {
         console.error('Failed to search:', e);
     }
+}
+
+// === Analytics fetch helpers ===
+
+async function fetchAnalytics(endpoint) {
+    const cacheKey = endpoint + '|' + dateRange.from + '|' + dateRange.to;
+    if (analyticsCache[cacheKey]) return analyticsCache[cacheKey];
+
+    const params = getDateParams();
+    const url = `/api/analytics/${endpoint}${params.toString() ? '?' + params : ''}`;
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+        analyticsCache[cacheKey] = data;
+        return data;
+    } catch (e) {
+        console.error(`Failed to load analytics/${endpoint}:`, e);
+        return null;
+    }
+}
+
+// === Tab Loaders ===
+
+async function loadActivityTab() {
+    const [heatmap, byHour, typeTrend] = await Promise.all([
+        fetchAnalytics('activity-heatmap'),
+        fetchAnalytics('activity-by-hour'),
+        fetchAnalytics('type-trend')
+    ]);
+
+    SineCharts.renderHeatmap('#chart-activity-heatmap', heatmap ? heatmap.days : []);
+    SineCharts.renderStackedBarByHour('#chart-activity-by-hour', byHour ? byHour.hours : []);
+    SineCharts.renderStackedArea('#chart-type-trend', typeTrend ? typeTrend.series : []);
+}
+
+let sessionData = null; // Shared between session charts
+async function loadSessionsTab() {
+    const data = await fetchAnalytics('sessions');
+    sessionData = data ? data.sessions : [];
+
+    SineCharts.renderSessionTimeline('#chart-session-timeline', sessionData);
+    SineCharts.renderHistogram('#chart-session-histogram', sessionData);
+    SineCharts.renderScatter('#chart-prompt-scatter', sessionData);
+}
+
+async function loadCodebaseTab() {
+    const [hotspots, breakdown, concepts] = await Promise.all([
+        fetchAnalytics('file-hotspots'),
+        fetchAnalytics('project-breakdown'),
+        fetchAnalytics('concepts')
+    ]);
+
+    SineCharts.renderTreemap('#chart-file-treemap', hotspots ? hotspots.files : []);
+    SineCharts.renderGroupedBar('#chart-project-breakdown', breakdown ? breakdown.projects : []);
+    SineCharts.renderBubbleChart('#chart-concept-cloud', concepts ? concepts.concepts : []);
+}
+
+async function loadInsightsTab() {
+    const [summary, bugfixRatio, devices] = await Promise.all([
+        fetchAnalytics('summary'),
+        fetchAnalytics('bugfix-ratio'),
+        fetchAnalytics('devices')
+    ]);
+
+    if (summary) renderMetricCards(summary);
+    SineCharts.renderBugfixTrend('#chart-bugfix-trend', bugfixRatio ? bugfixRatio.series : []);
+    SineCharts.renderDeviceChart('#chart-devices', devices || { series: [], devices: [] });
+}
+
+function renderMetricCards(summary) {
+    const cards = [
+        { id: 'metric-obs-per-day', data: summary.observationsPerDay, format: v => v.toFixed(1), color: '#00d4ff' },
+        { id: 'metric-session-duration', data: summary.avgSessionDuration, format: v => v.toFixed(0) + 'm', color: '#9d4edd' },
+        { id: 'metric-bugfix-ratio', data: summary.bugfixRatio, format: v => (v * 100).toFixed(0) + '%', color: '#ff4444' },
+        { id: 'metric-files-per-day', data: summary.uniqueFilesPerDay, format: v => v.toFixed(1), color: '#00ff88' }
+    ];
+
+    cards.forEach(({ id, data, format, color }) => {
+        const card = document.getElementById(id);
+        if (!card || !data) return;
+
+        card.querySelector('.metric-value').textContent = format(data.current);
+
+        const deltaEl = card.querySelector('.metric-delta');
+        const delta = data.delta;
+        if (delta > 0) {
+            deltaEl.textContent = '+' + (typeof delta === 'number' && delta < 1 ? delta.toFixed(2) : delta.toFixed(1));
+            deltaEl.className = 'metric-delta positive';
+        } else if (delta < 0) {
+            deltaEl.textContent = (typeof delta === 'number' && Math.abs(delta) < 1 ? delta.toFixed(2) : delta.toFixed(1));
+            deltaEl.className = 'metric-delta negative';
+        } else {
+            deltaEl.textContent = '0';
+            deltaEl.className = 'metric-delta neutral';
+        }
+
+        SineCharts.renderSparkline(
+            '#' + id + ' .metric-sparkline',
+            data.sparkline,
+            color
+        );
+    });
 }
 
 // API calls
