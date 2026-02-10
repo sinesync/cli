@@ -634,13 +634,35 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		}
 
 		// Check if needs push
-		if cloudChecksum, exists := cloudItems[obs.ID]; !exists || cloudChecksum != checksum {
+		cloudChecksum, inCloud := cloudItems[obs.ID]
+		if !inCloud {
+			// Cloud doesn't have it at all — must push
 			toPush = append(toPush, encryptedObsItem{
 				obs:       obs,
 				encrypted: encrypted,
 				checksum:  checksum,
 				vaultID:   vaultID,
 			})
+		} else if cloudChecksum != checksum {
+			// Checksums differ — only push if observation was locally modified since last upload.
+			// Re-encryption produces different ciphertext (random nonce), so checksum mismatches
+			// are expected even when the underlying data hasn't changed.
+			if cached, hasCached := syncManifest.GetLocalUpload(obs.ID); hasCached {
+				if !cached.UpdatedAt.Equal(obs.Core.UpdatedAt) {
+					// Observation was modified since last upload — push update
+					toPush = append(toPush, encryptedObsItem{
+						obs:       obs,
+						encrypted: encrypted,
+						checksum:  checksum,
+						vaultID:   vaultID,
+					})
+				}
+				// else: checksum differs only due to re-encryption nonce, skip
+			} else {
+				// No cached upload state — this is likely a pulled item we haven't tracked yet.
+				// Record cloud checksum to prevent future re-push attempts.
+				syncManifest.SetLocalUpload(obs.ID, cloudChecksum, obs.Core.UpdatedAt)
+			}
 		}
 	}
 
@@ -720,6 +742,11 @@ func (m *SyncManager) sync(token string) (pushed, pulled int, err error) {
 		// Cache successful uploads
 		for _, item := range uploadedItems {
 			syncManifest.SetLocalUpload(item.id, item.checksum, item.updatedAt)
+		}
+
+		// Delay between batches to reduce sustained backend load
+		if i+batchSize < len(toPush) {
+			time.Sleep(1 * time.Second)
 		}
 	}
 
