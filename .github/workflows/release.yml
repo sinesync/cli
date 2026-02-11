@@ -241,6 +241,20 @@ jobs:
           sha256sum *.tar.gz *.zip > checksums.txt
           cat checksums.txt
 
+      - name: GPG sign checksums
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --detach-sign --armor artifacts/checksums.txt
+            echo "Checksums signed successfully"
+          else
+            echo "Skipping GPG signing - no key configured"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -253,3 +267,97 @@ jobs:
             artifacts/*.tar.gz
             artifacts/*.zip
             artifacts/checksums.txt
+            artifacts/checksums.txt.asc
+            sinesync-release.pub
+
+  publish-gcs:
+    name: Publish to GCS
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      BUCKET: sinesync-releases
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p upload/${VERSION}
+
+          # Move archives into version directory
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} upload/${VERSION}/ \;
+
+          # Generate checksums
+          cd upload/${VERSION}
+          sha256sum *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
+          cd ../..
+
+          # Copy public key to version dir and bucket root
+          if [ -f sinesync-release.pub ]; then
+            cp sinesync-release.pub upload/${VERSION}/
+            cp sinesync-release.pub upload/
+          fi
+
+      - name: GPG sign checksums
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --detach-sign --armor upload/${VERSION}/checksums.txt
+            echo "Checksums signed"
+          else
+            echo "Skipping GPG signing — no key configured"
+          fi
+
+      - name: Upload to GCS
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          # Upload version directory (no-clobber to prevent overwriting existing releases)
+          gsutil -m cp -r -n "upload/${VERSION}" "gs://${BUCKET}/"
+
+          # Upload public key to bucket root (overwrite)
+          if [ -f upload/sinesync-release.pub ]; then
+            gsutil cp upload/sinesync-release.pub "gs://${BUCKET}/sinesync-release.pub"
+          fi
+
+          # Write latest version pointer (always overwrite, short cache)
+          echo -n "${VERSION}" > latest
+          gsutil -h "Cache-Control:public, max-age=300" cp latest "gs://${BUCKET}/latest"
+
+          echo "Published ${VERSION} to gs://${BUCKET}/"
+          gsutil ls "gs://${BUCKET}/${VERSION}/"
