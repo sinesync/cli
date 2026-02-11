@@ -17,47 +17,50 @@ document.addEventListener('DOMContentLoaded', () => {
     loadObservations();
 });
 
-// Sine wave animation in header
+// Sine wave animation in header (matches website SineWave component)
 function initSineWave() {
     const canvas = document.getElementById('sine-canvas');
     const ctx = canvas.getContext('2d');
 
     function resize() {
-        canvas.width = canvas.offsetWidth;
-        canvas.height = canvas.offsetHeight;
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = canvas.offsetWidth * dpr;
+        canvas.height = canvas.offsetHeight * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     resize();
     window.addEventListener('resize', resize);
 
-    let phase = 0;
+    let time = 0;
 
-    // Rainbow colors
     const rainbowColors = [
         '#ff0080', '#ff0040', '#ff8000', '#ffff00',
-        '#00ff80', '#00d4ff', '#0080ff', '#8000ff'
+        '#00ff80', '#00d4ff', '#0080ff', '#8000ff', '#ff0080'
     ];
 
     function draw() {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const w = canvas.offsetWidth;
+        const h = canvas.offsetHeight;
+        ctx.clearRect(0, 0, w, h);
 
-        // Create rainbow gradient
-        const gradient = ctx.createLinearGradient(0, 0, canvas.width, 0);
-        const colorShift = (phase * 0.5) % rainbowColors.length;
+        const amplitude = h * 0.15;
+        const frequency = 0.008;
+        const speed = 0.02;
+        const yOffset = h - amplitude;
+
+        // Rainbow gradient with flowing color shift
+        const gradient = ctx.createLinearGradient(0, 0, w, 0);
+        const colorShift = (time * 0.002) % rainbowColors.length;
         for (let i = 0; i < rainbowColors.length; i++) {
             const colorIndex = Math.floor((i + colorShift) % rainbowColors.length);
             gradient.addColorStop(i / (rainbowColors.length - 1), rainbowColors[colorIndex]);
         }
 
+        // Draw sine wave path
         ctx.beginPath();
-        ctx.strokeStyle = gradient;
-        ctx.lineWidth = 2;
-        ctx.shadowBlur = 15;
-        ctx.shadowColor = 'rgba(0, 212, 255, 0.5)';
-
-        for (let x = 0; x < canvas.width; x++) {
-            const y = canvas.height / 2 + Math.sin((x / 50) + phase) * 12;
-
+        for (let x = 0; x <= w; x += 2) {
+            const y = yOffset + Math.sin(x * frequency + time * speed) * amplitude;
             if (x === 0) {
                 ctx.moveTo(x, y);
             } else {
@@ -65,8 +68,20 @@ function initSineWave() {
             }
         }
 
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = 5;
+        ctx.lineCap = 'round';
+
+        // Multi-layer glow
+        ctx.shadowBlur = 40;
+        ctx.shadowColor = 'rgba(255, 0, 128, 0.8)';
         ctx.stroke();
-        phase += 0.02;
+
+        ctx.shadowBlur = 80;
+        ctx.shadowColor = 'rgba(0, 212, 255, 0.4)';
+        ctx.stroke();
+
+        time += 1;
         requestAnimationFrame(draw);
     }
 
