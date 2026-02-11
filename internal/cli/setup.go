@@ -171,9 +171,18 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("   %s", string(output))
 	}
 
-	// Step 7: Force cloud sync (pushes imported observations, pulls from other devices)
+	// Step 7: Sync vault keys (only if logged in, must run before cloud sync)
+	if authCfg, err := loadAuthConfig(); err == nil && authCfg != nil &&
+		(authCfg.DeviceToken != "" || authCfg.Token != "") {
+		fmt.Print("\n7. ")
+		if err := runVaultSync(nil, nil); err != nil {
+			fmt.Printf("   ✗ Vault sync failed: %v\n", err)
+		}
+	}
+
+	// Step 8: Force cloud sync (pushes imported observations, pulls from other devices)
 	if mode == "standalone" {
-		fmt.Println("\n7. Syncing with cloud...")
+		fmt.Println("\n8. Syncing with cloud...")
 		if err := triggerDaemonSync(daemon.DefaultPort); err != nil {
 			fmt.Printf("   ✗ Sync trigger failed: %v\n", err)
 		} else {

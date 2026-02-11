@@ -249,6 +249,12 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Println("Cloud sync is now enabled with end-to-end encryption.")
 
+	// Auto-sync vault keys so cloud sync works immediately
+	if err := runVaultSync(nil, nil); err != nil {
+		fmt.Printf("Warning: vault sync failed: %v\n", err)
+		fmt.Println("You can run 'sinesync vault sync' manually to sync vault keys.")
+	}
+
 	return nil
 }
 
