@@ -72,7 +72,18 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		hasCodex = true
 		fmt.Println("   ✓ OpenAI Codex")
 	}
-	if !hasClaudeCode && !hasCodex {
+	hasCursor := false
+	if _, err := exec.LookPath("cursor"); err == nil {
+		hasCursor = true
+	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if _, err := os.Stat(filepath.Join(home, ".cursor")); err == nil {
+			hasCursor = true
+		}
+	}
+	if hasCursor {
+		fmt.Println("   ✓ Cursor")
+	}
+	if !hasClaudeCode && !hasCodex && !hasCursor {
 		fmt.Println("   ✗ No supported AI coding tools found")
 	}
 
@@ -124,36 +135,72 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		fmt.Println("   → Using standalone mode")
 	}
 
-	// Step 2: Register MCP server
-	fmt.Println("\n2. Registering MCP server...")
-	err = registerMCPServer(binaryPath)
-	if err != nil {
-		fmt.Printf("   ✗ Failed: %v\n", err)
-		fmt.Println("   You can manually add to ~/.claude/settings.json")
-	} else {
-		fmt.Println("   ✓ MCP server registered")
-	}
-
-	// Step 3: Configure hooks based on mode
-	fmt.Println("\n3. Configuring Claude Code hooks...")
 	adapterMode := mode == "adapter"
-	err = configureAllHooks(binaryPath, adapterMode)
-	if err != nil {
-		fmt.Printf("   ✗ Failed: %v\n", err)
-	} else {
-		if adapterMode {
-			fmt.Println("   ✓ PreCompact hook (import observations)")
-			fmt.Println("   ✓ SessionStart hook (inject context on compact)")
+
+	// Step 2: Claude Code integration (if installed)
+	if hasClaudeCode {
+		fmt.Println("\n2. Configuring Claude Code...")
+		err = registerMCPServer(binaryPath)
+		if err != nil {
+			fmt.Printf("   ✗ MCP registration failed: %v\n", err)
+			fmt.Println("   You can manually add to ~/.claude/settings.json")
 		} else {
-			fmt.Println("   ✓ SessionStart hook (inject context)")
-			fmt.Println("   ✓ PostToolUse hook (capture observations)")
-			fmt.Println("   ✓ UserPromptSubmit hook (record prompts)")
-			fmt.Println("   ✓ Stop hook (session summary)")
+			fmt.Println("   ✓ MCP server registered")
 		}
+		err = configureAllHooks(binaryPath, adapterMode)
+		if err != nil {
+			fmt.Printf("   ✗ Hook configuration failed: %v\n", err)
+		} else {
+			if adapterMode {
+				fmt.Println("   ✓ PreCompact hook (import observations)")
+				fmt.Println("   ✓ SessionStart hook (inject context on compact)")
+			} else {
+				fmt.Println("   ✓ SessionStart hook (inject context)")
+				fmt.Println("   ✓ PostToolUse hook (capture observations)")
+				fmt.Println("   ✓ UserPromptSubmit hook (record prompts)")
+				fmt.Println("   ✓ Stop hook (session summary)")
+			}
+		}
+	} else {
+		fmt.Println("\n2. Skipping Claude Code (not installed)")
 	}
 
-	// Step 4: Save config
-	fmt.Println("\n4. Saving configuration...")
+	// Step 3: Cursor integration (if installed)
+	if hasCursor {
+		fmt.Println("\n3. Configuring Cursor...")
+		if err := configureCursor(binaryPath, adapterMode); err != nil {
+			fmt.Printf("   ✗ Failed: %v\n", err)
+		} else {
+			fmt.Println("   ✓ MCP server registered in ~/.cursor/mcp.json")
+			if adapterMode {
+				fmt.Println("   ✓ beforeSubmitPrompt hook (inject context)")
+			} else {
+				fmt.Println("   ✓ beforeSubmitPrompt hook (inject context)")
+				fmt.Println("   ✓ afterMCPExecution hook (capture observations)")
+				fmt.Println("   ✓ afterShellExecution hook (capture observations)")
+				fmt.Println("   ✓ afterFileEdit hook (capture file edits)")
+				fmt.Println("   ✓ stop hook (session summary)")
+			}
+		}
+	} else {
+		fmt.Println("\n3. Skipping Cursor (not installed)")
+	}
+
+	// Step 4: Codex integration (if installed)
+	if hasCodex {
+		fmt.Println("\n4. Configuring Codex...")
+		if err := configureCodex(binaryPath); err != nil {
+			fmt.Printf("   ✗ Failed: %v\n", err)
+		} else {
+			fmt.Println("   ✓ MCP server registered in ~/.codex/config.toml")
+			fmt.Println("   ✓ Notify hook configured for observation capture")
+		}
+	} else {
+		fmt.Println("\n4. Skipping Codex (not installed)")
+	}
+
+	// Step 5: Save config
+	fmt.Println("\n5. Saving configuration...")
 	cfg, _ := config.Load()
 	previousMode := cfg.Mode // capture before mutation
 	cfg.Mode = mode
@@ -164,9 +211,9 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("   ✓ Config saved to %s\n", config.ConfigPath())
 	}
 
-	// Step 5: Reset sync manifest if switching to standalone from a different mode
+	// Step 6: Reset sync manifest if switching to standalone from a different mode
 	if mode == "standalone" && previousMode != "standalone" {
-		fmt.Println("\n5. Resetting sync manifest for new backend...")
+		fmt.Println("\n6. Resetting sync manifest for new backend...")
 		syncManifest := storage.GetSyncManifest()
 		syncManifest.ClearSeenIDs()
 		if err := syncManifest.Save(); err != nil {
@@ -176,8 +223,8 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 6: Restart daemon (must restart so manifest reset takes effect)
-	fmt.Println("\n6. Restarting daemon...")
+	// Step 7: Restart daemon (must restart so manifest reset takes effect)
+	fmt.Println("\n7. Restarting daemon...")
 	stopCmd := exec.Command(binaryPath, "daemon", "stop")
 	stopCmd.CombinedOutput() // ignore error if not running
 	startCmd := exec.Command(binaryPath, "daemon", "start")
@@ -187,33 +234,22 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("   %s", string(output))
 	}
 
-	// Step 7: Sync vault keys (only if logged in, must run before cloud sync)
+	// Step 8: Sync vault keys (only if logged in, must run before cloud sync)
 	if authCfg, err := loadAuthConfig(); err == nil && authCfg != nil &&
 		(authCfg.DeviceToken != "" || authCfg.Token != "") {
-		fmt.Print("\n7. ")
+		fmt.Print("\n8. ")
 		if err := runVaultSync(nil, nil); err != nil {
 			fmt.Printf("   ✗ Vault sync failed: %v\n", err)
 		}
 	}
 
-	// Step 8: Force cloud sync (pushes imported observations, pulls from other devices)
+	// Step 9: Force cloud sync (pushes imported observations, pulls from other devices)
 	if mode == "standalone" {
-		fmt.Println("\n8. Syncing with cloud...")
+		fmt.Println("\n9. Syncing with cloud...")
 		if err := triggerDaemonSync(daemon.DefaultPort); err != nil {
 			fmt.Printf("   ✗ Sync trigger failed: %v\n", err)
 		} else {
 			fmt.Println("   ✓ Cloud sync triggered")
-		}
-	}
-
-	// Step 9: Codex integration (if installed)
-	if hasCodex {
-		fmt.Println("\n9. Codex integration...")
-		if err := configureCodex(binaryPath); err != nil {
-			fmt.Printf("   ✗ Failed: %v\n", err)
-		} else {
-			fmt.Println("   ✓ MCP server registered in ~/.codex/config.toml")
-			fmt.Println("   ✓ Notify hook configured for observation capture")
 		}
 	}
 
@@ -467,4 +503,141 @@ func configureCodex(binaryPath string) error {
 	}
 
 	return os.WriteFile(configPath, output, 0644)
+}
+
+// configureCursor registers sinesync's MCP server and hook entries for Cursor.
+// MCP server goes in ~/.cursor/mcp.json, hooks go in ~/.cursor/hooks.json.
+// In adapter mode, only the context hook is installed (claude-mem handles capture).
+// In standalone mode, all capture hooks are installed.
+// Existing entries from other tools are preserved (merged, not clobbered).
+func configureCursor(binaryPath string, adapterMode bool) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("cannot determine home dir: %w", err)
+	}
+
+	cursorDir := filepath.Join(home, ".cursor")
+
+	// Ensure .cursor directory exists
+	if err := os.MkdirAll(cursorDir, 0755); err != nil {
+		return fmt.Errorf("cannot create .cursor dir: %w", err)
+	}
+
+	// --- Register MCP server in ~/.cursor/mcp.json ---
+	mcpPath := filepath.Join(cursorDir, "mcp.json")
+	var mcpCfg map[string]interface{}
+	mcpData, err := os.ReadFile(mcpPath)
+	if os.IsNotExist(err) {
+		mcpCfg = make(map[string]interface{})
+	} else if err != nil {
+		return fmt.Errorf("cannot read mcp.json: %w", err)
+	} else {
+		if err := json.Unmarshal(mcpData, &mcpCfg); err != nil {
+			return fmt.Errorf("mcp.json has syntax error (fix manually or remove it): %w", err)
+		}
+	}
+
+	mcpServers, ok := mcpCfg["mcpServers"].(map[string]interface{})
+	if !ok {
+		mcpServers = make(map[string]interface{})
+	}
+	mcpServers["sinesync"] = map[string]interface{}{
+		"command": binaryPath,
+		"args":    []string{"mcp", "start"},
+	}
+	mcpCfg["mcpServers"] = mcpServers
+
+	mcpOutput, err := json.MarshalIndent(mcpCfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal mcp.json: %w", err)
+	}
+	if err := os.WriteFile(mcpPath, mcpOutput, 0644); err != nil {
+		return fmt.Errorf("failed to write mcp.json: %w", err)
+	}
+
+	// --- Configure hooks in ~/.cursor/hooks.json ---
+	hooksPath := filepath.Join(cursorDir, "hooks.json")
+	var cfg map[string]interface{}
+	data, err := os.ReadFile(hooksPath)
+	if os.IsNotExist(err) {
+		cfg = make(map[string]interface{})
+	} else if err != nil {
+		return fmt.Errorf("cannot read hooks.json: %w", err)
+	} else {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return fmt.Errorf("hooks.json has syntax error (fix manually or remove it): %w", err)
+		}
+	}
+
+	// Get or create hooks section
+	hooks, ok := cfg["hooks"].(map[string]interface{})
+	if !ok {
+		hooks = make(map[string]interface{})
+	}
+
+	// Define sinesync hook entries based on mode
+	sinesyncHooks := map[string]string{
+		"beforeSubmitPrompt": binaryPath + " cursor-hook context",
+	}
+	// Standalone-only hooks for direct observation capture
+	standaloneOnlyEvents := []string{"afterMCPExecution", "afterShellExecution", "afterFileEdit", "stop"}
+
+	if !adapterMode {
+		sinesyncHooks["afterMCPExecution"] = binaryPath + " cursor-hook capture"
+		sinesyncHooks["afterShellExecution"] = binaryPath + " cursor-hook capture"
+		sinesyncHooks["afterFileEdit"] = binaryPath + " cursor-hook file-edit"
+		sinesyncHooks["stop"] = binaryPath + " cursor-hook summarize"
+	}
+
+	for event, command := range sinesyncHooks {
+		entry := map[string]interface{}{"command": command}
+
+		// Merge into existing hook list, replacing any existing sinesync entry
+		existing, _ := hooks[event].([]interface{})
+		merged := make([]interface{}, 0, len(existing)+1)
+		for _, e := range existing {
+			if m, ok := e.(map[string]interface{}); ok {
+				if cmd, _ := m["command"].(string); strings.Contains(cmd, "sinesync") {
+					continue // Remove old sinesync entry
+				}
+			}
+			merged = append(merged, e)
+		}
+		merged = append(merged, entry)
+		hooks[event] = merged
+	}
+
+	// In adapter mode, clean up standalone-only hooks from a previous setup
+	if adapterMode {
+		for _, event := range standaloneOnlyEvents {
+			existing, _ := hooks[event].([]interface{})
+			if len(existing) == 0 {
+				continue
+			}
+			cleaned := make([]interface{}, 0, len(existing))
+			for _, e := range existing {
+				if m, ok := e.(map[string]interface{}); ok {
+					if cmd, _ := m["command"].(string); strings.Contains(cmd, "sinesync") {
+						continue // Remove sinesync capture hooks
+					}
+				}
+				cleaned = append(cleaned, e)
+			}
+			if len(cleaned) > 0 {
+				hooks[event] = cleaned
+			} else {
+				delete(hooks, event)
+			}
+		}
+	}
+
+	cfg["hooks"] = hooks
+
+	// Write back
+	output, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal hooks.json: %w", err)
+	}
+
+	return os.WriteFile(hooksPath, output, 0644)
 }
