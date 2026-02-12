@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.71.1
 	github.com/google/uuid v1.6.0
 	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
+	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/spf13/cobra v1.10.2
 	github.com/yalue/onnxruntime_go v1.25.0
 	github.com/zalando/go-keyring v0.2.6

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	toml "github.com/pelletier/go-toml/v2"
+
 	"github.com/miclip/sinesync/internal/adapters"
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/daemon"
@@ -56,9 +58,25 @@ func runSetup(cmd *cobra.Command, args []string) error {
 
 	reader := bufio.NewReader(os.Stdin)
 
-	// Step 1: Detect adapters and determine mode
-	fmt.Println("\n1. Detecting mode...")
+	// Step 1: Detect AI coding tools and adapters
+	fmt.Println("\n1. Detecting AI coding tools...")
 
+	// Detect supported coding tools
+	hasClaudeCode := false
+	if _, err := exec.LookPath("claude"); err == nil {
+		hasClaudeCode = true
+		fmt.Println("   ✓ Claude Code")
+	}
+	hasCodex := false
+	if _, err := exec.LookPath("codex"); err == nil {
+		hasCodex = true
+		fmt.Println("   ✓ OpenAI Codex")
+	}
+	if !hasClaudeCode && !hasCodex {
+		fmt.Println("   ✗ No supported AI coding tools found")
+	}
+
+	// Detect memory adapters
 	registry := adapters.DefaultRegistry()
 	available := registry.Available()
 	defer registry.Close()
@@ -66,8 +84,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	mode := "standalone"
 
 	if len(available) > 0 {
-		// Show detected adapters
-		fmt.Println("   Memory tools detected:")
+		fmt.Println("\n   Memory tools detected:")
 		for _, a := range available {
 			countStr := ""
 			if c, ok := a.(adapters.Countable); ok {
@@ -104,7 +121,6 @@ func runSetup(cmd *cobra.Command, args []string) error {
 			}
 		}
 	} else {
-		fmt.Println("   ✗ No memory tools found")
 		fmt.Println("   → Using standalone mode")
 	}
 
@@ -187,6 +203,17 @@ func runSetup(cmd *cobra.Command, args []string) error {
 			fmt.Printf("   ✗ Sync trigger failed: %v\n", err)
 		} else {
 			fmt.Println("   ✓ Cloud sync triggered")
+		}
+	}
+
+	// Step 9: Codex integration (if installed)
+	if hasCodex {
+		fmt.Println("\n9. Codex integration...")
+		if err := configureCodex(binaryPath); err != nil {
+			fmt.Printf("   ✗ Failed: %v\n", err)
+		} else {
+			fmt.Println("   ✓ MCP server registered in ~/.codex/config.toml")
+			fmt.Println("   ✓ Notify hook configured for observation capture")
 		}
 	}
 
@@ -389,4 +416,55 @@ func writeClaudeSettings(path string, settings *ClaudeSettings) error {
 	}
 
 	return os.WriteFile(path, data, 0644)
+}
+
+// configureCodex registers sinesync's MCP server and notify hook in Codex's config.toml.
+func configureCodex(binaryPath string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("cannot determine home dir: %w", err)
+	}
+
+	codexDir := filepath.Join(home, ".codex")
+	configPath := filepath.Join(codexDir, "config.toml")
+
+	// Ensure .codex directory exists
+	if err := os.MkdirAll(codexDir, 0755); err != nil {
+		return fmt.Errorf("cannot create .codex dir: %w", err)
+	}
+
+	// Read existing config (or start fresh)
+	var cfg map[string]interface{}
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		cfg = make(map[string]interface{})
+	} else if err != nil {
+		return fmt.Errorf("cannot read config.toml: %w", err)
+	} else {
+		if err := toml.Unmarshal(data, &cfg); err != nil {
+			return fmt.Errorf("config.toml has syntax error (fix manually or remove it): %w", err)
+		}
+	}
+
+	// Set notify command
+	cfg["notify"] = []string{binaryPath, "codex-notify"}
+
+	// Set MCP server
+	mcpServers, ok := cfg["mcp_servers"].(map[string]interface{})
+	if !ok {
+		mcpServers = make(map[string]interface{})
+	}
+	mcpServers["sinesync"] = map[string]interface{}{
+		"command": binaryPath,
+		"args":    []string{"mcp", "start"},
+	}
+	cfg["mcp_servers"] = mcpServers
+
+	// Write back
+	output, err := toml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal TOML: %w", err)
+	}
+
+	return os.WriteFile(configPath, output, 0644)
 }

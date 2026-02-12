@@ -242,6 +242,7 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/capture", s.handleCapture)
 	mux.HandleFunc("/api/summarize", s.handleSummarize)
 	mux.HandleFunc("/api/prompt", s.handlePrompt)
+	mux.HandleFunc("/api/codex-capture", s.handleCodexCapture)
 
 	// Dashboard API endpoints
 	mux.HandleFunc("/api/stats", s.handleStats)
@@ -972,6 +973,247 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		_ = sqlBackend.InsertUserPrompt(sessionID, prompt, project, promptNumber, time.Now().Unix())
 		log.Printf("[prompt] Recorded prompt for session=%s project=%s", sessionID, project)
 	})
+}
+
+// === Codex capture endpoint ===
+
+func (s *Server) handleCodexCapture(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	var payload struct {
+		Type                 string   `json:"type"`
+		ThreadID             string   `json:"thread-id"`
+		TurnID               string   `json:"turn-id"`
+		CWD                  string   `json:"cwd"`
+		InputMessages        []string `json:"input-messages"`
+		LastAssistantMessage string   `json:"last-assistant-message"`
+	}
+
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if payload.Type != "agent-turn-complete" {
+		writeJSON(w, map[string]interface{}{"status": "skipped", "reason": "unsupported event type"})
+		return
+	}
+
+	if payload.LastAssistantMessage == "" {
+		writeJSON(w, map[string]interface{}{"status": "skipped"})
+		return
+	}
+
+	// Ack immediately — do heavy work async
+	writeJSON(w, map[string]interface{}{"status": "accepted"})
+
+	s.enqueueHook(func() {
+		s.processCodexCapture(payload.ThreadID, payload.TurnID, payload.CWD, payload.InputMessages, payload.LastAssistantMessage)
+	})
+}
+
+// processCodexCapture extracts an observation from a Codex agent-turn-complete event.
+func (s *Server) processCodexCapture(threadID, turnID, cwd string, inputMessages []string, lastAssistantMessage string) {
+	project := ""
+	if cwd != "" && cwd != string(os.PathSeparator) {
+		project = filepath.Base(cwd)
+		if project == "." {
+			project = ""
+		}
+	}
+	log.Printf("[codex-capture] Processing: thread=%s project=%s", threadID, project)
+
+	now := time.Now()
+
+	// Derive title from first input message (the user prompt)
+	title := "Codex agent turn"
+	if len(inputMessages) > 0 && inputMessages[0] != "" {
+		title = truncate(inputMessages[0], 80)
+	}
+
+	// Derive observation type from user prompt (intent), not assistant message
+	userPrompt := ""
+	if len(inputMessages) > 0 {
+		userPrompt = inputMessages[0]
+	}
+	obsType := classifyCodexMessage(userPrompt)
+
+	// Extract file paths from the assistant message
+	files := extractFilePathsFromText(lastAssistantMessage)
+
+	// Extract concepts from the assistant message
+	concepts := extractConceptsFromText(lastAssistantMessage)
+
+	obs := &storage.Observation{
+		ID: generateID(),
+		Core: storage.Core{
+			Type:      obsType,
+			Title:     title,
+			Summary:   truncate(lastAssistantMessage, 200),
+			Content:   truncate(lastAssistantMessage, 2000),
+			Project:   project,
+			SessionID: threadID,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		Structured: storage.Structured{
+			Concepts: concepts,
+			Files: storage.Files{
+				Modified: files,
+			},
+		},
+		Source: storage.Source{
+			Adapter: "sinesync-codex",
+			ID:      threadID + ":" + turnID,
+			Epoch:   now.Unix(),
+		},
+	}
+
+	// Ensure session exists before saving (FK constraint)
+	if threadID != "" {
+		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+			_ = sqlBackend.EnsureSession(threadID, project, now.Unix())
+		}
+	}
+
+	// Generate embedding
+	textForEmbedding := obs.TextForEmbedding()
+	if s.embedder != nil && s.embedder.IsReady() {
+		embedding, err := s.embedder.Embed(textForEmbedding)
+		if err == nil {
+			obs.Embedding.Vector = embedding
+			obs.Embedding.Model = embeddings.ModelName
+			obs.Embedding.Tokenizer = s.embedder.TokenizerType()
+			obs.Embedding.Dims = embeddings.Dimensions
+		} else {
+			log.Printf("[codex-capture] WARNING: embedding failed: %v", err)
+		}
+	}
+
+	if err := s.backend.SaveObservation(obs); err != nil {
+		log.Printf("[codex-capture] Failed to save observation: %v", err)
+		return
+	}
+	s.invalidateCache()
+	s.syncManager.NotifyActivity()
+
+	if threadID != "" {
+		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+			_ = sqlBackend.IncrementSessionObservationCount(threadID)
+		}
+	}
+
+	log.Printf("[codex-capture] Saved: id=%s type=%s project=%s", obs.ID, obs.Core.Type, obs.Core.Project)
+}
+
+// classifyCodexMessage heuristically determines the observation type from the user prompt.
+func classifyCodexMessage(prompt string) string {
+	p := strings.ToLower(prompt)
+	switch {
+	case strings.Contains(p, "fix ") || strings.Contains(p, "debug") || strings.Contains(p, "broken") ||
+		strings.HasPrefix(p, "why is") || strings.HasPrefix(p, "why does"):
+		return "bugfix"
+	case strings.Contains(p, "review") || strings.Contains(p, "search") || strings.Contains(p, "find ") ||
+		strings.Contains(p, "explain") || strings.Contains(p, "what is") || strings.Contains(p, "how does") ||
+		strings.Contains(p, "look at") || strings.Contains(p, "check "):
+		return "discovery"
+	case strings.Contains(p, "refactor") || strings.Contains(p, "clean up") || strings.Contains(p, "reorganize"):
+		return "refactor"
+	case strings.Contains(p, "add ") || strings.Contains(p, "implement") || strings.Contains(p, "create ") ||
+		strings.Contains(p, "build ") || strings.Contains(p, "write "):
+		return "feature"
+	default:
+		return "change"
+	}
+}
+
+// extractFilePathsFromText scans text for file path patterns.
+func extractFilePathsFromText(text string) []string {
+	seen := make(map[string]bool)
+	var files []string
+
+	// Split on whitespace and common delimiters
+	for _, word := range strings.FieldsFunc(text, func(r rune) bool {
+		return r == ' ' || r == '\n' || r == '\t' || r == '`' || r == '\'' || r == '"' || r == '(' || r == ')' || r == ','
+	}) {
+		// Trim trailing punctuation that commonly follows file paths (e.g., "file.go:")
+		clean := strings.TrimRight(word, ":;.")
+		if clean == "" {
+			continue
+		}
+		if isFilePath(clean) {
+			if !seen[clean] {
+				seen[clean] = true
+				files = append(files, clean)
+			}
+		}
+	}
+
+	return files
+}
+
+// isFilePath checks if a string looks like a file path.
+func isFilePath(s string) bool {
+	// Must contain a dot (for extension) or a slash
+	if !strings.Contains(s, "/") && !strings.Contains(s, ".") {
+		return false
+	}
+	// Must have a recognizable file extension
+	ext := strings.ToLower(filepath.Ext(s))
+	switch ext {
+	case ".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".rb", ".java",
+		".svelte", ".vue", ".css", ".scss", ".html", ".sql", ".tf", ".toml",
+		".yaml", ".yml", ".json", ".md", ".sh", ".bash", ".zsh",
+		".c", ".h", ".cpp", ".hpp", ".swift", ".kt", ".scala":
+		return true
+	}
+	return false
+}
+
+// extractConceptsFromText extracts language/framework concepts from free text.
+func extractConceptsFromText(text string) []string {
+	txt := strings.ToLower(text)
+	var concepts []string
+	seen := make(map[string]bool)
+
+	checks := []struct {
+		pattern string
+		concept string
+	}{
+		{"golang", "go"}, {".go", "go"}, {"go build", "go"},
+		{"typescript", "typescript"}, {".ts", "typescript"}, {".tsx", "typescript"},
+		{"javascript", "javascript"}, {".js", "javascript"},
+		{"python", "python"}, {".py", "python"},
+		{"rust", "rust"}, {".rs", "rust"},
+		{"terraform", "terraform"}, {".tf", "terraform"},
+		{"docker", "docker"}, {"dockerfile", "docker"},
+		{"svelte", "svelte"}, {".svelte", "svelte"},
+		{"react", "react"}, {"jsx", "react"},
+		{"git commit", "git"}, {"git push", "git"},
+		{"npm ", "nodejs"}, {"yarn ", "nodejs"}, {"pnpm ", "nodejs"},
+		{"test", "testing"}, {"pytest", "testing"}, {"jest", "testing"},
+		{"build", "build"}, {"compile", "build"},
+		{"sql", "sql"}, {"database", "sql"},
+		{"api", "api"}, {"endpoint", "api"},
+	}
+
+	for _, c := range checks {
+		if strings.Contains(txt, c.pattern) && !seen[c.concept] {
+			seen[c.concept] = true
+			concepts = append(concepts, c.concept)
+		}
+	}
+
+	return concepts
 }
 
 // === Dashboard API endpoints ===
