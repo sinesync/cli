@@ -75,7 +75,7 @@ func WritePIDInfo(info *PIDInfo) error {
 		return err
 	}
 
-	return os.WriteFile(PIDFilePath(), data, 0644)
+	return os.WriteFile(PIDFilePath(), data, 0600)
 }
 
 // RemovePIDFile removes the PID file
