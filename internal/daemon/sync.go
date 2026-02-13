@@ -557,7 +557,8 @@ func (m *SyncManager) refreshAccessToken() (string, error) {
 	}
 
 	var result struct {
-		Token string `json:"token"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refreshToken"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", fmt.Errorf("decode refresh response: %w", err)
@@ -568,6 +569,13 @@ func (m *SyncManager) refreshAccessToken() (string, error) {
 	if err := keyring.Set(keyringService, "token", result.Token); err != nil {
 		// Also update auth.json as fallback
 		m.updateStoredToken(result.Token)
+	}
+
+	// Store rotated refresh token if provided
+	if result.RefreshToken != "" {
+		if err := keyring.Set(keyringService, "refreshToken", result.RefreshToken); err != nil {
+			log.Printf("[sync] Warning: failed to store rotated refresh token in keyring — user will need to re-login")
+		}
 	}
 
 	log.Printf("[sync] Token refreshed successfully")

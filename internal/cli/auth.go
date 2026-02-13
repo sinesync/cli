@@ -757,6 +757,7 @@ func saveAuthConfig(cfg *AuthConfig) error {
 	if cfg.Token != "" {
 		if err := kr.Set(keyringService, "token", cfg.Token); err != nil {
 			// Fall back to file storage if keychain unavailable
+			fmt.Fprintf(os.Stderr, "Warning: system keychain unavailable, storing tokens in %s\n", authConfigPath())
 			return saveAuthConfigToFile(cfg)
 		}
 	}
@@ -867,14 +868,24 @@ func refreshAccessToken(apiBase string) (string, error) {
 	}
 
 	var result struct {
-		Token string `json:"token"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refreshToken"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
 
-	// Save new token to keyring
-	_ = kr.Set(keyringService, "token", result.Token)
+	// Save new access token to keyring
+	if err := kr.Set(keyringService, "token", result.Token); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to store access token in keyring: %v\n", err)
+	}
+
+	// Save rotated refresh token if provided
+	if result.RefreshToken != "" {
+		if err := kr.Set(keyringService, "refreshToken", result.RefreshToken); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to store rotated refresh token in keyring — run 'sinesync login' to re-authenticate\n")
+		}
+	}
 
 	return result.Token, nil
 }
