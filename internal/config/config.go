@@ -148,7 +148,12 @@ func Save(cfg *Config) error {
 		return err
 	}
 
-	return os.WriteFile(ConfigPath(), data, 0644)
+	path := ConfigPath()
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	// Chmod ensures existing files get tightened (WriteFile only sets mode on create)
+	return os.Chmod(path, 0600)
 }
 
 // ShouldSyncProject checks if a project should be synced based on config

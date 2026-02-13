@@ -124,7 +124,11 @@ alwaysApply: true
 %s
 `, content)
 
-	return os.WriteFile(filepath.Join(rulesDir, "sinesync-context.mdc"), []byte(mdcContent), 0644)
+	path := filepath.Join(rulesDir, "sinesync-context.mdc")
+	if err := os.WriteFile(path, []byte(mdcContent), 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
 
 // runCursorContext handles beforeSubmitPrompt: fetches context from daemon

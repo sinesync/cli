@@ -332,8 +332,11 @@ func registerMCPServer(binaryPath string) error {
 				if len(mcpServers) == 0 {
 					delete(settings, "mcpServers")
 				}
-				out, _ := json.MarshalIndent(settings, "", "  ")
-				os.WriteFile(settingsPath, out, 0644)
+				if out, marshalErr := json.MarshalIndent(settings, "", "  "); marshalErr == nil {
+					if writeErr := os.WriteFile(settingsPath, out, 0600); writeErr == nil {
+						os.Chmod(settingsPath, 0600)
+					}
+				}
 			}
 		}
 	}
@@ -443,13 +446,18 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 
 	settings["hooks"] = hooks
 
-	// Write back
+	// Write back — ensure directory exists for fresh installs
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0755); err != nil {
+		return err
+	}
 	output, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
 	}
-
-	return os.WriteFile(settingsPath, output, 0644)
+	if err := os.WriteFile(settingsPath, output, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(settingsPath, 0600)
 }
 
 func getClaudeSettingsPath() string {
@@ -469,7 +477,10 @@ func writeClaudeSettings(path string, settings *ClaudeSettings) error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0644)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
 
 // configureCodex registers sinesync's MCP server and notify hook in Codex's config.toml.
@@ -520,7 +531,10 @@ func configureCodex(binaryPath string) error {
 		return fmt.Errorf("failed to marshal TOML: %w", err)
 	}
 
-	return os.WriteFile(configPath, output, 0644)
+	if err := os.WriteFile(configPath, output, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(configPath, 0600)
 }
 
 // configureCursor registers sinesync's MCP server and hook entries for Cursor.
@@ -569,9 +583,10 @@ func configureCursor(binaryPath string, adapterMode bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal mcp.json: %w", err)
 	}
-	if err := os.WriteFile(mcpPath, mcpOutput, 0644); err != nil {
+	if err := os.WriteFile(mcpPath, mcpOutput, 0600); err != nil {
 		return fmt.Errorf("failed to write mcp.json: %w", err)
 	}
+	os.Chmod(mcpPath, 0600)
 
 	// --- Configure hooks in ~/.cursor/hooks.json ---
 	hooksPath := filepath.Join(cursorDir, "hooks.json")
@@ -657,5 +672,8 @@ func configureCursor(binaryPath string, adapterMode bool) error {
 		return fmt.Errorf("failed to marshal hooks.json: %w", err)
 	}
 
-	return os.WriteFile(hooksPath, output, 0644)
+	if err := os.WriteFile(hooksPath, output, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(hooksPath, 0600)
 }
