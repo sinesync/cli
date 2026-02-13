@@ -9,8 +9,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/spf13/cobra"
 )
@@ -87,6 +89,53 @@ var hookClient = &http.Client{Timeout: 3 * time.Second}
 // contextClient has a longer timeout since context injection reads the full response.
 var contextClient = &http.Client{Timeout: 10 * time.Second}
 
+// readHookSecret reads the daemon hook secret from the data directory.
+func readHookSecret() string {
+	secretPath := filepath.Join(config.DataDir(), "hook-secret")
+	data, err := os.ReadFile(secretPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// hookPost sends a POST request to the daemon with the hook secret header.
+func hookPost(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	if secret := readHookSecret(); secret != "" {
+		req.Header.Set("X-Hook-Secret", secret)
+	}
+	return hookClient.Do(req)
+}
+
+// hookGet sends a GET request to the daemon with the hook secret header.
+func hookGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if secret := readHookSecret(); secret != "" {
+		req.Header.Set("X-Hook-Secret", secret)
+	}
+	return hookClient.Do(req)
+}
+
+// contextGet sends a GET request using the longer-timeout context client with the hook secret.
+func contextGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if secret := readHookSecret(); secret != "" {
+		req.Header.Set("X-Hook-Secret", secret)
+	}
+	return contextClient.Do(req)
+}
+
 // runContext needs the response (injected into Claude Code's context via stdout),
 // so it waits for the full response. Uses a longer timeout than fire-and-forget hooks.
 func runContext(cmd *cobra.Command, args []string) error {
@@ -106,7 +155,7 @@ func runContext(cmd *cobra.Command, args []string) error {
 	apiURL := daemonURL(fmt.Sprintf("/api/context?project=%s&session_id=%s",
 		url.QueryEscape(project), url.QueryEscape(input.SessionID)))
 
-	resp, err := contextClient.Get(apiURL)
+	resp, err := contextGet(apiURL)
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}
@@ -117,7 +166,7 @@ func runContext(cmd *cobra.Command, args []string) error {
 }
 
 func checkAuthStatus() string {
-	resp, err := hookClient.Get(daemonURL("/api/sync"))
+	resp, err := hookGet(daemonURL("/api/sync"))
 	if err != nil {
 		return ""
 	}
@@ -153,7 +202,7 @@ func runCapture(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	resp, err := hookClient.Post(daemonURL("/api/capture"), "application/json", bytes.NewReader(inputData))
+	resp, err := hookPost(daemonURL("/api/capture"), "application/json", bytes.NewReader(inputData))
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}
@@ -167,7 +216,7 @@ func runSummarize(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	resp, err := hookClient.Post(daemonURL("/api/summarize"), "application/json", bytes.NewReader(inputData))
+	resp, err := hookPost(daemonURL("/api/summarize"), "application/json", bytes.NewReader(inputData))
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}
@@ -181,7 +230,7 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	resp, err := hookClient.Post(daemonURL("/api/prompt"), "application/json", bytes.NewReader(inputData))
+	resp, err := hookPost(daemonURL("/api/prompt"), "application/json", bytes.NewReader(inputData))
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}

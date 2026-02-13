@@ -56,7 +56,7 @@ func runCodexNotify(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	resp, err := hookClient.Post(daemonURL("/api/codex-capture"), "application/json", bytes.NewReader(body))
+	resp, err := hookPost(daemonURL("/api/codex-capture"), "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}

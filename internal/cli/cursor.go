@@ -147,7 +147,7 @@ func runCursorContext(cmd *cobra.Command, args []string) error {
 	apiURL := daemonURL(fmt.Sprintf("/api/context?project=%s&session_id=%s",
 		url.QueryEscape(project), url.QueryEscape(input.ConversationID)))
 
-	resp, err := contextClient.Get(apiURL)
+	resp, err := contextGet(apiURL)
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}
@@ -235,7 +235,7 @@ func runCursorCapture(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	resp, err := hookClient.Post(daemonURL("/api/capture"), "application/json", bytes.NewReader(body))
+	resp, err := hookPost(daemonURL("/api/capture"), "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}
@@ -270,7 +270,7 @@ func runCursorFileEdit(cmd *cobra.Command, args []string) error {
 			ToolInput: toolInput,
 		}
 		body, _ := json.Marshal(payload)
-		if resp, err := hookClient.Post(daemonURL("/api/capture"), "application/json", bytes.NewReader(body)); err == nil {
+		if resp, err := hookPost(daemonURL("/api/capture"), "application/json", bytes.NewReader(body)); err == nil {
 			drainClose(resp)
 		}
 		return nil
@@ -293,7 +293,7 @@ func runCursorFileEdit(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			continue
 		}
-		if resp, err := hookClient.Post(daemonURL("/api/capture"), "application/json", bytes.NewReader(body)); err == nil {
+		if resp, err := hookPost(daemonURL("/api/capture"), "application/json", bytes.NewReader(body)); err == nil {
 			drainClose(resp)
 		}
 	}
@@ -322,7 +322,7 @@ func runCursorSummarize(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	resp, err := hookClient.Post(daemonURL("/api/summarize"), "application/json", bytes.NewReader(body))
+	resp, err := hookPost(daemonURL("/api/summarize"), "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}

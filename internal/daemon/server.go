@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -53,6 +54,9 @@ type Server struct {
 	hookQueue    chan func()
 	hookDone     chan struct{}
 	hookShutdown atomic.Bool
+
+	// Shared secret for hook API authentication
+	hookSecret string
 }
 
 // NewServer creates a new daemon server
@@ -229,20 +233,48 @@ func (s *Server) enqueueHook(fn func()) {
 	}
 }
 
+// requireHookAuth wraps a handler to require the hook secret in the X-Hook-Secret header.
+func (s *Server) requireHookAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.hookSecret != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Hook-Secret")), []byte(s.hookSecret)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// generateHookSecret creates a random secret and writes it to a 0600 file.
+func (s *Server) generateHookSecret() error {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Errorf("generate hook secret: %w", err)
+	}
+	s.hookSecret = fmt.Sprintf("%x", b)
+
+	secretPath := filepath.Join(config.DataDir(), "hook-secret")
+	return os.WriteFile(secretPath, []byte(s.hookSecret), 0600)
+}
+
 // Run starts the server and blocks until shutdown
 func (s *Server) Run() error {
+	// Generate shared secret for hook API authentication
+	if err := s.generateHookSecret(); err != nil {
+		log.Printf("[daemon] Warning: failed to generate hook secret: %v (hook auth disabled)", err)
+	}
+
 	mux := http.NewServeMux()
 
-	// Health/status endpoints
+	// Health/status endpoints (no auth required)
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/status", s.handleStatus)
 
-	// Hook API endpoints
-	mux.HandleFunc("/api/context", s.handleContext)
-	mux.HandleFunc("/api/capture", s.handleCapture)
-	mux.HandleFunc("/api/summarize", s.handleSummarize)
-	mux.HandleFunc("/api/prompt", s.handlePrompt)
-	mux.HandleFunc("/api/codex-capture", s.handleCodexCapture)
+	// Hook API endpoints (require hook secret)
+	mux.HandleFunc("/api/context", s.requireHookAuth(s.handleContext))
+	mux.HandleFunc("/api/capture", s.requireHookAuth(s.handleCapture))
+	mux.HandleFunc("/api/summarize", s.requireHookAuth(s.handleSummarize))
+	mux.HandleFunc("/api/prompt", s.requireHookAuth(s.handlePrompt))
+	mux.HandleFunc("/api/codex-capture", s.requireHookAuth(s.handleCodexCapture))
 
 	// Dashboard API endpoints
 	mux.HandleFunc("/api/stats", s.handleStats)
