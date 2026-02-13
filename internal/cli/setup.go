@@ -49,11 +49,29 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	fmt.Println("sine~sync setup")
 	fmt.Println("─────────────────────────────────────────")
 
-	// Get binary path
-	binaryPath, err := exec.LookPath("sinesync")
-	if err != nil {
-		// Try current directory
-		binaryPath, _ = filepath.Abs("./sinesync")
+	// Resolve the binary path for hook/MCP configuration.
+	// Prefer os.Executable() for the actual running binary, but detect
+	// temporary paths from "go run" and fall back to PATH lookup.
+	binaryPath, err := os.Executable()
+	if err == nil {
+		// Detect "go run" temp binaries — they won't exist after the process exits
+		if strings.Contains(binaryPath, "/go-build") || strings.Contains(binaryPath, "\\go-build") {
+			if lp, lpErr := exec.LookPath("sinesync"); lpErr == nil {
+				binaryPath = lp
+			} else {
+				return fmt.Errorf("running via 'go run' and sinesync is not on PATH — please install the binary first")
+			}
+		}
+	} else {
+		// os.Executable() failed — fall back to PATH lookup
+		if lp, lpErr := exec.LookPath("sinesync"); lpErr == nil {
+			binaryPath = lp
+		} else {
+			return fmt.Errorf("unable to determine sinesync binary path: %w", err)
+		}
+	}
+	if _, statErr := os.Stat(binaryPath); statErr != nil {
+		return fmt.Errorf("sinesync binary not found at %q: %w", binaryPath, statErr)
 	}
 
 	reader := bufio.NewReader(os.Stdin)
