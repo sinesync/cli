@@ -25,6 +25,13 @@ import (
 	"golang.org/x/term"
 )
 
+// zeroBytes overwrites a byte slice with zeros to clear sensitive data from memory.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
 const keyringService = "sinesync"
 
 const DefaultAPIBase = "https://api.sinesync.ai/v1"
@@ -134,6 +141,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
+	defer zeroBytes(passwordBytes)
 	password := string(passwordBytes)
 
 	if password == "" {
@@ -278,6 +286,7 @@ func runSignup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
+	defer zeroBytes(passwordBytes)
 	password := string(passwordBytes)
 
 	if password == "" {
@@ -291,6 +300,7 @@ func runSignup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read password: %w", err)
 	}
+	defer zeroBytes(confirmBytes)
 
 	if string(confirmBytes) != password {
 		return fmt.Errorf("passwords do not match")
@@ -967,6 +977,7 @@ func promptSecretKey() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer zeroBytes(input)
 
 	// Normalize the secret key (remove whitespace, uppercase)
 	secretKey := crypto.NormalizeSecretKey(strings.TrimSpace(string(input)))
