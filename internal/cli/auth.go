@@ -3,14 +3,21 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,6 +52,7 @@ type AuthConfig struct {
 	ExpiresAt    string `json:"expiresAt"`
 	DeviceID     string `json:"deviceId,omitempty"`
 	DeviceToken  string `json:"deviceToken,omitempty"`
+	AuthMethod   string `json:"authMethod,omitempty"` // "srp" or "saml"
 }
 
 var loginCmd = &cobra.Command{
@@ -132,6 +140,17 @@ func runLogin(cmd *cobra.Command, args []string) error {
 
 	if email == "" {
 		return fmt.Errorf("email is required")
+	}
+
+	// Check for SAML SSO before prompting for password
+	samlResult, err := discoverSAML(apiBase, email)
+	if err != nil {
+		// Discovery failure is non-fatal; fall back to password login
+		fmt.Fprintf(os.Stderr, "Warning: SSO discovery failed: %v\n", err)
+	}
+
+	if samlResult != nil && samlResult.SAMLEnabled {
+		return doSAMLLoginFlow(apiBase, email, samlResult.OrgSlug)
 	}
 
 	// Get password
@@ -238,6 +257,7 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		ExpiresAt:    deviceResp.ExpiresAt,
 		DeviceID:     deviceResp.Device.ID,
 		DeviceToken:  deviceResp.Token,
+		AuthMethod:   "srp",
 	}
 
 	if err := saveAuthConfig(authCfg); err != nil {
@@ -264,6 +284,235 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// --- SAML SSO Login ---
+
+type samlDiscoverResult struct {
+	SAMLEnabled bool   `json:"samlEnabled"`
+	OrgSlug     string `json:"orgSlug"`
+}
+
+// discoverSAML checks if the user's email domain has SAML SSO enabled.
+func discoverSAML(apiBase, email string) (*samlDiscoverResult, error) {
+	body, _ := json.Marshal(map[string]string{"email": email})
+	req, err := http.NewRequest("POST", apiBase+"/auth/saml/discover", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	httputil.SetClientHeaders(req)
+
+	resp, err := authHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("discovery returned %d", resp.StatusCode)
+	}
+
+	var result samlDiscoverResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// doSAMLLoginFlow performs the full SAML login: PKCE, browser, callback, token exchange, device registration.
+func doSAMLLoginFlow(apiBase, email, orgSlug string) error {
+	fmt.Printf("SSO detected for %s — opening browser for authentication...\n", email)
+
+	// Generate PKCE pair
+	verifierBytes := make([]byte, 43)
+	if _, err := rand.Read(verifierBytes); err != nil {
+		return fmt.Errorf("failed to generate PKCE verifier: %w", err)
+	}
+	codeVerifier := base64.RawURLEncoding.EncodeToString(verifierBytes)
+	challengeHash := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(challengeHash[:])
+
+	// Generate state nonce
+	stateBytes := make([]byte, 16)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return fmt.Errorf("failed to generate state: %w", err)
+	}
+	state := base64.RawURLEncoding.EncodeToString(stateBytes)
+
+	// Start localhost HTTP server on a random port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("failed to start callback server: %w", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	type callbackResult struct {
+		code  string
+		state string
+		err   error
+	}
+	resultCh := make(chan callbackResult, 1)
+	var once sync.Once
+	sendResult := func(r callbackResult) {
+		once.Do(func() { resultCh <- r })
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		cbState := r.URL.Query().Get("state")
+		cbCode := r.URL.Query().Get("code")
+		cbError := r.URL.Query().Get("error")
+
+		if cbError != "" {
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, "<html><body><h2>Login failed</h2><p>%s</p><p>You can close this tab.</p></body></html>", html.EscapeString(cbError))
+			sendResult(callbackResult{err: fmt.Errorf("SSO error: %s", cbError)})
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body><h2>Login complete!</h2><p>You can close this tab and return to the terminal.</p></body></html>")
+		sendResult(callbackResult{code: cbCode, state: cbState})
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			sendResult(callbackResult{err: fmt.Errorf("callback server error: %w", err)})
+		}
+	}()
+
+	// Build login URL
+	loginURL := fmt.Sprintf("%s/auth/saml/login?org=%s&clientType=cli&port=%d&code_challenge=%s&state=%s",
+		apiBase, orgSlug, port, codeChallenge, state)
+
+	// Open browser
+	if err := openBrowserForSAML(loginURL); err != nil {
+		fmt.Println("Could not open browser automatically.")
+		fmt.Println("Open this URL in your browser:")
+		fmt.Printf("  %s\n", loginURL)
+	}
+
+	fmt.Println("Waiting for SSO authentication...")
+
+	// Wait for callback with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	var cbResult callbackResult
+	select {
+	case cbResult = <-resultCh:
+	case <-ctx.Done():
+		server.Shutdown(context.Background())
+		return fmt.Errorf("SSO login timed out after 120 seconds")
+	}
+
+	// Shut down callback server
+	server.Shutdown(context.Background())
+
+	if cbResult.err != nil {
+		return cbResult.err
+	}
+
+	// Verify state nonce
+	if cbResult.state != state {
+		return fmt.Errorf("SSO state mismatch — possible CSRF attack")
+	}
+
+	fmt.Println("✓ SSO authentication successful")
+
+	// Exchange auth code for tokens
+	exchangeBody, _ := json.Marshal(map[string]string{
+		"code":          cbResult.code,
+		"code_verifier": codeVerifier,
+	})
+
+	exchangeReq, err := http.NewRequest("POST", apiBase+"/auth/saml/token", bytes.NewReader(exchangeBody))
+	if err != nil {
+		return fmt.Errorf("failed to create token exchange request: %w", err)
+	}
+	exchangeReq.Header.Set("Content-Type", "application/json")
+	httputil.SetClientHeaders(exchangeReq)
+
+	exchangeResp, err := authHTTPClient.Do(exchangeReq)
+	if err != nil {
+		return fmt.Errorf("token exchange failed: %w", err)
+	}
+	defer exchangeResp.Body.Close()
+
+	if exchangeResp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(exchangeResp.Body)
+		return fmt.Errorf("token exchange failed: %d - %s", exchangeResp.StatusCode, string(respBody))
+	}
+
+	var tokenResult authResponse
+	if err := json.NewDecoder(exchangeResp.Body).Decode(&tokenResult); err != nil {
+		return fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	fmt.Println("✓ Authenticated via SSO")
+
+	// Register device
+	hostname := getHostname()
+	platform := getPlatform()
+
+	fmt.Printf("Registering device: %s (%s)...\n", hostname, platform)
+
+	deviceResp, err := registerDevice(apiBase, tokenResult.Token, hostname, platform)
+	if err != nil {
+		if isAccountDeletedError(err) {
+			return fmt.Errorf("this account has been deleted")
+		}
+		return fmt.Errorf("device registration failed: %w", err)
+	}
+
+	fmt.Println("✓ Device registered")
+
+	// Save auth config with SAML auth method
+	authCfg := &AuthConfig{
+		UserID:       tokenResult.User.ID,
+		Email:        tokenResult.User.Email,
+		Token:        deviceResp.Token,
+		RefreshToken: deviceResp.RefreshToken,
+		ExpiresAt:    deviceResp.ExpiresAt,
+		DeviceID:     deviceResp.Device.ID,
+		DeviceToken:  deviceResp.Token,
+		AuthMethod:   "saml",
+	}
+
+	if err := saveAuthConfig(authCfg); err != nil {
+		return fmt.Errorf("failed to save auth: %w", err)
+	}
+
+	// Update last auth time
+	keychain.SetLastAuth(time.Now())
+
+	fmt.Println()
+	fmt.Println("✓ Logged in via SSO!")
+	fmt.Printf("  User: %s\n", authCfg.Email)
+	fmt.Printf("  Device: %s\n", hostname)
+	fmt.Println()
+	fmt.Println("Logged in via SSO. Cloud sync features that require encryption")
+	fmt.Println("are not yet available for SSO users.")
+
+	return nil
+}
+
+// openBrowserForSAML opens the given URL in the user's default browser.
+func openBrowserForSAML(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "linux":
+		cmd = exec.Command("xdg-open", url)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", "", url)
+	default:
+		return fmt.Errorf("unsupported platform")
+	}
+	return cmd.Start()
 }
 
 func runSignup(cmd *cobra.Command, args []string) error {
