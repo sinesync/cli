@@ -507,14 +507,448 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 	// Update last auth time
 	keychain.SetLastAuth(time.Now())
 
+	// SSO device-key encryption setup
+	token := authCfg.Token
+
+	status, err := ssoCredentialStatus(apiBase, token)
+	if err != nil {
+		return fmt.Errorf("failed to check SSO credential status: %w", err)
+	}
+
+	if !status.HasBundle {
+		// First-ever SSO login — bootstrap encryption keys
+		if err := ssoBootstrap(apiBase, token); err != nil {
+			return fmt.Errorf("SSO key bootstrap failed: %w", err)
+		}
+	} else if keychain.HasDeviceKey() {
+		// Returning device — unlock from device key
+		if err := ssoSameDeviceUnlock(apiBase, token); err != nil {
+			return fmt.Errorf("SSO device unlock failed: %w", err)
+		}
+	} else {
+		// New device — device linking flow
+		if err := ssoNewDeviceLink(apiBase, token, hostname, platform); err != nil {
+			return fmt.Errorf("SSO device link failed: %w", err)
+		}
+	}
+
+	// Check if user has a keypair, generate one if not
+	checkAndGenerateKeypair(authCfg.Token)
+
 	fmt.Println()
 	fmt.Println("✓ Logged in via SSO!")
 	fmt.Printf("  User: %s\n", authCfg.Email)
 	fmt.Printf("  Device: %s\n", hostname)
 	fmt.Println()
-	fmt.Println("Logged in via SSO. Cloud sync features that require encryption")
-	fmt.Println("are not yet available for SSO users.")
+	fmt.Println("Cloud sync is now enabled with end-to-end encryption.")
 
+	// Auto-sync vault keys
+	if err := runVaultSync(nil, nil); err != nil {
+		fmt.Printf("Warning: vault sync failed: %v\n", err)
+		fmt.Println("You can run 'sinesync vault sync' manually to sync vault keys.")
+	}
+
+	return nil
+}
+
+// --- SSO encryption helpers ---
+
+type ssoStatusResult struct {
+	HasBundle bool `json:"hasBundle"`
+}
+
+func ssoCredentialStatus(apiBase, token string) (*ssoStatusResult, error) {
+	req, err := http.NewRequest("GET", apiBase+"/sso/credentials/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
+
+	resp, err := authHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result ssoStatusResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ssoBootstrap generates new encryption keys for first-time SSO login.
+// The server derives the device ID from the access token.
+func ssoBootstrap(apiBase, token string) error {
+	fmt.Println("Setting up device-key encryption for SSO...")
+
+	// 1. Generate random 32-byte account key (master encryption key)
+	accountKey, err := crypto.GenerateKey(32)
+	if err != nil {
+		return fmt.Errorf("generate account key: %w", err)
+	}
+
+	// 2. Generate X25519 keypair for vault sharing
+	publicKey, privateKey, err := crypto.GenerateX25519Keypair()
+	if err != nil {
+		return fmt.Errorf("generate keypair: %w", err)
+	}
+
+	// 3. Generate random 32-byte device key
+	deviceKey, err := crypto.GenerateKey(32)
+	if err != nil {
+		return fmt.Errorf("generate device key: %w", err)
+	}
+
+	// 4. Store device key in keychain
+	if err := keychain.SetDeviceKey(deviceKey); err != nil {
+		return fmt.Errorf("store device key: %w", err)
+	}
+
+	// 5. Build credential bundle JSON
+	bundleJSON, err := json.Marshal(map[string]string{
+		"version":    "1",
+		"accountKey": base64.StdEncoding.EncodeToString(accountKey),
+		"privateKey": privateKey,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal bundle: %w", err)
+	}
+
+	// 6. Encrypt bundle with device key
+	encryptedBundle, err := encryption.EncryptCredentialBundle(bundleJSON, deviceKey)
+	if err != nil {
+		return fmt.Errorf("encrypt bundle: %w", err)
+	}
+
+	// 7. Set account key as the derived key
+	encMgr := encryption.GetManager()
+	if err := encMgr.SetKeyDirect(accountKey); err != nil {
+		return fmt.Errorf("set key: %w", err)
+	}
+
+	// 8. Create test blob for key verification
+	testBlob, err := encMgr.CreateTestBlob()
+	if err != nil {
+		return fmt.Errorf("create test blob: %w", err)
+	}
+
+	// 9. Encrypt private key with account key
+	encryptedPrivateKey, err := encMgr.EncryptUserPrivateKey([]byte(privateKey))
+	if err != nil {
+		return fmt.Errorf("encrypt private key: %w", err)
+	}
+
+	// 10. Upload to server
+	body, _ := json.Marshal(map[string]string{
+		"encryptedBundle":     base64.StdEncoding.EncodeToString(encryptedBundle),
+		"publicKey":           publicKey,
+		"encryptedPrivateKey": encryptedPrivateKey,
+		"testBlob":            base64.StdEncoding.EncodeToString(testBlob),
+	})
+
+	req, err := http.NewRequest("POST", apiBase+"/sso/credentials/bootstrap", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
+
+	resp, err := authHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("bootstrap request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	fmt.Println("✓ Encryption keys generated and secured with device key")
+	return nil
+}
+
+// ssoSameDeviceUnlock decrypts credential bundle using device key from keychain.
+// The server derives the device ID from the access token.
+func ssoSameDeviceUnlock(apiBase, token string) error {
+	fmt.Println("Unlocking encryption keys from device key...")
+
+	// 1. Get device key from keychain
+	deviceKey, err := keychain.GetDeviceKey()
+	if err != nil {
+		return fmt.Errorf("get device key: %w", err)
+	}
+
+	// 2. Download encrypted bundle
+	req, err := http.NewRequest("GET", apiBase+"/sso/credentials/bundle", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
+
+	resp, err := authHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch bundle: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var bundleResp struct {
+		EncryptedBundle string `json:"encryptedBundle"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&bundleResp); err != nil {
+		return err
+	}
+
+	// 3. Decrypt bundle
+	encryptedBytes, err := base64.StdEncoding.DecodeString(bundleResp.EncryptedBundle)
+	if err != nil {
+		return fmt.Errorf("decode bundle: %w", err)
+	}
+
+	bundleJSON, err := encryption.DecryptCredentialBundle(encryptedBytes, deviceKey)
+	if err != nil {
+		return fmt.Errorf("decrypt bundle: %w", err)
+	}
+
+	// 4. Parse bundle
+	var bundle struct {
+		AccountKey string `json:"accountKey"`
+		PrivateKey string `json:"privateKey"`
+	}
+	if err := json.Unmarshal(bundleJSON, &bundle); err != nil {
+		return fmt.Errorf("parse bundle: %w", err)
+	}
+
+	accountKey, err := base64.StdEncoding.DecodeString(bundle.AccountKey)
+	if err != nil {
+		return fmt.Errorf("decode account key: %w", err)
+	}
+
+	// 5. Set account key
+	encMgr := encryption.GetManager()
+	if err := encMgr.SetKeyDirect(accountKey); err != nil {
+		return fmt.Errorf("set key: %w", err)
+	}
+
+	fmt.Println("✓ Encryption keys unlocked from device key")
+	return nil
+}
+
+// ssoNewDeviceLink performs the device linking flow for a new device.
+// The server derives the device ID from the access token.
+func ssoNewDeviceLink(apiBase, token, hostname, platform string) error {
+	fmt.Println("This device needs to be linked to an existing device for encryption keys.")
+	fmt.Println()
+
+	// 1. Request a device link
+	reqBody, _ := json.Marshal(map[string]string{
+		"deviceName": hostname,
+		"platform":   platform,
+	})
+
+	req, err := http.NewRequest("POST", apiBase+"/device-link/request", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
+
+	resp, err := authHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("create link request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var linkResult struct {
+		LinkRequestID string `json:"linkRequestId"`
+		DisplayCode   string `json:"displayCode"`
+		ExpiresAt     string `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&linkResult); err != nil {
+		return err
+	}
+
+	// 2. Display linking code
+	code := linkResult.DisplayCode
+	if len(code) != 6 {
+		return fmt.Errorf("server returned invalid display code (length %d)", len(code))
+	}
+	fmt.Printf("Linking code: %s-%s\n", code[:3], code[3:])
+	fmt.Println()
+	fmt.Println("On an existing device, run:")
+	fmt.Println("  sinesync device approve")
+	fmt.Println()
+	fmt.Println("Waiting for approval...")
+
+	// 3. Poll for approval
+	pollURL := fmt.Sprintf("%s/device-link/%s/poll", apiBase, linkResult.LinkRequestID)
+	expiresAt, err := time.Parse(time.RFC3339, linkResult.ExpiresAt)
+	if err != nil {
+		return fmt.Errorf("invalid expiresAt in server response: %w", err)
+	}
+
+	var pollResult struct {
+		Status          string `json:"status"`
+		EncryptedBundle string `json:"encryptedBundle"`
+		TransferSalt    string `json:"transferSalt"`
+	}
+
+	for {
+		if time.Now().After(expiresAt) {
+			return fmt.Errorf("device link request expired")
+		}
+
+		time.Sleep(3 * time.Second)
+
+		pollReq, err := http.NewRequest("GET", pollURL, nil)
+		if err != nil {
+			continue
+		}
+		pollReq.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(pollReq)
+
+		pollResp, err := authHTTPClient.Do(pollReq)
+		if err != nil {
+			continue
+		}
+
+		if pollResp.StatusCode != http.StatusOK {
+			pollResp.Body.Close()
+			continue
+		}
+
+		if err := json.NewDecoder(pollResp.Body).Decode(&pollResult); err != nil {
+			pollResp.Body.Close()
+			continue
+		}
+		pollResp.Body.Close()
+
+		if pollResult.Status == "approved" {
+			break
+		}
+		if pollResult.Status == "expired" {
+			return fmt.Errorf("device link request expired")
+		}
+	}
+
+	fmt.Println("✓ Device approved!")
+
+	// 4. Derive transfer key from display code + salt
+	transferSalt, err := base64.StdEncoding.DecodeString(pollResult.TransferSalt)
+	if err != nil {
+		return fmt.Errorf("decode transfer salt: %w", err)
+	}
+	transferKey := crypto.DeriveKeyFromCode(code, transferSalt)
+
+	// 5. Decrypt the transfer bundle
+	encryptedBundle, err := base64.StdEncoding.DecodeString(pollResult.EncryptedBundle)
+	if err != nil {
+		return fmt.Errorf("decode bundle: %w", err)
+	}
+
+	bundleJSON, err := encryption.DecryptForDeviceLink(encryptedBundle, transferKey)
+	if err != nil {
+		return fmt.Errorf("decrypt transfer bundle: %w", err)
+	}
+
+	// 6. Parse bundle
+	var bundle struct {
+		AccountKey string `json:"accountKey"`
+		PrivateKey string `json:"privateKey"`
+	}
+	if err := json.Unmarshal(bundleJSON, &bundle); err != nil {
+		return fmt.Errorf("parse bundle: %w", err)
+	}
+
+	accountKey, err := base64.StdEncoding.DecodeString(bundle.AccountKey)
+	if err != nil {
+		return fmt.Errorf("decode account key: %w", err)
+	}
+
+	// 7. Generate new device key and store in keychain
+	newDeviceKey, err := crypto.GenerateKey(32)
+	if err != nil {
+		return fmt.Errorf("generate device key: %w", err)
+	}
+	if err := keychain.SetDeviceKey(newDeviceKey); err != nil {
+		return fmt.Errorf("store device key: %w", err)
+	}
+
+	// 8. Re-encrypt bundle with new device key
+	reEncrypted, err := encryption.EncryptCredentialBundle(bundleJSON, newDeviceKey)
+	if err != nil {
+		return fmt.Errorf("re-encrypt bundle: %w", err)
+	}
+
+	// 9. Upload new device's bundle
+	uploadBody, _ := json.Marshal(map[string]string{
+		"encryptedBundle": base64.StdEncoding.EncodeToString(reEncrypted),
+	})
+	uploadReq, err := http.NewRequest("POST", apiBase+"/sso/credentials/bundle", bytes.NewReader(uploadBody))
+	if err != nil {
+		return fmt.Errorf("create upload request: %w", err)
+	}
+	uploadReq.Header.Set("Content-Type", "application/json")
+	uploadReq.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(uploadReq)
+
+	uploadResp, err := authHTTPClient.Do(uploadReq)
+	if err != nil {
+		return fmt.Errorf("upload bundle: %w", err)
+	}
+	defer uploadResp.Body.Close()
+
+	if uploadResp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(uploadResp.Body)
+		return fmt.Errorf("upload failed: %d - %s", uploadResp.StatusCode, string(respBody))
+	}
+
+	// 10. Claim the link request
+	claimReq, err := http.NewRequest("POST", fmt.Sprintf("%s/device-link/%s/claim", apiBase, linkResult.LinkRequestID), nil)
+	if err != nil {
+		return fmt.Errorf("create claim request: %w", err)
+	}
+	claimReq.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(claimReq)
+
+	claimResp, err := authHTTPClient.Do(claimReq)
+	if err != nil {
+		return fmt.Errorf("claim request: %w", err)
+	}
+	defer claimResp.Body.Close()
+
+	if claimResp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(claimResp.Body)
+		return fmt.Errorf("claim failed: %d - %s", claimResp.StatusCode, string(respBody))
+	}
+
+	// 11. Set account key as the derived key
+	encMgr := encryption.GetManager()
+	if err := encMgr.SetKeyDirect(accountKey); err != nil {
+		return fmt.Errorf("set key: %w", err)
+	}
+
+	fmt.Println("✓ Encryption keys received and secured with device key")
 	return nil
 }
 
@@ -1031,41 +1465,36 @@ func saveAuthConfig(cfg *AuthConfig) error {
 		return err
 	}
 
-	// Store tokens in system keychain
+	// Store tokens in system keychain — fail if keychain is unavailable
 	if cfg.Token != "" {
 		if err := kr.Set(keyringService, "token", cfg.Token); err != nil {
-			// Fall back to file storage if keychain unavailable
-			fmt.Fprintf(os.Stderr, "Warning: system keychain unavailable, storing tokens in %s\n", authConfigPath())
-			return saveAuthConfigToFile(cfg)
+			return fmt.Errorf("system keychain unavailable — cannot store tokens securely: %w", err)
 		}
 	}
 	if cfg.RefreshToken != "" {
-		_ = kr.Set(keyringService, "refreshToken", cfg.RefreshToken)
+		if err := kr.Set(keyringService, "refreshToken", cfg.RefreshToken); err != nil {
+			return fmt.Errorf("failed to store refresh token in keychain: %w", err)
+		}
 	}
 	if cfg.DeviceToken != "" {
-		_ = kr.Set(keyringService, "deviceToken", cfg.DeviceToken)
+		if err := kr.Set(keyringService, "deviceToken", cfg.DeviceToken); err != nil {
+			return fmt.Errorf("failed to store device token in keychain: %w", err)
+		}
 	}
 
-	// Store non-sensitive data in file
+	// Store only non-sensitive metadata in file
 	fileCfg := AuthConfig{
-		UserID:    cfg.UserID,
-		Email:     cfg.Email,
-		ExpiresAt: cfg.ExpiresAt,
-		DeviceID:  cfg.DeviceID,
+		UserID:     cfg.UserID,
+		Email:      cfg.Email,
+		ExpiresAt:  cfg.ExpiresAt,
+		DeviceID:   cfg.DeviceID,
+		AuthMethod: cfg.AuthMethod,
 	}
 	data, err := json.MarshalIndent(fileCfg, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(authConfigPath(), data, 0600)
-}
-
-func saveAuthConfigToFile(cfg *AuthConfig) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
 	return os.WriteFile(authConfigPath(), data, 0600)
 }
 
@@ -1079,6 +1508,12 @@ func loadAuthConfig() (*AuthConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
+
+	// Clear any tokens deserialized from disk — tokens must only come from keychain.
+	// Legacy auth.json files may contain plaintext tokens that should not be trusted.
+	cfg.Token = ""
+	cfg.RefreshToken = ""
+	cfg.DeviceToken = ""
 
 	// Load tokens from keychain
 	if token, err := kr.Get(keyringService, "token"); err == nil {

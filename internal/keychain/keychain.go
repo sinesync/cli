@@ -146,9 +146,33 @@ func GetOrCreateDBKey() ([]byte, error) {
 	return key, nil
 }
 
+// Device key (for SSO credential bundle encryption)
+
+func GetDeviceKey() ([]byte, error) {
+	encoded, err := keyring.Get(serviceName, "device-key")
+	if err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.DecodeString(encoded)
+}
+
+func SetDeviceKey(key []byte) error {
+	encoded := base64.StdEncoding.EncodeToString(key)
+	return keyring.Set(serviceName, "device-key", encoded)
+}
+
+func DeleteDeviceKey() error {
+	return keyring.Delete(serviceName, "device-key")
+}
+
+func HasDeviceKey() bool {
+	key, err := GetDeviceKey()
+	return err == nil && len(key) > 0
+}
+
 // Clear removes all stored credentials
 func Clear() error {
-	keys := []string{"session-token", "user-salt", "secret-key", "derived-key", "last-auth", "local-db-key"}
+	keys := []string{"session-token", "user-salt", "secret-key", "derived-key", "last-auth", "local-db-key", "device-key"}
 	for _, key := range keys {
 		keyring.Delete(serviceName, key) // Ignore errors
 	}

@@ -47,6 +47,19 @@ func DeriveKey(password, secretKey string, salt []byte) []byte {
 	)
 }
 
+// DeriveKeyFromCode derives an encryption key from a short code (e.g., 6-digit device link code).
+// Uses Argon2id with the same parameters as DeriveKey.
+func DeriveKeyFromCode(code string, salt []byte) []byte {
+	return argon2.IDKey(
+		[]byte(code),
+		salt,
+		argonTime,
+		argonMemory,
+		argonThreads,
+		keyLength,
+	)
+}
+
 // GenerateSalt generates a random salt for key derivation
 func GenerateSalt() ([]byte, error) {
 	salt := make([]byte, 16)

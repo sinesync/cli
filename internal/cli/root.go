@@ -58,6 +58,7 @@ func init() {
 	rootCmd.AddCommand(daemonCmd)
 	rootCmd.AddCommand(debugEmbedCmd)
 	rootCmd.AddCommand(doctorCmd)
+	rootCmd.AddCommand(deviceCmd)
 }
 
 // Reembed command - regenerate embeddings with ONNX
