@@ -347,10 +347,12 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 	}
 	state := base64.RawURLEncoding.EncodeToString(stateBytes)
 
-	// Start localhost HTTP server for the SSO callback
+	// Start HTTP server for the SSO callback
+	// When --sso-port is set, bind to 0.0.0.0 so Docker port forwarding works
 	listenAddr := "127.0.0.1:0"
 	if ssoPort > 0 {
-		listenAddr = fmt.Sprintf("127.0.0.1:%d", ssoPort)
+		listenAddr = fmt.Sprintf("0.0.0.0:%d", ssoPort)
+		fmt.Fprintf(os.Stderr, "Warning: SSO callback listening on all interfaces (port %d)\n", ssoPort)
 	}
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -400,9 +402,11 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 
 	// Open browser (or print URL for headless/SSH environments)
 	if ssoPort > 0 {
+		// Replace Docker-internal hostnames with localhost for browser access
+		browserURL := strings.Replace(loginURL, "host.docker.internal", "localhost", 1)
 		fmt.Println("Open this URL in your local browser:")
-		fmt.Printf("  %s\n", loginURL)
-		fmt.Printf("\nEnsure SSH port forwarding is active: ssh -L %d:127.0.0.1:%d ...\n", port, port)
+		fmt.Printf("  %s\n", browserURL)
+		fmt.Printf("\nEnsure port forwarding is active for port %d\n", port)
 	} else if err := openBrowserForSAML(loginURL); err != nil {
 		fmt.Println("Could not open browser automatically.")
 		fmt.Println("Open this URL in your browser:")
