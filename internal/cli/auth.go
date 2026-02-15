@@ -95,6 +95,7 @@ previous public key.`,
 }
 
 func init() {
+	loginCmd.Flags().Int("sso-port", 0, "Fixed port for SSO callback (useful for SSH port forwarding)")
 	rootCmd.AddCommand(loginCmd)
 	rootCmd.AddCommand(signupCmd)
 	rootCmd.AddCommand(logoutCmd)
@@ -150,7 +151,8 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	}
 
 	if samlResult != nil && samlResult.SAMLEnabled {
-		return doSAMLLoginFlow(apiBase, email, samlResult.OrgSlug)
+		ssoPort, _ := cmd.Flags().GetInt("sso-port")
+		return doSAMLLoginFlow(apiBase, email, samlResult.OrgSlug, ssoPort)
 	}
 
 	// Get password
@@ -321,8 +323,13 @@ func discoverSAML(apiBase, email string) (*samlDiscoverResult, error) {
 }
 
 // doSAMLLoginFlow performs the full SAML login: PKCE, browser, callback, token exchange, device registration.
-func doSAMLLoginFlow(apiBase, email, orgSlug string) error {
-	fmt.Printf("SSO detected for %s — opening browser for authentication...\n", email)
+// If ssoPort > 0, use that fixed port for the callback server (useful for SSH port forwarding).
+func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
+	if ssoPort > 0 {
+		fmt.Printf("SSO detected for %s — follow the printed URL to authenticate (port %d)...\n", email, ssoPort)
+	} else {
+		fmt.Printf("SSO detected for %s — opening browser for authentication...\n", email)
+	}
 
 	// Generate PKCE pair
 	verifierBytes := make([]byte, 43)
@@ -340,8 +347,12 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string) error {
 	}
 	state := base64.RawURLEncoding.EncodeToString(stateBytes)
 
-	// Start localhost HTTP server on a random port
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	// Start localhost HTTP server for the SSO callback
+	listenAddr := "127.0.0.1:0"
+	if ssoPort > 0 {
+		listenAddr = fmt.Sprintf("127.0.0.1:%d", ssoPort)
+	}
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start callback server: %w", err)
 	}
@@ -387,14 +398,18 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string) error {
 	loginURL := fmt.Sprintf("%s/auth/saml/login?org=%s&clientType=cli&port=%d&code_challenge=%s&state=%s",
 		apiBase, orgSlug, port, codeChallenge, state)
 
-	// Open browser
-	if err := openBrowserForSAML(loginURL); err != nil {
+	// Open browser (or print URL for headless/SSH environments)
+	if ssoPort > 0 {
+		fmt.Println("Open this URL in your local browser:")
+		fmt.Printf("  %s\n", loginURL)
+		fmt.Printf("\nEnsure SSH port forwarding is active: ssh -L %d:127.0.0.1:%d ...\n", port, port)
+	} else if err := openBrowserForSAML(loginURL); err != nil {
 		fmt.Println("Could not open browser automatically.")
 		fmt.Println("Open this URL in your browser:")
 		fmt.Printf("  %s\n", loginURL)
 	}
 
-	fmt.Println("Waiting for SSO authentication...")
+	fmt.Println("\nWaiting for SSO authentication...")
 
 	// Wait for callback with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
