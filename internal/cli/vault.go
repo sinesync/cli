@@ -192,6 +192,19 @@ Examples:
 	RunE: runVaultProvision,
 }
 
+var vaultResetKeysCmd = &cobra.Command{
+	Use:   "reset-keys",
+	Short: "Reset org encryption keys (recovery after admin loss)",
+	Long: `Reset the org keypair and all vault encryption keys.
+
+Use this when the admin who initialized encryption is no longer available.
+After reset, run 'sinesync vault provision' to re-initialize.
+
+WARNING: This clears all encrypted vault keys and member access records.
+Members will need to be re-provisioned after the reset.`,
+	RunE: runVaultResetKeys,
+}
+
 var vaultShareCmd = &cobra.Command{
 	Use:   "share <vault-id>",
 	Short: "Share a vault with another user",
@@ -310,6 +323,7 @@ func init() {
 	vaultMigrateProjectCmd.Flags().BoolVarP(&migrateForce, "force", "f", false, "Upload observations even if project is already in target vault")
 	vaultCmd.AddCommand(vaultSyncCmd)
 	vaultCmd.AddCommand(vaultProvisionCmd)
+	vaultCmd.AddCommand(vaultResetKeysCmd)
 	vaultCmd.AddCommand(vaultShareCmd)
 	vaultCmd.AddCommand(vaultPendingConfirmCmd)
 	vaultCmd.AddCommand(vaultConfirmCmd)
@@ -1173,6 +1187,46 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 			fmt.Println("✓ Daemon sync triggered")
 		}
 	}
+
+	return nil
+}
+
+func runVaultResetKeys(cmd *cobra.Command, args []string) error {
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	orgInfo, err := fetchUserOrgInfo(token)
+	if err != nil || orgInfo == nil {
+		return fmt.Errorf("you are not in an organization")
+	}
+
+	isAdmin := orgInfo.Role == "admin" || orgInfo.Role == "owner"
+	if !isAdmin {
+		return fmt.Errorf("only admins can reset org keys (your role: %s)", orgInfo.Role)
+	}
+
+	fmt.Println("WARNING: This will reset all org encryption keys.")
+	fmt.Println("All vault member access will be cleared and must be re-provisioned.")
+	fmt.Println()
+	fmt.Print("Type 'RESET' to confirm: ")
+	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read input: %w", err)
+	}
+	if strings.TrimSpace(input) != "RESET" {
+		fmt.Println("Aborted.")
+		return nil
+	}
+
+	if err := resetOrgKeypair(token, orgInfo.OrgID); err != nil {
+		return fmt.Errorf("failed to reset org keys: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Println("✓ Org encryption keys have been reset")
+	fmt.Println("  Run 'sinesync vault provision' to re-initialize encryption")
 
 	return nil
 }

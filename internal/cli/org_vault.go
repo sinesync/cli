@@ -385,6 +385,30 @@ func submitKeyHolders(token, orgID string, holders []map[string]string) error {
 	return nil
 }
 
+// resetOrgKeypair resets the org keypair and all associated crypto state
+func resetOrgKeypair(token, orgID string) error {
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	req, err := http.NewRequest("POST", apiBase+"/organizations/"+orgID+"/org-key/reset", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := doVaultRequest(client, req, &token)
+	if err != nil {
+		return fmt.Errorf("failed to reset org keypair: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("reset org keypair failed %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
 // updateOrgVaultKey updates the encrypted vault key on an org vault
 func updateOrgVaultKey(token, orgID, vaultID, encryptedVaultKey string) error {
 	apiBase := getAPIBase()
