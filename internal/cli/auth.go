@@ -526,9 +526,9 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 			return fmt.Errorf("SSO device unlock failed: %w", err)
 		}
 	} else {
-		// New device — device linking flow
-		if err := ssoNewDeviceLink(apiBase, token, hostname, platform); err != nil {
-			return fmt.Errorf("SSO device link failed: %w", err)
+		// New device — recover using account key
+		if err := ssoAccountKeyRecover(apiBase, token); err != nil {
+			return fmt.Errorf("SSO account key recovery failed: %w", err)
 		}
 	}
 
@@ -764,6 +764,98 @@ func ssoSameDeviceUnlock(apiBase, token string) error {
 	}
 
 	fmt.Println("✓ Encryption keys unlocked from device key")
+	return nil
+}
+
+// ssoAccountKeyRecover sets up encryption on a new device using the account key.
+// The user enters their account key (dashed base32) to derive the encryption key directly.
+func ssoAccountKeyRecover(apiBase, token string) error {
+	fmt.Println("New device detected. Enter your account key to set up encryption.")
+	fmt.Println()
+	fmt.Print("Account Key: ")
+	accountKeyInput, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read account key: %w", err)
+	}
+
+	// Normalize and decode dashed base32
+	accountKeyInput = crypto.NormalizeSecretKey(accountKeyInput)
+	accountKey, err := crypto.DecodeSecretKey(accountKeyInput)
+	if err != nil {
+		return fmt.Errorf("invalid account key format: %w", err)
+	}
+
+	// Set account key as the encryption key
+	encMgr := encryption.GetManager()
+	if err := encMgr.SetKeyDirect(accountKey); err != nil {
+		return fmt.Errorf("set key: %w", err)
+	}
+
+	// Verify the key by decrypting the test blob
+	testBlob, err := fetchTestBlob(apiBase, token)
+	if err != nil {
+		return fmt.Errorf("fetch test blob: %w", err)
+	}
+	if !encMgr.VerifyKey(testBlob) {
+		return fmt.Errorf("invalid account key — decryption failed")
+	}
+
+	// Fetch the encrypted private key and decrypt to include in bundle
+	privateKeyB64, err := fetchAndDecryptPrivateKey(token)
+	if err != nil {
+		return fmt.Errorf("fetch private key: %w", err)
+	}
+
+	// Generate new device key for this device
+	deviceKey, err := crypto.GenerateKey(32)
+	if err != nil {
+		return fmt.Errorf("generate device key: %w", err)
+	}
+
+	if err := keychain.SetDeviceKey(deviceKey); err != nil {
+		return fmt.Errorf("store device key: %w", err)
+	}
+
+	// Build and encrypt credential bundle
+	bundleJSON, err := json.Marshal(map[string]string{
+		"version":    "1",
+		"accountKey": base64.StdEncoding.EncodeToString(accountKey),
+		"privateKey": privateKeyB64,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal bundle: %w", err)
+	}
+
+	encryptedBundle, err := encryption.EncryptCredentialBundle(bundleJSON, deviceKey)
+	if err != nil {
+		return fmt.Errorf("encrypt bundle: %w", err)
+	}
+
+	// Upload new bundle for this device
+	body, _ := json.Marshal(map[string]string{
+		"encryptedBundle": base64.StdEncoding.EncodeToString(encryptedBundle),
+	})
+
+	req, err := http.NewRequest("POST", apiBase+"/sso/credentials/bundle", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(req)
+
+	resp, err := authHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("store bundle: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	fmt.Println("✓ Encryption keys recovered from account key")
 	return nil
 }
 
