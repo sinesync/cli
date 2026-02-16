@@ -527,7 +527,7 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 		}
 	} else {
 		// New device — recover using account key
-		if err := ssoAccountKeyRecover(apiBase, token); err != nil {
+		if err := ssoAccountKeyRecover(apiBase, token, status.TestBlob); err != nil {
 			return fmt.Errorf("SSO account key recovery failed: %w", err)
 		}
 	}
@@ -554,7 +554,8 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 // --- SSO encryption helpers ---
 
 type ssoStatusResult struct {
-	HasBundle bool `json:"hasBundle"`
+	HasBundle bool   `json:"hasBundle"`
+	TestBlob  string `json:"testBlob,omitempty"`
 }
 
 func ssoCredentialStatus(apiBase, token string) (*ssoStatusResult, error) {
@@ -769,7 +770,7 @@ func ssoSameDeviceUnlock(apiBase, token string) error {
 
 // ssoAccountKeyRecover sets up encryption on a new device using the account key.
 // The user enters their account key (dashed base32) to derive the encryption key directly.
-func ssoAccountKeyRecover(apiBase, token string) error {
+func ssoAccountKeyRecover(apiBase, token, testBlobB64 string) error {
 	fmt.Println("New device detected. Enter your account key to set up encryption.")
 	fmt.Println()
 	fmt.Print("Account Key: ")
@@ -792,9 +793,9 @@ func ssoAccountKeyRecover(apiBase, token string) error {
 	}
 
 	// Verify the key by decrypting the test blob
-	testBlob, err := fetchTestBlob(apiBase, token)
+	testBlob, err := base64.StdEncoding.DecodeString(testBlobB64)
 	if err != nil {
-		return fmt.Errorf("fetch test blob: %w", err)
+		return fmt.Errorf("decode test blob: %w", err)
 	}
 	if !encMgr.VerifyKey(testBlob) {
 		return fmt.Errorf("invalid account key — decryption failed")
