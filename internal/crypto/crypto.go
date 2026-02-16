@@ -275,6 +275,11 @@ func NormalizeSecretKey(key string) string {
 	return result
 }
 
+// EncodeBase32 encodes bytes to a user-friendly base32 string with dashes (XXXX-XXXX-...)
+func EncodeBase32(data []byte) string {
+	return encodeBase32(data)
+}
+
 // EncodeBase64 encodes bytes to standard base64 string
 func EncodeBase64(data []byte) string {
 	return base64.StdEncoding.EncodeToString(data)

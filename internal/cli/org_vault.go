@@ -258,6 +258,10 @@ func fetchOrgVaultKey(token, orgID, vaultID string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		// User has no vault member record yet — needs provisioning
+		return "", nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("org vault key fetch failed %d: %s", resp.StatusCode, string(body))
@@ -310,6 +314,75 @@ func fetchMyPublicKey(token string) (string, error) {
 	}
 
 	return result.PublicKey, nil
+}
+
+// AdminPendingHolder represents an admin who needs a key holder record
+type AdminPendingHolder struct {
+	UserID    string `json:"userId"`
+	PublicKey string `json:"publicKey"`
+}
+
+// fetchAdminsPendingKeyHolders gets admins without key holder records
+func fetchAdminsPendingKeyHolders(token, orgID string) ([]AdminPendingHolder, error) {
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequest("GET", apiBase+"/organizations/"+orgID+"/org-key/admins-pending", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := doVaultRequest(client, req, &token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch pending admin holders: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("pending admin holders fetch failed %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Admins []AdminPendingHolder `json:"admins"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return result.Admins, nil
+}
+
+// submitKeyHolders creates key holder records for other admins
+func submitKeyHolders(token, orgID string, holders []map[string]string) error {
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	body, err := json.Marshal(map[string]interface{}{
+		"holders": holders,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", apiBase+"/organizations/"+orgID+"/org-key/holders", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := doVaultRequest(client, req, &token)
+	if err != nil {
+		return fmt.Errorf("failed to submit key holders: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("submit key holders failed %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
 }
 
 // updateOrgVaultKey updates the encrypted vault key on an org vault

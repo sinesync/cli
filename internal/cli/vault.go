@@ -1259,13 +1259,23 @@ func runVaultProvision(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 3: Provision pending members
+	// Check what needs the org private key
 	pending, err := fetchPendingProvisions(token, orgInfo.OrgID)
 	if err != nil {
 		fmt.Printf("  Warning: failed to fetch pending provisions: %v\n", err)
-	} else if len(pending) > 0 {
-		fmt.Printf("  Provisioning %d pending members...\n", len(pending))
+		pending = nil
+	}
 
+	pendingAdmins, err := fetchAdminsPendingKeyHolders(token, orgInfo.OrgID)
+	if err != nil {
+		fmt.Printf("  Warning: failed to fetch pending admin holders: %v\n", err)
+		pendingAdmins = nil
+	}
+
+	var distributedHolders int
+
+	needOrgPrivKey := len(pending) > 0 || len(pendingAdmins) > 0
+	if needOrgPrivKey {
 		// Decrypt org private key using admin's X25519 private key
 		adminPrivKey, err := fetchAndDecryptPrivateKey(token)
 		if err != nil {
@@ -1284,59 +1294,89 @@ func runVaultProvision(cmd *cobra.Command, args []string) error {
 		defer zeroBytes(orgPrivKeyBytes)
 		orgPrivKey := string(orgPrivKeyBytes)
 
-		var provisions []map[string]interface{}
+		// Step 3: Provision pending members
+		if len(pending) > 0 {
+			fmt.Printf("  Provisioning %d pending members...\n", len(pending))
 
-		for _, p := range pending {
-			var memberVaults []map[string]interface{}
-			for _, vaultID := range p.VaultIDs {
-				// Find vault's encrypted key
-				var vaultEncKey string
-				for _, ov := range orgVaults {
-					if ov.ID == vaultID {
-						vaultEncKey = ov.EncryptedVaultKey
-						break
+			var provisions []map[string]interface{}
+
+			for _, p := range pending {
+				var memberVaults []map[string]interface{}
+				for _, vaultID := range p.VaultIDs {
+					// Find vault's encrypted key
+					var vaultEncKey string
+					for _, ov := range orgVaults {
+						if ov.ID == vaultID {
+							vaultEncKey = ov.EncryptedVaultKey
+							break
+						}
 					}
+
+					if vaultEncKey == "" {
+						continue
+					}
+
+					// Decrypt vault key using org private key
+					vaultKeyBytes, err := crypto.X25519Open(vaultEncKey, orgPrivKey)
+					if err != nil {
+						fmt.Printf("  Warning: failed to decrypt vault key for %s: %v\n", vaultID, err)
+						continue
+					}
+
+					// Seal vault key for the member's public key
+					sealedKey, err := crypto.X25519Seal(vaultKeyBytes, p.PublicKey)
+					zeroBytes(vaultKeyBytes)
+					if err != nil {
+						fmt.Printf("  Warning: failed to seal key for user %s: %v\n", p.UserID, err)
+						continue
+					}
+
+					memberVaults = append(memberVaults, map[string]interface{}{
+						"vaultId":           vaultID,
+						"encryptedVaultKey": sealedKey,
+						"role":              "editor",
+					})
 				}
 
-				if vaultEncKey == "" {
-					continue
+				if len(memberVaults) > 0 {
+					provisions = append(provisions, map[string]interface{}{
+						"userId": p.UserID,
+						"vaults": memberVaults,
+					})
 				}
-
-				// Decrypt vault key using org private key
-				vaultKeyBytes, err := crypto.X25519Open(vaultEncKey, orgPrivKey)
-				if err != nil {
-					fmt.Printf("  Warning: failed to decrypt vault key for %s: %v\n", vaultID, err)
-					continue
-				}
-
-				// Seal vault key for the member's public key
-				sealedKey, err := crypto.X25519Seal(vaultKeyBytes, p.PublicKey)
-				zeroBytes(vaultKeyBytes)
-				if err != nil {
-					fmt.Printf("  Warning: failed to seal key for user %s: %v\n", p.UserID, err)
-					continue
-				}
-
-				memberVaults = append(memberVaults, map[string]interface{}{
-					"vaultId":           vaultID,
-					"encryptedVaultKey": sealedKey,
-					"role":              "editor",
-				})
 			}
 
-			if len(memberVaults) > 0 {
-				provisions = append(provisions, map[string]interface{}{
-					"userId": p.UserID,
-					"vaults": memberVaults,
-				})
+			if len(provisions) > 0 {
+				if err := submitProvisions(token, orgInfo.OrgID, provisions); err != nil {
+					return fmt.Errorf("failed to submit provisions: %w", err)
+				}
+				provisionedMembers = len(provisions)
 			}
 		}
 
-		if len(provisions) > 0 {
-			if err := submitProvisions(token, orgInfo.OrgID, provisions); err != nil {
-				return fmt.Errorf("failed to submit provisions: %w", err)
+		// Step 4: Distribute key holders to other admins
+		if len(pendingAdmins) > 0 {
+			fmt.Printf("  Distributing org key to %d admin(s)...\n", len(pendingAdmins))
+
+			var holders []map[string]string
+			for _, admin := range pendingAdmins {
+				sealed, err := crypto.X25519Seal(orgPrivKeyBytes, admin.PublicKey)
+				if err != nil {
+					fmt.Printf("  Warning: failed to seal org key for admin %s: %v\n", admin.UserID, err)
+					continue
+				}
+				holders = append(holders, map[string]string{
+					"userId":                admin.UserID,
+					"encryptedOrgPrivateKey": sealed,
+				})
 			}
-			provisionedMembers = len(provisions)
+
+			if len(holders) > 0 {
+				if err := submitKeyHolders(token, orgInfo.OrgID, holders); err != nil {
+					return fmt.Errorf("failed to submit key holders: %w", err)
+				}
+				distributedHolders = len(holders)
+			}
 		}
 	}
 
@@ -1351,7 +1391,10 @@ func runVaultProvision(cmd *cobra.Command, args []string) error {
 	if provisionedMembers > 0 {
 		fmt.Printf("✓ Provisioned %d member(s)\n", provisionedMembers)
 	}
-	if initKeypair == 0 && initVaultKeys == 0 && provisionedMembers == 0 {
+	if distributedHolders > 0 {
+		fmt.Printf("✓ Distributed org key to %d admin(s)\n", distributedHolders)
+	}
+	if initKeypair == 0 && initVaultKeys == 0 && provisionedMembers == 0 && distributedHolders == 0 {
 		fmt.Println("✓ Nothing to provision — all members are up to date")
 	}
 
