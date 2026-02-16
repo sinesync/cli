@@ -672,7 +672,25 @@ func ssoBootstrap(apiBase, token string) error {
 		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	// Display account key — this is the only time it's visible in plaintext
+	accountKeyB64 := base64.StdEncoding.EncodeToString(accountKey)
+	fmt.Println()
 	fmt.Println("✓ Encryption keys generated and secured with device key")
+	fmt.Println()
+	fmt.Println("  ┌─────────────────────────────────────────────────────┐")
+	fmt.Println("  │  YOUR ACCOUNT KEY (save this securely)              │")
+	fmt.Println("  │                                                     │")
+	fmt.Printf("  │  %s  │\n", accountKeyB64)
+	fmt.Println("  │                                                     │")
+	fmt.Println("  │  You will need this key to provision org vault      │")
+	fmt.Println("  │  members from the web UI. It will not be shown      │")
+	fmt.Println("  │  again.                                             │")
+	fmt.Println("  └─────────────────────────────────────────────────────┘")
+	fmt.Println()
+	fmt.Print("Press Enter after you have saved your account key...")
+	bufio.NewReader(os.Stdin).ReadString('\n')
+	fmt.Println()
+
 	return nil
 }
 
