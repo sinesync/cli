@@ -77,6 +77,8 @@ type LocalVault struct {
 	EncryptedVaultKey string   `json:"encryptedVaultKey"`
 	Projects          []string `json:"projects"`
 	IsDefault         bool     `json:"isDefault"`
+	IsOrgVault        bool     `json:"isOrgVault,omitempty"`
+	OrgID             string   `json:"orgId,omitempty"`
 }
 
 var vaultCmd = &cobra.Command{
@@ -170,6 +172,24 @@ var vaultSyncCmd = &cobra.Command{
 	Short: "Sync vault keys from server",
 	Long:  `Fetch and store encrypted vault keys from the server.`,
 	RunE:  runVaultSync,
+}
+
+var vaultProvisionCmd = &cobra.Command{
+	Use:   "provision",
+	Short: "Provision vault keys for pending org members",
+	Long: `Initialize org encryption and provision vault keys for pending members.
+
+This is an admin-only command that:
+  1. Initializes the org keypair (if not yet done)
+  2. Generates vault keys for any vaults without them
+  3. Provisions pending members with their encrypted vault keys
+
+Enterprises can run this on a schedule (e.g. cron) for automatic provisioning.
+
+Examples:
+  sinesync vault provision                    # Provision all pending members
+  */5 * * * * sinesync vault provision        # Cron every 5 minutes`,
+	RunE: runVaultProvision,
 }
 
 var vaultShareCmd = &cobra.Command{
@@ -289,6 +309,7 @@ func init() {
 	vaultCmd.AddCommand(vaultMigrateProjectCmd)
 	vaultMigrateProjectCmd.Flags().BoolVarP(&migrateForce, "force", "f", false, "Upload observations even if project is already in target vault")
 	vaultCmd.AddCommand(vaultSyncCmd)
+	vaultCmd.AddCommand(vaultProvisionCmd)
 	vaultCmd.AddCommand(vaultShareCmd)
 	vaultCmd.AddCommand(vaultPendingConfirmCmd)
 	vaultCmd.AddCommand(vaultConfirmCmd)
@@ -354,6 +375,29 @@ func runVaultList(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    Role: %s\n", v.Role)
 		fmt.Printf("    Members: %d\n", v.MemberCount)
 		fmt.Println()
+	}
+
+	// Show org vaults
+	orgInfo, err := fetchUserOrgInfo(token)
+	if err == nil && orgInfo != nil {
+		orgVaults, err := fetchOrgVaults(token, orgInfo.OrgID)
+		if err == nil && len(orgVaults) > 0 {
+			fmt.Println("Organization vaults:")
+			fmt.Println()
+			for _, v := range orgVaults {
+				fmt.Printf("  %s [org]\n", v.Name)
+				fmt.Printf("    ID: %s\n", v.ID)
+				if v.Role != "" {
+					fmt.Printf("    Role: %s\n", v.Role)
+				}
+				if v.EncryptedVaultKey != "" {
+					fmt.Printf("    Status: encrypted\n")
+				} else {
+					fmt.Printf("    Status: pending key setup\n")
+				}
+				fmt.Println()
+			}
+		}
 	}
 
 	return nil
@@ -1037,6 +1081,83 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  ✓ %s (%d local projects)\n", v.Name, len(projects))
 	}
 
+	// --- Org vault sync section ---
+	orgInfo, orgErr := fetchUserOrgInfo(token)
+	if orgErr == nil && orgInfo != nil {
+		fmt.Println()
+		fmt.Println("Syncing org vaults...")
+
+		isAdmin := orgInfo.Role == "admin" || orgInfo.Role == "owner"
+
+		// Check for pending provisions and hint admin to run provision command
+		if isAdmin {
+			needsProvisioning := false
+			if orgInfo.OrgPublicKey == "" {
+				needsProvisioning = true
+			} else {
+				pending, err := fetchPendingProvisions(token, orgInfo.OrgID)
+				if err == nil && len(pending) > 0 {
+					needsProvisioning = true
+				}
+				orgVaultsCheck, err := fetchOrgVaults(token, orgInfo.OrgID)
+				if err == nil {
+					for _, ov := range orgVaultsCheck {
+						if ov.EncryptedVaultKey == "" {
+							needsProvisioning = true
+							break
+						}
+					}
+				}
+			}
+			if needsProvisioning {
+				fmt.Println("  ⚠ Pending provisions detected — run 'sinesync vault provision' to provision members")
+			}
+		}
+
+		// Fetch org vaults and get user's own vault keys (no admin provisioning here)
+		orgVaults, err := fetchOrgVaults(token, orgInfo.OrgID)
+		if err != nil {
+			fmt.Printf("  Warning: failed to fetch org vaults: %v\n", err)
+		} else {
+			for _, ov := range orgVaults {
+				encKey, err := fetchOrgVaultKey(token, orgInfo.OrgID, ov.ID)
+				if err != nil {
+					fmt.Printf("  Warning: failed to fetch key for org vault %s: %v\n", ov.Name, err)
+					continue
+				}
+
+				if encKey == "" {
+					fmt.Printf("  %s: access pending — an admin will provision your keys shortly\n", ov.Name)
+					continue
+				}
+
+				// Normalize the key (X25519 -> AES-GCM)
+				normalizedKey, err := normalizeVaultKey(encKey, token)
+				if err != nil {
+					fmt.Printf("  Warning: failed to normalize key for org vault %s: %v\n", ov.Name, err)
+					continue
+				}
+
+				// Preserve existing local project mappings
+				projects := existingProjects[ov.ID]
+				if projects == nil {
+					projects = []string{}
+				}
+
+				localConfig.Vaults = append(localConfig.Vaults, LocalVault{
+					VaultID:           ov.ID,
+					Name:              ov.Name,
+					EncryptedVaultKey: normalizedKey,
+					Projects:          projects,
+					IsOrgVault:        true,
+					OrgID:             orgInfo.OrgID,
+				})
+
+				fmt.Printf("  ✓ %s [org] (%d local projects)\n", ov.Name, len(projects))
+			}
+		}
+	}
+
 	// Save local config
 	if err := saveLocalVaultConfig(&localConfig); err != nil {
 		return fmt.Errorf("failed to save vault config: %w", err)
@@ -1051,6 +1172,187 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 		} else {
 			fmt.Println("✓ Daemon sync triggered")
 		}
+	}
+
+	return nil
+}
+
+func runVaultProvision(cmd *cobra.Command, args []string) error {
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	// Fetch org info and verify admin
+	orgInfo, err := fetchUserOrgInfo(token)
+	if err != nil || orgInfo == nil {
+		return fmt.Errorf("you are not in an organization")
+	}
+
+	isAdmin := orgInfo.Role == "admin" || orgInfo.Role == "owner"
+	if !isAdmin {
+		return fmt.Errorf("only admins can provision org vault keys (your role: %s)", orgInfo.Role)
+	}
+
+	fmt.Println("Provisioning org vault keys...")
+
+	var initKeypair, initVaultKeys, provisionedMembers int
+
+	// Step 1: Org keypair init (if no orgPublicKey)
+	if orgInfo.OrgPublicKey == "" {
+		fmt.Println("  Initializing org keypair...")
+
+		pubKey, privKey, err := crypto.GenerateX25519Keypair()
+		if err != nil {
+			return fmt.Errorf("failed to generate org keypair: %w", err)
+		}
+
+		// Fetch admin's public key to seal the org private key with X25519
+		adminPubKey, err := fetchMyPublicKey(token)
+		if err != nil {
+			return fmt.Errorf("failed to fetch admin public key: %w", err)
+		}
+
+		encryptedOrgPrivKey, err := crypto.X25519Seal([]byte(privKey), adminPubKey)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt org private key: %w", err)
+		}
+
+		if err := initOrgKeypairAPI(token, orgInfo.OrgID, pubKey, encryptedOrgPrivKey); err != nil {
+			return fmt.Errorf("failed to init org keypair: %w", err)
+		}
+
+		orgInfo.OrgPublicKey = pubKey
+		initKeypair = 1
+		fmt.Println("  ✓ Org keypair initialized")
+	}
+
+	// Step 2: Initialize vault keys for any vaults without them
+	orgVaults, err := fetchOrgVaults(token, orgInfo.OrgID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch org vaults: %w", err)
+	}
+
+	for i, ov := range orgVaults {
+		if ov.EncryptedVaultKey == "" {
+			vaultKey, err := crypto.GenerateKey(32)
+			if err != nil {
+				fmt.Printf("  Warning: failed to generate vault key for %s: %v\n", ov.Name, err)
+				continue
+			}
+
+			sealedKey, err := crypto.X25519Seal(vaultKey, orgInfo.OrgPublicKey)
+			zeroBytes(vaultKey)
+			if err != nil {
+				fmt.Printf("  Warning: failed to seal vault key for %s: %v\n", ov.Name, err)
+				continue
+			}
+
+			if err := updateOrgVaultKey(token, orgInfo.OrgID, ov.ID, sealedKey); err != nil {
+				fmt.Printf("  Warning: failed to set vault key for %s: %v\n", ov.Name, err)
+				continue
+			}
+
+			orgVaults[i].EncryptedVaultKey = sealedKey
+			initVaultKeys++
+			fmt.Printf("  ✓ Initialized vault key for %s\n", ov.Name)
+		}
+	}
+
+	// Step 3: Provision pending members
+	pending, err := fetchPendingProvisions(token, orgInfo.OrgID)
+	if err != nil {
+		fmt.Printf("  Warning: failed to fetch pending provisions: %v\n", err)
+	} else if len(pending) > 0 {
+		fmt.Printf("  Provisioning %d pending members...\n", len(pending))
+
+		// Decrypt org private key using admin's X25519 private key
+		adminPrivKey, err := fetchAndDecryptPrivateKey(token)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt admin private key: %w", err)
+		}
+
+		orgKey, err := fetchOrgKey(token, orgInfo.OrgID)
+		if err != nil || orgKey == nil || orgKey.KeyHolder == nil {
+			return fmt.Errorf("org key holder not found — keypair may not be initialized")
+		}
+
+		orgPrivKeyBytes, err := crypto.X25519Open(orgKey.KeyHolder.EncryptedOrgPrivateKey, adminPrivKey)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt org private key: %w", err)
+		}
+		defer zeroBytes(orgPrivKeyBytes)
+		orgPrivKey := string(orgPrivKeyBytes)
+
+		var provisions []map[string]interface{}
+
+		for _, p := range pending {
+			var memberVaults []map[string]interface{}
+			for _, vaultID := range p.VaultIDs {
+				// Find vault's encrypted key
+				var vaultEncKey string
+				for _, ov := range orgVaults {
+					if ov.ID == vaultID {
+						vaultEncKey = ov.EncryptedVaultKey
+						break
+					}
+				}
+
+				if vaultEncKey == "" {
+					continue
+				}
+
+				// Decrypt vault key using org private key
+				vaultKeyBytes, err := crypto.X25519Open(vaultEncKey, orgPrivKey)
+				if err != nil {
+					fmt.Printf("  Warning: failed to decrypt vault key for %s: %v\n", vaultID, err)
+					continue
+				}
+
+				// Seal vault key for the member's public key
+				sealedKey, err := crypto.X25519Seal(vaultKeyBytes, p.PublicKey)
+				zeroBytes(vaultKeyBytes)
+				if err != nil {
+					fmt.Printf("  Warning: failed to seal key for user %s: %v\n", p.UserID, err)
+					continue
+				}
+
+				memberVaults = append(memberVaults, map[string]interface{}{
+					"vaultId":           vaultID,
+					"encryptedVaultKey": sealedKey,
+					"role":              "editor",
+				})
+			}
+
+			if len(memberVaults) > 0 {
+				provisions = append(provisions, map[string]interface{}{
+					"userId": p.UserID,
+					"vaults": memberVaults,
+				})
+			}
+		}
+
+		if len(provisions) > 0 {
+			if err := submitProvisions(token, orgInfo.OrgID, provisions); err != nil {
+				return fmt.Errorf("failed to submit provisions: %w", err)
+			}
+			provisionedMembers = len(provisions)
+		}
+	}
+
+	// Summary
+	fmt.Println()
+	if initKeypair > 0 {
+		fmt.Println("✓ Initialized org keypair")
+	}
+	if initVaultKeys > 0 {
+		fmt.Printf("✓ Initialized %d vault key(s)\n", initVaultKeys)
+	}
+	if provisionedMembers > 0 {
+		fmt.Printf("✓ Provisioned %d member(s)\n", provisionedMembers)
+	}
+	if initKeypair == 0 && initVaultKeys == 0 && provisionedMembers == 0 {
+		fmt.Println("✓ Nothing to provision — all members are up to date")
 	}
 
 	return nil
