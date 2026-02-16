@@ -409,6 +409,66 @@ func resetOrgKeypair(token, orgID string) error {
 	return nil
 }
 
+// OrgMemberInfo represents a member from the org members list
+type OrgMemberInfo struct {
+	UserID string `json:"userId"`
+	Email  string `json:"email,omitempty"`
+	Role   string `json:"role"`
+}
+
+// fetchOrgMembers lists org members
+func fetchOrgMembers(token, orgID string) ([]OrgMemberInfo, error) {
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequest("GET", apiBase+"/organizations/"+orgID+"/members", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := doVaultRequest(client, req, &token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch org members: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("org members fetch failed %d: %s", resp.StatusCode, string(body))
+	}
+
+	var members []OrgMemberInfo
+	if err := json.NewDecoder(resp.Body).Decode(&members); err != nil {
+		return nil, err
+	}
+
+	return members, nil
+}
+
+// resetMemberEncryption resets a user's SSO encryption state
+func resetMemberEncryption(token, orgID, userID string) error {
+	apiBase := getAPIBase()
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequest("POST", apiBase+"/organizations/"+orgID+"/members/"+userID+"/reset-encryption", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := doVaultRequest(client, req, &token)
+	if err != nil {
+		return fmt.Errorf("failed to reset member encryption: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("reset member encryption failed %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
 // updateOrgVaultKey updates the encrypted vault key on an org vault
 func updateOrgVaultKey(token, orgID, vaultID, encryptedVaultKey string) error {
 	apiBase := getAPIBase()

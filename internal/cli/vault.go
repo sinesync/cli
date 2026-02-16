@@ -205,6 +205,22 @@ Members will need to be re-provisioned after the reset.`,
 	RunE: runVaultResetKeys,
 }
 
+var vaultResetMemberCmd = &cobra.Command{
+	Use:   "reset-member <email>",
+	Short: "Reset a member's encryption state (admin only)",
+	Long: `Reset a member's SSO encryption state so they can re-bootstrap.
+
+This clears the member's encryption keys, credential bundles, and vault access records.
+The member will need to log in again and set up encryption from scratch.
+
+Use this when a member has lost their account key or is locked out of their account.
+
+Examples:
+  sinesync vault reset-member alice@example.com`,
+	Args: cobra.ExactArgs(1),
+	RunE: runVaultResetMember,
+}
+
 var vaultShareCmd = &cobra.Command{
 	Use:   "share <vault-id>",
 	Short: "Share a vault with another user",
@@ -324,6 +340,7 @@ func init() {
 	vaultCmd.AddCommand(vaultSyncCmd)
 	vaultCmd.AddCommand(vaultProvisionCmd)
 	vaultCmd.AddCommand(vaultResetKeysCmd)
+	vaultCmd.AddCommand(vaultResetMemberCmd)
 	vaultCmd.AddCommand(vaultShareCmd)
 	vaultCmd.AddCommand(vaultPendingConfirmCmd)
 	vaultCmd.AddCommand(vaultConfirmCmd)
@@ -1207,8 +1224,15 @@ func runVaultResetKeys(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("only admins can reset org keys (your role: %s)", orgInfo.Role)
 	}
 
-	fmt.Println("WARNING: This will reset all org encryption keys.")
-	fmt.Println("All vault member access will be cleared and must be re-provisioned.")
+	fmt.Println("WARNING: This will reset encryption for ALL org vaults.")
+	fmt.Println()
+	fmt.Println("  What will be cleared:")
+	fmt.Println("    - Org keypair")
+	fmt.Println("    - Encrypted keys for ALL org vaults")
+	fmt.Println("    - ALL member vault access records")
+	fmt.Println()
+	fmt.Println("  After reset, run 'vault provision' to re-initialize everything.")
+	fmt.Println("  Members will not be able to sync org vaults until re-provisioned.")
 	fmt.Println()
 	fmt.Print("Type 'RESET' to confirm: ")
 	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -1227,6 +1251,67 @@ func runVaultResetKeys(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Println("✓ Org encryption keys have been reset")
 	fmt.Println("  Run 'sinesync vault provision' to re-initialize encryption")
+
+	return nil
+}
+
+func runVaultResetMember(cmd *cobra.Command, args []string) error {
+	email := args[0]
+
+	token, err := getAuthTokenForVault()
+	if err != nil {
+		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	orgInfo, err := fetchUserOrgInfo(token)
+	if err != nil || orgInfo == nil {
+		return fmt.Errorf("you are not in an organization")
+	}
+
+	isAdmin := orgInfo.Role == "admin" || orgInfo.Role == "owner"
+	if !isAdmin {
+		return fmt.Errorf("only admins can reset member encryption (your role: %s)", orgInfo.Role)
+	}
+
+	// Look up user by email
+	members, err := fetchOrgMembers(token, orgInfo.OrgID)
+	if err != nil {
+		return fmt.Errorf("failed to list org members: %w", err)
+	}
+
+	var targetUserID string
+	for _, m := range members {
+		if strings.EqualFold(m.Email, email) {
+			targetUserID = m.UserID
+			break
+		}
+	}
+	if targetUserID == "" {
+		return fmt.Errorf("no org member found with email: %s", email)
+	}
+
+	fmt.Printf("Reset encryption for %s?\n", email)
+	fmt.Println("This will clear their encryption keys and vault access.")
+	fmt.Println("They will need to log in again and re-bootstrap encryption.")
+	fmt.Println()
+	fmt.Print("Type 'RESET' to confirm: ")
+	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read input: %w", err)
+	}
+	if strings.TrimSpace(input) != "RESET" {
+		fmt.Println("Aborted.")
+		return nil
+	}
+
+	if err := resetMemberEncryption(token, orgInfo.OrgID, targetUserID); err != nil {
+		return fmt.Errorf("failed to reset member encryption: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Printf("✓ Encryption reset for %s\n", email)
+	fmt.Println("  They can now log in and set up encryption again.")
+	fmt.Println("  Run 'sinesync vault provision' afterwards to re-provision their vault access.")
 
 	return nil
 }
