@@ -366,54 +366,59 @@ func runVaultList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not logged in: %w", err)
 	}
 
-	apiBase := getAPIBase()
-	client := &http.Client{Timeout: 30 * time.Second}
+	orgInfo, _ := fetchUserOrgInfo(token)
+	isOrgUser := orgInfo != nil
 
-	req, err := http.NewRequest("GET", apiBase+"/vaults", nil)
-	if err != nil {
-		return err
-	}
+	// Personal vaults (skip for org users)
+	if !isOrgUser {
+		apiBase := getAPIBase()
+		client := &http.Client{Timeout: 30 * time.Second}
 
-	resp, err := doVaultRequest(client, req, &token)
-	if err != nil {
-		return fmt.Errorf("failed to fetch vaults: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server error: %s", string(body))
-	}
-
-	var result struct {
-		Vaults []VaultWithRole `json:"vaults"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
-	}
-
-	if len(result.Vaults) == 0 {
-		fmt.Println("No vaults found.")
-		return nil
-	}
-
-	fmt.Println("Your vaults:")
-	fmt.Println()
-	for _, v := range result.Vaults {
-		defaultMarker := ""
-		if v.IsDefault {
-			defaultMarker = " (default)"
+		req, err := http.NewRequest("GET", apiBase+"/vaults", nil)
+		if err != nil {
+			return err
 		}
-		fmt.Printf("  %s%s\n", v.Name, defaultMarker)
-		fmt.Printf("    ID: %s\n", v.ID)
-		fmt.Printf("    Role: %s\n", v.Role)
-		fmt.Printf("    Members: %d\n", v.MemberCount)
+
+		resp, err := doVaultRequest(client, req, &token)
+		if err != nil {
+			return fmt.Errorf("failed to fetch vaults: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("server error: %s", string(body))
+		}
+
+		var result struct {
+			Vaults []VaultWithRole `json:"vaults"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return err
+		}
+
+		if len(result.Vaults) == 0 {
+			fmt.Println("No vaults found.")
+			return nil
+		}
+
+		fmt.Println("Your vaults:")
 		fmt.Println()
+		for _, v := range result.Vaults {
+			defaultMarker := ""
+			if v.IsDefault {
+				defaultMarker = " (default)"
+			}
+			fmt.Printf("  %s%s\n", v.Name, defaultMarker)
+			fmt.Printf("    ID: %s\n", v.ID)
+			fmt.Printf("    Role: %s\n", v.Role)
+			fmt.Printf("    Members: %d\n", v.MemberCount)
+			fmt.Println()
+		}
 	}
 
 	// Show org vaults
-	orgInfo, err := fetchUserOrgInfo(token)
-	if err == nil && orgInfo != nil {
+	if isOrgUser {
 		orgVaults, err := fetchOrgVaults(token, orgInfo.OrgID)
 		if err == nil && len(orgVaults) > 0 {
 			fmt.Println("Organization vaults:")
@@ -431,6 +436,11 @@ func runVaultList(cmd *cobra.Command, args []string) error {
 				}
 				fmt.Println()
 			}
+		} else if err != nil {
+			return fmt.Errorf("failed to fetch org vaults: %w", err)
+		} else {
+			fmt.Println("No organization vaults found.")
+			fmt.Println("Contact your organization administrator for vault access.")
 		}
 	}
 
@@ -443,6 +453,12 @@ func runVaultCreate(cmd *cobra.Command, args []string) error {
 	token, err := getAuthTokenForVault()
 	if err != nil {
 		return fmt.Errorf("not logged in: %w", err)
+	}
+
+	// Org users cannot create personal vaults
+	orgInfo, _ := fetchUserOrgInfo(token)
+	if orgInfo != nil {
+		return fmt.Errorf("organization members cannot create personal vaults")
 	}
 
 	apiBase := getAPIBase()
@@ -1031,93 +1047,99 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Check org membership early to skip personal vaults for org users
+	orgInfo, _ := fetchUserOrgInfo(token)
+	isOrgUser := orgInfo != nil
+
 	apiBase := getAPIBase()
 	client := &http.Client{Timeout: 30 * time.Second}
-
-	// Get all vaults
-	req, err := http.NewRequest("GET", apiBase+"/vaults", nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := doVaultRequest(client, req, &token)
-	if err != nil {
-		return fmt.Errorf("failed to fetch vaults: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server error: %s", string(body))
-	}
-
-	var result struct {
-		Vaults []VaultWithRole `json:"vaults"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
-	}
 
 	// For each vault, get the encrypted key (projects are local-only)
 	localConfig := LocalVaultConfig{Vaults: make([]LocalVault, 0)}
 
-	for _, v := range result.Vaults {
-		// Get encrypted vault key
-		keyReq, err := http.NewRequest("GET", apiBase+"/vaults/"+v.ID+"/key", nil)
+	// Personal vault sync (skip for org users)
+	if !isOrgUser {
+		// Get all vaults
+		req, err := http.NewRequest("GET", apiBase+"/vaults", nil)
 		if err != nil {
-			fmt.Printf("  Warning: failed to create key request for vault %s: %v\n", v.Name, err)
-			continue
+			return err
 		}
 
-		keyResp, err := doVaultRequest(client, keyReq, &token)
+		resp, err := doVaultRequest(client, req, &token)
 		if err != nil {
-			fmt.Printf("  Warning: failed to get key for vault %s: %v\n", v.Name, err)
-			continue
+			return fmt.Errorf("failed to fetch vaults: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("server error: %s", string(body))
 		}
 
-		var keyResult struct {
-			EncryptedVaultKey string `json:"encryptedVaultKey"`
+		var result struct {
+			Vaults []VaultWithRole `json:"vaults"`
 		}
-		if keyResp.StatusCode == http.StatusOK {
-			if err := json.NewDecoder(keyResp.Body).Decode(&keyResult); err != nil {
-				fmt.Printf("  Warning: failed to decode key response for vault %s: %v\n", v.Name, err)
-			}
-		} else {
-			fmt.Printf("  Warning: key fetch returned status %d for vault %s\n", keyResp.StatusCode, v.Name)
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return err
 		}
-		keyResp.Body.Close()
 
-		// Normalize the encrypted vault key to AES-GCM format
-		// Vault owners already have AES-GCM keys; invited members have X25519-sealed keys
-		if keyResult.EncryptedVaultKey != "" {
-			normalizedKey, err := normalizeVaultKey(keyResult.EncryptedVaultKey, token)
+		for _, v := range result.Vaults {
+			// Get encrypted vault key
+			keyReq, err := http.NewRequest("GET", apiBase+"/vaults/"+v.ID+"/key", nil)
 			if err != nil {
-				fmt.Printf("  Warning: failed to normalize key for vault %s: %v\n", v.Name, err)
-			} else {
-				keyResult.EncryptedVaultKey = normalizedKey
+				fmt.Printf("  Warning: failed to create key request for vault %s: %v\n", v.Name, err)
+				continue
 			}
+
+			keyResp, err := doVaultRequest(client, keyReq, &token)
+			if err != nil {
+				fmt.Printf("  Warning: failed to get key for vault %s: %v\n", v.Name, err)
+				continue
+			}
+
+			var keyResult struct {
+				EncryptedVaultKey string `json:"encryptedVaultKey"`
+			}
+			if keyResp.StatusCode == http.StatusOK {
+				if err := json.NewDecoder(keyResp.Body).Decode(&keyResult); err != nil {
+					fmt.Printf("  Warning: failed to decode key response for vault %s: %v\n", v.Name, err)
+				}
+			} else {
+				fmt.Printf("  Warning: key fetch returned status %d for vault %s\n", keyResp.StatusCode, v.Name)
+			}
+			keyResp.Body.Close()
+
+			// Normalize the encrypted vault key to AES-GCM format
+			// Vault owners already have AES-GCM keys; invited members have X25519-sealed keys
+			if keyResult.EncryptedVaultKey != "" {
+				normalizedKey, err := normalizeVaultKey(keyResult.EncryptedVaultKey, token)
+				if err != nil {
+					fmt.Printf("  Warning: failed to normalize key for vault %s: %v\n", v.Name, err)
+				} else {
+					keyResult.EncryptedVaultKey = normalizedKey
+				}
+			}
+
+			// Preserve existing local project mappings
+			projects := existingProjects[v.ID]
+			if projects == nil {
+				projects = []string{}
+			}
+
+			localConfig.Vaults = append(localConfig.Vaults, LocalVault{
+				VaultID:           v.ID,
+				Name:              v.Name,
+				EncryptedVaultKey: keyResult.EncryptedVaultKey,
+				Projects:          projects,
+				IsDefault:         v.IsDefault,
+			})
+
+			fmt.Printf("  ✓ %s (%d local projects)\n", v.Name, len(projects))
 		}
-
-		// Preserve existing local project mappings
-		projects := existingProjects[v.ID]
-		if projects == nil {
-			projects = []string{}
-		}
-
-		localConfig.Vaults = append(localConfig.Vaults, LocalVault{
-			VaultID:           v.ID,
-			Name:              v.Name,
-			EncryptedVaultKey: keyResult.EncryptedVaultKey,
-			Projects:          projects,
-			IsDefault:         v.IsDefault,
-		})
-
-		fmt.Printf("  ✓ %s (%d local projects)\n", v.Name, len(projects))
 	}
 
 	// --- Org vault sync section ---
-	orgInfo, orgErr := fetchUserOrgInfo(token)
-	if orgErr == nil && orgInfo != nil {
+	if isOrgUser {
 		fmt.Println()
 		fmt.Println("Syncing org vaults...")
 
@@ -1189,6 +1211,18 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 
 				fmt.Printf("  ✓ %s [org] (%d local projects)\n", ov.Name, len(projects))
 			}
+		}
+
+		// Set first org vault as default if no vault is already default
+		hasDefault := false
+		for _, v := range localConfig.Vaults {
+			if v.IsDefault {
+				hasDefault = true
+				break
+			}
+		}
+		if !hasDefault && len(localConfig.Vaults) > 0 {
+			localConfig.Vaults[0].IsDefault = true
 		}
 	}
 
