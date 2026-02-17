@@ -510,6 +510,16 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 	// SSO device-key encryption setup
 	token := authCfg.Token
 
+	// Determine org role for encryption flow decisions
+	isAdmin := false
+	orgInfo, err := fetchUserOrgInfo(token)
+	if err != nil {
+		return fmt.Errorf("failed to fetch organization info; please retry login: %w", err)
+	}
+	if orgInfo != nil {
+		isAdmin = orgInfo.Role == "admin" || orgInfo.Role == "owner"
+	}
+
 	status, err := ssoCredentialStatus(apiBase, token)
 	if err != nil {
 		return fmt.Errorf("failed to check SSO credential status: %w", err)
@@ -517,7 +527,7 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 
 	if !status.HasBundle {
 		// First-ever SSO login — bootstrap encryption keys
-		if err := ssoBootstrap(apiBase, token); err != nil {
+		if err := ssoBootstrap(apiBase, token, isAdmin); err != nil {
 			return fmt.Errorf("SSO key bootstrap failed: %w", err)
 		}
 	} else if keychain.HasDeviceKey() {
@@ -525,10 +535,15 @@ func doSAMLLoginFlow(apiBase, email, orgSlug string, ssoPort int) error {
 		if err := ssoSameDeviceUnlock(apiBase, token); err != nil {
 			return fmt.Errorf("SSO device unlock failed: %w", err)
 		}
-	} else {
-		// New device — recover using account key
+	} else if isAdmin {
+		// Admin on new device — recover using account key
 		if err := ssoAccountKeyRecover(apiBase, token, status.TestBlob); err != nil {
 			return fmt.Errorf("SSO account key recovery failed: %w", err)
+		}
+	} else {
+		// Member on new device — try self-service recovery from existing device
+		if err := ssoDeviceRecovery(apiBase, token, authCfg.DeviceID); err != nil {
+			return fmt.Errorf("SSO device recovery failed: %w", err)
 		}
 	}
 
@@ -586,7 +601,7 @@ func ssoCredentialStatus(apiBase, token string) (*ssoStatusResult, error) {
 
 // ssoBootstrap generates new encryption keys for first-time SSO login.
 // The server derives the device ID from the access token.
-func ssoBootstrap(apiBase, token string) error {
+func ssoBootstrap(apiBase, token string, isAdmin bool) error {
 	fmt.Println("Setting up device-key encryption for SSO...")
 
 	// 1. Generate random 32-byte account key (master encryption key)
@@ -673,25 +688,29 @@ func ssoBootstrap(apiBase, token string) error {
 		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	// Display account key in dashed base32 format (matches personal vault secret key format)
-	accountKeyFormatted := crypto.EncodeBase32(accountKey)
 	fmt.Println()
 	fmt.Println("✓ Encryption keys generated and secured with device key")
-	fmt.Println()
-	fmt.Println("  ┌────────────────────────────────────────────────────────────────────┐")
-	fmt.Printf("  │  %-64s  │\n", "")
-	fmt.Printf("  │  %-64s  │\n", "YOUR ACCOUNT KEY (save this securely)")
-	fmt.Printf("  │  %-64s  │\n", "")
-	fmt.Printf("  │  %-64s  │\n", accountKeyFormatted)
-	fmt.Printf("  │  %-64s  │\n", "")
-	fmt.Printf("  │  %-64s  │\n", "You will need this key to provision org vault members from the")
-	fmt.Printf("  │  %-64s  │\n", "web UI. It will not be shown again.")
-	fmt.Printf("  │  %-64s  │\n", "")
-	fmt.Println("  └────────────────────────────────────────────────────────────────────┘")
-	fmt.Println()
-	fmt.Print("Press Enter after you have saved your account key...")
-	bufio.NewReader(os.Stdin).ReadString('\n')
-	fmt.Println()
+
+	if isAdmin {
+		// Admins need the account key for new device recovery and web provisioning
+		accountKeyFormatted := crypto.EncodeBase32(accountKey)
+		fmt.Println()
+		fmt.Println("  ┌────────────────────────────────────────────────────────────────────┐")
+		fmt.Printf("  │  %-64s  │\n", "")
+		fmt.Printf("  │  %-64s  │\n", "YOUR ACCOUNT KEY (save this securely)")
+		fmt.Printf("  │  %-64s  │\n", "")
+		fmt.Printf("  │  %-64s  │\n", accountKeyFormatted)
+		fmt.Printf("  │  %-64s  │\n", "")
+		fmt.Printf("  │  %-64s  │\n", "You will need this key to set up new devices and")
+		fmt.Printf("  │  %-64s  │\n", "provision members from the web UI.")
+		fmt.Printf("  │  %-64s  │\n", "It will not be shown again.")
+		fmt.Printf("  │  %-64s  │\n", "")
+		fmt.Println("  └────────────────────────────────────────────────────────────────────┘")
+		fmt.Println()
+		fmt.Print("Press Enter after you have saved your account key...")
+		bufio.NewReader(os.Stdin).ReadString('\n')
+		fmt.Println()
+	}
 
 	return nil
 }
@@ -857,6 +876,193 @@ func ssoAccountKeyRecover(apiBase, token, testBlobB64 string) error {
 	}
 
 	fmt.Println("✓ Encryption keys recovered from account key")
+	return nil
+}
+
+// ssoDeviceRecovery performs self-service recovery for a member on a new device.
+// An ephemeral X25519 keypair is generated; the new device posts its temp public key
+// and polls until an existing device seals the credential bundle with that key.
+func ssoDeviceRecovery(apiBase, token, deviceID string) error {
+	fmt.Println()
+	fmt.Println("New device detected. Requesting encryption keys from your existing device...")
+	fmt.Println("Run 'sinesync vault sync' on an existing device to approve.")
+	fmt.Println()
+
+	// 1. Generate ephemeral X25519 keypair
+	tempPubKey, tempPrivKey, err := crypto.GenerateX25519Keypair()
+	if err != nil {
+		return fmt.Errorf("generate ephemeral keypair: %w", err)
+	}
+
+	hostname := getHostname()
+
+	// 2. POST recovery request
+	reqBody, _ := json.Marshal(map[string]string{
+		"tempPublicKey": tempPubKey,
+		"deviceName":    hostname,
+	})
+
+	recoveryID := ""
+	{
+		req, err := http.NewRequest("POST", apiBase+"/sso/credentials/recovery", bytes.NewReader(reqBody))
+		if err != nil {
+			return fmt.Errorf("create recovery request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(req)
+
+		resp, err := authHTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("post recovery request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("recovery request failed: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var result struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return fmt.Errorf("parse recovery response: %w", err)
+		}
+		recoveryID = result.ID
+	}
+
+	// 3. Poll for approval (every 5s, 5-minute timeout)
+	fmt.Println("Waiting for approval from existing device...")
+	deadline := time.Now().Add(5 * time.Minute)
+	var encryptedBundle string
+
+	for {
+		if time.Now().After(deadline) {
+			fmt.Println()
+			fmt.Println("Timed out waiting for approval from an existing device.")
+			fmt.Println("Ask your org admin to run: sinesync vault reset-member <your-email>")
+			fmt.Println("Then log in again.")
+			return fmt.Errorf("device recovery timed out — no existing device responded")
+		}
+
+		time.Sleep(5 * time.Second)
+
+		pollReq, err := http.NewRequest("GET", fmt.Sprintf("%s/sso/credentials/recovery/%s", apiBase, recoveryID), nil)
+		if err != nil {
+			continue
+		}
+		pollReq.Header.Set("Authorization", "Bearer "+token)
+		httputil.SetClientHeaders(pollReq)
+
+		pollResp, err := authHTTPClient.Do(pollReq)
+		if err != nil {
+			continue
+		}
+
+		if pollResp.StatusCode != http.StatusOK {
+			pollResp.Body.Close()
+			continue
+		}
+
+		var recovery struct {
+			Status          string `json:"status"`
+			EncryptedBundle string `json:"encryptedBundle"`
+		}
+		if err := json.NewDecoder(pollResp.Body).Decode(&recovery); err != nil {
+			pollResp.Body.Close()
+			continue
+		}
+		pollResp.Body.Close()
+
+		if recovery.Status == "ready" {
+			encryptedBundle = recovery.EncryptedBundle
+			break
+		}
+	}
+
+	// 4. Decrypt bundle with ephemeral private key
+	bundleJSON, err := crypto.X25519Open(encryptedBundle, tempPrivKey)
+	if err != nil {
+		return fmt.Errorf("decrypt recovery bundle: %w", err)
+	}
+
+	fmt.Println("✓ Encryption keys received from existing device")
+
+	// 5. Parse bundle
+	var bundle struct {
+		AccountKey string `json:"accountKey"`
+		PrivateKey string `json:"privateKey"`
+	}
+	if err := json.Unmarshal(bundleJSON, &bundle); err != nil {
+		return fmt.Errorf("parse bundle: %w", err)
+	}
+
+	accountKey, err := base64.StdEncoding.DecodeString(bundle.AccountKey)
+	if err != nil {
+		return fmt.Errorf("decode account key: %w", err)
+	}
+
+	// 6. Generate new device key
+	deviceKey, err := crypto.GenerateKey(32)
+	if err != nil {
+		return fmt.Errorf("generate device key: %w", err)
+	}
+
+	if err := keychain.SetDeviceKey(deviceKey); err != nil {
+		return fmt.Errorf("store device key: %w", err)
+	}
+
+	// 7. Re-encrypt bundle with device key
+	reEncrypted, err := encryption.EncryptCredentialBundle(bundleJSON, deviceKey)
+	if err != nil {
+		return fmt.Errorf("re-encrypt bundle: %w", err)
+	}
+
+	// 8. Upload new device's bundle
+	uploadBody, _ := json.Marshal(map[string]string{
+		"encryptedBundle": base64.StdEncoding.EncodeToString(reEncrypted),
+	})
+	uploadReq, err := http.NewRequest("POST", apiBase+"/sso/credentials/bundle", bytes.NewReader(uploadBody))
+	if err != nil {
+		return fmt.Errorf("create upload request: %w", err)
+	}
+	uploadReq.Header.Set("Content-Type", "application/json")
+	uploadReq.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(uploadReq)
+
+	uploadResp, err := authHTTPClient.Do(uploadReq)
+	if err != nil {
+		return fmt.Errorf("upload bundle: %w", err)
+	}
+	defer uploadResp.Body.Close()
+
+	if uploadResp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(uploadResp.Body)
+		return fmt.Errorf("upload failed: %d - %s", uploadResp.StatusCode, string(respBody))
+	}
+
+	// 9. Set account key
+	encMgr := encryption.GetManager()
+	if err := encMgr.SetKeyDirect(accountKey); err != nil {
+		return fmt.Errorf("set key: %w", err)
+	}
+
+	// 10. Claim recovery (scrubs bundle from server)
+	claimReq, err := http.NewRequest("POST", fmt.Sprintf("%s/sso/credentials/recovery/%s/claim", apiBase, recoveryID), nil)
+	if err != nil {
+		return fmt.Errorf("create claim request: %w", err)
+	}
+	claimReq.Header.Set("Authorization", "Bearer "+token)
+	httputil.SetClientHeaders(claimReq)
+
+	claimResp, err := authHTTPClient.Do(claimReq)
+	if err != nil {
+		return fmt.Errorf("claim recovery: %w", err)
+	}
+	defer claimResp.Body.Close()
+
+	fmt.Println("✓ Encryption keys secured with device key")
 	return nil
 }
 

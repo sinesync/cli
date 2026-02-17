@@ -437,10 +437,13 @@ func fetchOrgMembers(token, orgID string) ([]OrgMemberInfo, error) {
 		return nil, fmt.Errorf("org members fetch failed %d: %s", resp.StatusCode, string(body))
 	}
 
-	var members []OrgMemberInfo
-	if err := json.NewDecoder(resp.Body).Decode(&members); err != nil {
+	var result struct {
+		Members []OrgMemberInfo `json:"members"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
+	members := result.Members
 
 	return members, nil
 }
