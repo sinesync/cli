@@ -13,14 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"encoding/base64"
-
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/miclip/sinesync/internal/httputil"
-	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
 	kr "github.com/zalando/go-keyring"
@@ -1176,14 +1173,6 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Approve pending device recoveries for SSO members (only when interactive)
-	authCfg, _ := loadAuthConfig()
-	if authCfg != nil && authCfg.AuthMethod == "saml" && keychain.HasDeviceKey() {
-		if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
-			approveDeviceRecoveries(token)
-		}
-	}
-
 	// Save local config
 	if err := saveLocalVaultConfig(&localConfig); err != nil {
 		return fmt.Errorf("failed to save vault config: %w", err)
@@ -1201,126 +1190,6 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-// approveDeviceRecoveries checks for pending device recovery requests from the
-// same user and approves them by sealing the credential bundle with each
-// requester's ephemeral X25519 public key.
-func approveDeviceRecoveries(token string) {
-	apiBase := getAPIBase()
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	// 1. Fetch pending recoveries
-	req, err := http.NewRequest("GET", apiBase+"/sso/credentials/recovery/pending", nil)
-	if err != nil {
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	httputil.SetClientHeaders(req)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return
-	}
-
-	var result struct {
-		Recoveries []struct {
-			ID            string `json:"id"`
-			DeviceName    string `json:"deviceName"`
-			TempPublicKey string `json:"tempPublicKey"`
-		} `json:"recoveries"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Recoveries) == 0 {
-		return
-	}
-
-	// 2. Load own credential bundle and decrypt with device key
-	deviceKey, err := keychain.GetDeviceKey()
-	if err != nil {
-		fmt.Printf("  Warning: could not read device key for recovery approval: %v\n", err)
-		return
-	}
-
-	bundleReq, err := http.NewRequest("GET", apiBase+"/sso/credentials/bundle", nil)
-	if err != nil {
-		return
-	}
-	bundleReq.Header.Set("Authorization", "Bearer "+token)
-	httputil.SetClientHeaders(bundleReq)
-
-	bundleResp, err := client.Do(bundleReq)
-	if err != nil {
-		return
-	}
-	defer bundleResp.Body.Close()
-
-	if bundleResp.StatusCode != http.StatusOK {
-		return
-	}
-
-	var bundleResult struct {
-		EncryptedBundle string `json:"encryptedBundle"`
-	}
-	if err := json.NewDecoder(bundleResp.Body).Decode(&bundleResult); err != nil {
-		return
-	}
-
-	encryptedBytes, err := base64.StdEncoding.DecodeString(bundleResult.EncryptedBundle)
-	if err != nil {
-		return
-	}
-
-	bundleJSON, err := encryption.DecryptCredentialBundle(encryptedBytes, deviceKey)
-	if err != nil {
-		fmt.Printf("  Warning: could not decrypt credential bundle for recovery approval: %v\n", err)
-		return
-	}
-
-	// 3. For each pending recovery, prompt for consent and seal bundle
-	reader := bufio.NewReader(os.Stdin)
-	for _, recovery := range result.Recoveries {
-		fmt.Printf("\n  Device recovery request from: %s\n", recovery.DeviceName)
-		fmt.Printf("  Approve this device? [y/N]: ")
-		answer, _ := reader.ReadString('\n')
-		answer = strings.TrimSpace(strings.ToLower(answer))
-		if answer != "y" && answer != "yes" {
-			fmt.Printf("  Skipped device: %s\n", recovery.DeviceName)
-			continue
-		}
-
-		sealed, err := crypto.X25519Seal(bundleJSON, recovery.TempPublicKey)
-		if err != nil {
-			fmt.Printf("  Warning: failed to seal bundle for device %s: %v\n", recovery.DeviceName, err)
-			continue
-		}
-
-		approveBody, _ := json.Marshal(map[string]string{
-			"encryptedBundle": sealed,
-		})
-
-		approveReq, err := http.NewRequest("PATCH", fmt.Sprintf("%s/sso/credentials/recovery/%s", apiBase, recovery.ID), bytes.NewReader(approveBody))
-		if err != nil {
-			continue
-		}
-		approveReq.Header.Set("Content-Type", "application/json")
-		approveReq.Header.Set("Authorization", "Bearer "+token)
-		httputil.SetClientHeaders(approveReq)
-
-		approveResp, err := client.Do(approveReq)
-		if err != nil {
-			continue
-		}
-		approveResp.Body.Close()
-
-		if approveResp.StatusCode == http.StatusOK {
-			fmt.Printf("  ✓ Approved device recovery: %s\n", recovery.DeviceName)
-		}
-	}
 }
 
 // Helper functions

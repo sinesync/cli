@@ -885,7 +885,7 @@ func ssoAccountKeyRecover(apiBase, token, testBlobB64 string) error {
 func ssoDeviceRecovery(apiBase, token, deviceID string) error {
 	fmt.Println()
 	fmt.Println("New device detected. Requesting encryption keys from your existing device...")
-	fmt.Println("Run 'sinesync vault sync' on an existing device to approve.")
+	fmt.Println("Run 'sinesync device approve' on an existing device to approve.")
 	fmt.Println()
 
 	// 1. Generate ephemeral X25519 keypair
