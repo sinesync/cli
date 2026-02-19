@@ -602,6 +602,16 @@ func (s *Server) processCapture(sessionID, toolName string, toolInput, toolRespo
 
 	obs.Core.SessionID = sessionID
 
+	// Ensure session row exists before saving (FK constraint)
+	if sessionID != "" {
+		if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+			if err := sqlBackend.EnsureSession(sessionID, obs.Core.Project, obs.Source.Epoch); err != nil {
+				log.Printf("[capture] Failed to ensure session %s for project %s: %v", sessionID, obs.Core.Project, err)
+				return
+			}
+		}
+	}
+
 	if err := s.backend.SaveObservation(obs); err != nil {
 		log.Printf("[capture] Failed to save observation: %v", err)
 		return
