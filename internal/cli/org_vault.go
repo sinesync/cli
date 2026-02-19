@@ -13,9 +13,10 @@ import (
 
 // OrgInfo represents the user's organization info from /users/org-info
 type OrgInfo struct {
-	OrgID        string `json:"orgId"`
-	Role         string `json:"role"`
-	OrgPublicKey string `json:"orgPublicKey"`
+	OrgID          string `json:"orgId"`
+	Role           string `json:"role"`
+	OrgPublicKey   string `json:"orgPublicKey"`
+	KeyHolderCount *int   `json:"keyHolderCount"`
 }
 
 // OrgKeyResponse represents the response from /organizations/:id/org-key

@@ -1117,6 +1117,54 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 			}
 		}
 
+		// Warn if key holder count is dangerously low
+		if orgInfo.KeyHolderCount != nil && *orgInfo.KeyHolderCount < 2 {
+			if *orgInfo.KeyHolderCount == 0 {
+				fmt.Println("  ⚠ No key holders — run 'sinesync admin provision' to initialize org encryption")
+			} else {
+				fmt.Println("  ⚠ Only 1 key holder — run 'sinesync admin provision' on another admin device for redundancy")
+			}
+		}
+
+		// Auto-distribute key holder status to other admins during sync
+		if isAdmin && orgInfo.OrgPublicKey != "" {
+			pendingAdmins, err := fetchAdminsPendingKeyHolders(token, orgInfo.OrgID)
+			if err != nil {
+				fmt.Printf("  Warning: failed to check pending admin holders: %v\n", err)
+			} else if len(pendingAdmins) > 0 {
+				// Current user must be a key holder to distribute
+				orgKey, err := fetchOrgKey(token, orgInfo.OrgID)
+				if err == nil && orgKey != nil && orgKey.KeyHolder != nil {
+					adminPrivKey, err := fetchAndDecryptPrivateKey(token)
+					if err == nil {
+						orgPrivKeyBytes, err := crypto.X25519Open(orgKey.KeyHolder.EncryptedOrgPrivateKey, adminPrivKey)
+						if err == nil {
+							var holders []map[string]string
+							for _, admin := range pendingAdmins {
+								sealed, err := crypto.X25519Seal(orgPrivKeyBytes, admin.PublicKey)
+								if err != nil {
+									continue
+								}
+								holders = append(holders, map[string]string{
+									"userId":                admin.UserID,
+									"encryptedOrgPrivateKey": sealed,
+								})
+							}
+							zeroBytes(orgPrivKeyBytes)
+
+							if len(holders) > 0 {
+								if err := submitKeyHolders(token, orgInfo.OrgID, holders); err != nil {
+									fmt.Printf("  Warning: failed to distribute key holder status: %v\n", err)
+								} else {
+									fmt.Printf("  ✓ Distributed key holder status to %d admin(s)\n", len(holders))
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Fetch org vaults and get user's own vault keys (no admin provisioning here)
 		orgVaults, err := fetchOrgVaults(token, orgInfo.OrgID)
 		if err != nil {
