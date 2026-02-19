@@ -941,7 +941,7 @@ func ssoDeviceRecovery(apiBase, token, deviceID string) error {
 		if time.Now().After(deadline) {
 			fmt.Println()
 			fmt.Println("Timed out waiting for approval from an existing device.")
-			fmt.Println("Ask your org admin to run: sinesync vault reset-member <your-email>")
+			fmt.Println("Ask your org admin to run: sinesync admin reset-member <your-email>")
 			fmt.Println("Then log in again.")
 			return fmt.Errorf("device recovery timed out — no existing device responded")
 		}
