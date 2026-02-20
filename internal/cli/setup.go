@@ -177,6 +177,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 				fmt.Println("   ✓ PostToolUse hook (capture observations)")
 				fmt.Println("   ✓ UserPromptSubmit hook (record prompts)")
 				fmt.Println("   ✓ Stop hook (session summary)")
+				fmt.Println("   ✓ SubagentStart/Stop hooks (capture subagent work)")
 			}
 		}
 	} else {
@@ -392,6 +393,8 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 		delete(hooks, "PostToolUse")
 		delete(hooks, "UserPromptSubmit")
 		delete(hooks, "Stop")
+		delete(hooks, "SubagentStart")
+		delete(hooks, "SubagentStop")
 	} else {
 		// Standalone mode - full capture
 		hooks["SessionStart"] = []map[string]interface{}{
@@ -435,6 +438,28 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 					{
 						"type":    "command",
 						"command": binaryPath + " summarize",
+						"timeout": 60,
+					},
+				},
+			},
+		}
+		hooks["SubagentStart"] = []map[string]interface{}{
+			{
+				"hooks": []map[string]interface{}{
+					{
+						"type":    "command",
+						"command": binaryPath + " subagent-start",
+						"timeout": 10,
+					},
+				},
+			},
+		}
+		hooks["SubagentStop"] = []map[string]interface{}{
+			{
+				"hooks": []map[string]interface{}{
+					{
+						"type":    "command",
+						"command": binaryPath + " subagent-stop",
 						"timeout": 60,
 					},
 				},

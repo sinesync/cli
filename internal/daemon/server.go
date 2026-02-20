@@ -57,6 +57,19 @@ type Server struct {
 
 	// Shared secret for hook API authentication
 	hookSecret string
+
+	// Subagent tracking
+	pendingSubagents   map[string]*pendingSubagent // keyed by agent_id
+	pendingSubagentsMu sync.Mutex
+}
+
+// pendingSubagent tracks an in-flight subagent between SubagentStart and SubagentStop.
+type pendingSubagent struct {
+	AgentID   string
+	AgentType string
+	SessionID string
+	Project   string
+	StartedAt time.Time
 }
 
 // NewServer creates a new daemon server
@@ -275,6 +288,8 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/summarize", s.requireHookAuth(s.handleSummarize))
 	mux.HandleFunc("/api/prompt", s.requireHookAuth(s.handlePrompt))
 	mux.HandleFunc("/api/codex-capture", s.requireHookAuth(s.handleCodexCapture))
+	mux.HandleFunc("/api/subagent-start", s.requireHookAuth(s.handleSubagentStart))
+	mux.HandleFunc("/api/subagent-stop", s.requireHookAuth(s.handleSubagentStop))
 
 	// Dashboard API endpoints
 	mux.HandleFunc("/api/stats", s.handleStats)
@@ -328,6 +343,7 @@ func (s *Server) Run() error {
 	// Start async hook processing queue
 	s.hookQueue = make(chan func(), 256)
 	s.hookDone = make(chan struct{})
+	s.pendingSubagents = make(map[string]*pendingSubagent)
 	go s.processHookQueue()
 
 	// Start background sync
@@ -546,15 +562,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Skip tools that don't produce meaningful observations
-	skipTools := map[string]bool{
-		"Read": true, "Glob": true, "Grep": true,
-		"ListMcpResourcesTool": true, "SlashCommand": true,
-		"Skill": true, "TodoWrite": true, "AskUserQuestion": true,
-		"TaskList": true, "TaskGet": true,
-	}
-
-	if skipTools[hookInput.ToolName] {
+	if skipCaptureTool(hookInput.ToolName) {
 		writeJSON(w, map[string]interface{}{"status": "skipped"})
 		return
 	}
@@ -626,6 +634,182 @@ func (s *Server) processCapture(sessionID, toolName string, toolInput, toolRespo
 	}
 
 	log.Printf("[capture] Saved: id=%s type=%s project=%s", obs.ID, obs.Core.Type, obs.Core.Project)
+}
+
+// === Subagent hooks ===
+
+func (s *Server) handleSubagentStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	var hookInput struct {
+		SessionID string `json:"session_id"`
+		AgentID   string `json:"agent_id"`
+		AgentType string `json:"agent_type"`
+		CWD       string `json:"cwd"`
+	}
+
+	if err := json.Unmarshal(body, &hookInput); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if hookInput.AgentID != "" {
+		s.pendingSubagentsMu.Lock()
+		s.pendingSubagents[hookInput.AgentID] = &pendingSubagent{
+			AgentID:   hookInput.AgentID,
+			AgentType: hookInput.AgentType,
+			SessionID: hookInput.SessionID,
+			Project:   filepath.Base(hookInput.CWD),
+			StartedAt: time.Now(),
+		}
+		s.pendingSubagentsMu.Unlock()
+		log.Printf("[subagent-start] Recorded agent_id=%s type=%s", hookInput.AgentID, hookInput.AgentType)
+	}
+
+	writeJSON(w, map[string]interface{}{"status": "accepted"})
+}
+
+func (s *Server) handleSubagentStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	var hookInput struct {
+		SessionID           string `json:"session_id"`
+		AgentID             string `json:"agent_id"`
+		AgentTranscriptPath string `json:"agent_transcript_path"`
+		CWD                 string `json:"cwd"`
+	}
+
+	if err := json.Unmarshal(body, &hookInput); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Ack immediately — do heavy work async
+	writeJSON(w, map[string]interface{}{"status": "accepted"})
+
+	s.enqueueHook(func() {
+		s.processSubagentStop(hookInput.SessionID, hookInput.AgentID, hookInput.AgentTranscriptPath, hookInput.CWD)
+	})
+}
+
+func (s *Server) processSubagentStop(sessionID, agentID, transcriptPath, cwd string) {
+	project := filepath.Base(cwd)
+
+	// Look up and remove pending subagent info
+	var agentType string
+	s.pendingSubagentsMu.Lock()
+	if ps, ok := s.pendingSubagents[agentID]; ok {
+		agentType = ps.AgentType
+		delete(s.pendingSubagents, agentID)
+	}
+	s.pendingSubagentsMu.Unlock()
+
+	if agentType == "" {
+		agentType = "unknown"
+	}
+
+	log.Printf("[subagent-stop] Processing agent_id=%s type=%s transcript=%s", agentID, agentType, transcriptPath)
+
+	if transcriptPath == "" {
+		log.Printf("[subagent-stop] No transcript path, skipping")
+		return
+	}
+
+	calls, err := parseTranscript(transcriptPath)
+	if err != nil {
+		log.Printf("[subagent-stop] Failed to parse transcript: %v", err)
+		return
+	}
+
+	var filtered []transcriptToolCall
+	for _, tc := range calls {
+		if !skipCaptureTool(tc.ToolName) {
+			filtered = append(filtered, tc)
+		}
+	}
+
+	// Cap at 15 observations per subagent to prevent flooding
+	const maxObsPerSubagent = 15
+	if len(filtered) > maxObsPerSubagent {
+		log.Printf("[subagent-stop] Capping observations from %d to %d", len(filtered), maxObsPerSubagent)
+		filtered = filtered[:maxObsPerSubagent]
+	}
+
+	saved := 0
+	for _, tc := range filtered {
+		obs := s.extractObservation(tc.ToolName, tc.ToolInput, tc.ToolResponse, project)
+		if obs == nil {
+			continue
+		}
+
+		// Tag with subagent metadata
+		obs.SetExtension("subagent", map[string]interface{}{
+			"agent_id":   agentID,
+			"agent_type": agentType,
+		})
+		obs.AddTag("agent:" + agentType)
+
+		// Generate embedding
+		if s.embedder != nil && s.embedder.IsReady() {
+			embedding, err := s.embedder.Embed(obs.TextForEmbedding())
+			if err == nil {
+				obs.Embedding.Vector = embedding
+				obs.Embedding.Model = embeddings.ModelName
+				obs.Embedding.Tokenizer = s.embedder.TokenizerType()
+				obs.Embedding.Dims = embeddings.Dimensions
+			} else {
+				log.Printf("[subagent-stop] WARNING: embedding failed for %s: %v", obs.ID, err)
+			}
+		}
+
+		obs.Core.SessionID = sessionID
+
+		// Ensure session row exists before saving
+		if sessionID != "" {
+			if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+				if err := sqlBackend.EnsureSession(sessionID, project, obs.Source.Epoch); err != nil {
+					log.Printf("[subagent-stop] Failed to ensure session: %v", err)
+					continue
+				}
+			}
+		}
+
+		if err := s.backend.SaveObservation(obs); err != nil {
+			log.Printf("[subagent-stop] Failed to save observation: %v", err)
+			continue
+		}
+		saved++
+
+		if sessionID != "" {
+			if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+				_ = sqlBackend.IncrementSessionObservationCount(sessionID)
+			}
+		}
+	}
+
+	if saved > 0 {
+		s.invalidateCache()
+		s.syncManager.NotifyActivity()
+		log.Printf("[subagent-stop] Saved %d observations from agent %s (%s)", saved, agentID, agentType)
+	}
 }
 
 func (s *Server) extractObservation(toolName string, toolInput map[string]interface{}, toolResponse, project string) *storage.Observation {
@@ -700,10 +884,20 @@ func (s *Server) extractObservation(toolName string, toolInput map[string]interf
 
 	case "Task":
 		prompt, _ := toolInput["prompt"].(string)
+		subagentType, _ := toolInput["subagent_type"].(string)
+		description, _ := toolInput["description"].(string)
 		obs.Core.Type = "discovery"
-		obs.Core.Title = "Delegated task"
-		obs.Core.Summary = truncate(prompt, 100)
-		obs.Core.Content = truncate(toolResponse, 500)
+		if description != "" && subagentType != "" {
+			obs.Core.Title = fmt.Sprintf("Delegated task (%s): %s", subagentType, description)
+		} else if description != "" {
+			obs.Core.Title = fmt.Sprintf("Delegated task: %s", description)
+		} else if subagentType != "" {
+			obs.Core.Title = fmt.Sprintf("Delegated task (%s)", subagentType)
+		} else {
+			obs.Core.Title = "Delegated task"
+		}
+		obs.Core.Summary = truncate(prompt, 200)
+		obs.Core.Content = truncate(toolResponse, 2000)
 
 	case "WebFetch", "WebSearch":
 		obs.Core.Type = "discovery"
@@ -812,6 +1006,21 @@ func extractConceptsFromCommand(command string) []string {
 	}
 
 	return concepts
+}
+
+// skipCaptureTool returns true for tools that don't produce meaningful observations.
+// Used by both handleCapture (PostToolUse) and processSubagentStop (transcript parsing).
+func skipCaptureTool(toolName string) bool {
+	switch toolName {
+	case "Read", "Glob", "Grep",
+		"ListMcpResourcesTool", "SlashCommand",
+		"Skill", "TodoWrite", "AskUserQuestion",
+		"TaskList", "TaskGet",
+		"TaskCreate", "TaskUpdate", "TaskStop",
+		"EnterPlanMode", "ExitPlanMode":
+		return true
+	}
+	return false
 }
 
 func truncate(s string, maxLen int) string {

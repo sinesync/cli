@@ -50,11 +50,27 @@ var promptCmd = &cobra.Command{
 	RunE:   runPrompt,
 }
 
+var subagentStartCmd = &cobra.Command{
+	Use:    "subagent-start",
+	Short:  "Record subagent spawn (SubagentStart hook)",
+	Hidden: true,
+	RunE:   runSubagentStart,
+}
+
+var subagentStopCmd = &cobra.Command{
+	Use:    "subagent-stop",
+	Short:  "Process subagent transcript (SubagentStop hook)",
+	Hidden: true,
+	RunE:   runSubagentStop,
+}
+
 func init() {
 	rootCmd.AddCommand(contextCmd)
 	rootCmd.AddCommand(captureCmd)
 	rootCmd.AddCommand(summarizeCmd)
 	rootCmd.AddCommand(promptCmd)
+	rootCmd.AddCommand(subagentStartCmd)
+	rootCmd.AddCommand(subagentStopCmd)
 }
 
 // HookInput is the JSON structure received from Claude Code hooks
@@ -231,6 +247,34 @@ func runPrompt(cmd *cobra.Command, args []string) error {
 	}
 
 	resp, err := hookPost(daemonURL("/api/prompt"), "application/json", bytes.NewReader(inputData))
+	if err != nil {
+		return nil // Daemon not available — silently skip
+	}
+	drainClose(resp)
+	return nil
+}
+
+func runSubagentStart(cmd *cobra.Command, args []string) error {
+	inputData, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return nil
+	}
+
+	resp, err := hookPost(daemonURL("/api/subagent-start"), "application/json", bytes.NewReader(inputData))
+	if err != nil {
+		return nil // Daemon not available — silently skip
+	}
+	drainClose(resp)
+	return nil
+}
+
+func runSubagentStop(cmd *cobra.Command, args []string) error {
+	inputData, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return nil
+	}
+
+	resp, err := hookPost(daemonURL("/api/subagent-stop"), "application/json", bytes.NewReader(inputData))
 	if err != nil {
 		return nil // Daemon not available — silently skip
 	}
