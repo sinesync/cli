@@ -56,11 +56,20 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install Linux cross-compilation tools
-        if: matrix.os == 'linux' && matrix.arch == 'arm64'
+      - name: Install Linux build dependencies
+        if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            sudo dpkg --add-architecture arm64
+            sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list.d/*.list || true
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs) main restricted universe" | sudo tee /etc/apt/sources.list.d/arm64.list
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ $(lsb_release -cs)-updates main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+            sudo apt-get update
+            sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64
+          else
+            sudo apt-get install -y libssl-dev
+          fi
 
       - name: Install Windows cross-compilation tools
         if: matrix.os == 'windows'
@@ -116,11 +125,6 @@ jobs:
 
             # Import certificate — use printf to avoid echo mangling base64
             printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
-
-            # Debug: verify p12 is valid and password works before security import
-            echo "p12 file size: $(wc -c < certificate.p12) bytes"
-            openssl pkcs12 -in certificate.p12 -passin pass:"$MACOS_CERTIFICATE_PWD" -nokeys | head -5
-
             security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" build.keychain
 
