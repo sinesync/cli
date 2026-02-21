@@ -191,7 +191,7 @@ jobs:
           dotnet tool install --global sign --version 0.9.1-beta.25330.2
           sign code trusted-signing `
             --trusted-signing-endpoint "https://cus.codesigning.azure.net/" `
-            --trusted-signing-account "sinesync-signing" `
+            --trusted-signing-account "sinesync" `
             --trusted-signing-certificate-profile "sinesync-code-signing" `
             --file-digest SHA256 `
             --timestamp-url "http://timestamp.acs.microsoft.com" `
