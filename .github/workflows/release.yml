@@ -158,33 +158,22 @@ jobs:
             echo "Skipping notarization - credentials not configured"
           fi
 
-      # Windows code signing
+      # Windows code signing via Azure Trusted Signing
       - name: Sign Windows binary
         if: matrix.os == 'windows'
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PWD: ${{ secrets.WINDOWS_CERTIFICATE_PWD }}
-        shell: pwsh
-        run: |
-          if ($env:WINDOWS_CERTIFICATE) {
-            # Decode certificate
-            $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
-            [IO.File]::WriteAllBytes("certificate.pfx", $certBytes)
-
-            # Sign using signtool
-            & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign `
-              /f certificate.pfx `
-              /p $env:WINDOWS_CERTIFICATE_PWD `
-              /tr http://timestamp.digicert.com `
-              /td sha256 `
-              /fd sha256 `
-              ${{ env.BINARY_NAME }}.exe
-
-            Remove-Item certificate.pfx
-            Write-Host "Binary signed successfully"
-          } else {
-            Write-Host "Skipping signing - no certificate configured"
-          }
+        uses: azure/trusted-signing-action@v1.1.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://cus.codesigning.azure.net/
+          trusted-signing-account-name: sinesync-signing
+          certificate-profile-name: sinesync-code-signing
+          files-folder: ${{ github.workspace }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Create archive
         shell: bash
