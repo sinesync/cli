@@ -179,6 +179,27 @@ jobs:
             echo "Skipping notarization - credentials not configured"
           fi
 
+      # Debug: verify Azure credentials are correct in CI
+      - name: Verify Azure credentials
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $body = @{
+            client_id     = "${{ secrets.AZURE_CLIENT_ID }}"
+            client_secret = "${{ secrets.AZURE_CLIENT_SECRET }}"
+            scope         = "https://codesigning.azure.net/.default"
+            grant_type    = "client_credentials"
+          }
+          try {
+            $resp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/${{ secrets.AZURE_TENANT_ID }}/oauth2/v2.0/token" -Method Post -Body $body
+            Write-Output "Auth OK - token length: $($resp.access_token.Length)"
+            Write-Output "Client ID starts with: $("${{ secrets.AZURE_CLIENT_ID }}".Substring(0,8))..."
+            Write-Output "Tenant ID starts with: $("${{ secrets.AZURE_TENANT_ID }}".Substring(0,8))..."
+          } catch {
+            Write-Output "Auth FAILED: $_"
+            exit 1
+          }
+
       # Windows code signing via Azure Trusted Signing
       - name: Sign Windows binary
         if: matrix.os == 'windows'
