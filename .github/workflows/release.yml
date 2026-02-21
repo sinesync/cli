@@ -179,36 +179,7 @@ jobs:
             echo "Skipping notarization - credentials not configured"
           fi
 
-      - name: Test signing API from runner
-        if: matrix.os == 'windows'
-        shell: pwsh
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          $body = @{
-            client_id     = $env:AZURE_CLIENT_ID
-            client_secret = $env:AZURE_CLIENT_SECRET
-            scope         = "https://codesigning.azure.net/.default"
-            grant_type    = "client_credentials"
-          }
-          $tokenResp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$($env:AZURE_TENANT_ID)/oauth2/v2.0/token" -Method Post -Body $body
-          Write-Output "Token acquired, length: $($tokenResp.access_token.Length)"
-
-          $headers = @{ Authorization = "Bearer $($tokenResp.access_token)"; "Content-Type" = "application/json" }
-          $signBody = '{"signatureAlgorithm":"RS256","digest":"dGVzdA=="}'
-          try {
-            $resp = Invoke-WebRequest -Uri "https://cus.codesigning.azure.net/codesigningaccounts/sinesync-signing/certificateprofiles/sinesync-code-signing/sign?api-version=2024-06-15" -Method Post -Headers $headers -Body $signBody -UseBasicParsing
-            Write-Output "Sign API response: $($resp.StatusCode)"
-          } catch {
-            $status = $_.Exception.Response.StatusCode.value__
-            Write-Output "Sign API response: $status"
-            if ($status -eq 400) { Write-Output "400 = AUTHORIZED (bad request body expected)" }
-            elseif ($status -eq 403) { Write-Output "403 = FORBIDDEN from runner IP" }
-          }
-
-      # Windows code signing via Azure Trusted Signing (manual setup to control env)
+      # Windows code signing via sign CLI (bypasses dlib which has 403 bug)
       - name: Sign Windows binary
         if: matrix.os == 'windows'
         shell: pwsh
@@ -217,46 +188,15 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
-          # Install signing tools
-          $buildToolsVer = "10.0.26100.4188"
-          $clientVer = "1.0.95"
-          $basePath = "$env:LOCALAPPDATA\TrustedSigning"
-
-          $sources = Get-PackageSource -Name nuget.org -ErrorAction SilentlyContinue
-          if (-not $sources) {
-            Register-PackageSource -Name nuget.org -Location "https://www.nuget.org/api/v2/" -ProviderName NuGet -Force
-          }
-
-          Install-Package Microsoft.Windows.SDK.BuildTools -RequiredVersion $buildToolsVer -Source nuget.org -Destination $basePath -Force -SkipDependencies
-          Install-Package Microsoft.Trusted.Signing.Client -RequiredVersion $clientVer -Source nuget.org -Destination $basePath -Force -SkipDependencies
-
-          $signtool = (Get-ChildItem -Path $basePath -Recurse -Filter "signtool.exe" | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1).FullName
-          $dlib = (Get-ChildItem -Path $basePath -Recurse -Filter "Azure.CodeSigning.Dlib.dll" | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1).FullName
-          Write-Output "signtool: $signtool"
-          Write-Output "dlib: $dlib"
-
-          # Write metadata - only set ExcludeCredentials for non-env types
-          $metadata = @{
-            Endpoint = "https://cus.codesigning.azure.net/"
-            CodeSigningAccountName = "sinesync-signing"
-            CertificateProfileName = "sinesync-code-signing"
-          } | ConvertTo-Json
-          $metadataPath = "$basePath\metadata.json"
-          $metadata | Out-File -FilePath $metadataPath -Encoding utf8
-
-          Write-Output "Metadata: $metadata"
-          Write-Output "AZURE_CLIENT_ID set: $([bool]$env:AZURE_CLIENT_ID)"
-          Write-Output "AZURE_CLIENT_SECRET set: $([bool]$env:AZURE_CLIENT_SECRET)"
-          Write-Output "AZURE_TENANT_ID set: $([bool]$env:AZURE_TENANT_ID)"
-          Write-Output "AZURE_CLIENT_CERTIFICATE_PATH set: $([bool]$env:AZURE_CLIENT_CERTIFICATE_PATH)"
-
-          # Sign
-          & $signtool sign /v /debug /fd SHA256 `
-            /tr http://timestamp.acs.microsoft.com /td SHA256 `
-            /dlib $dlib /dmdf $metadataPath `
+          dotnet tool install --global sign --version 0.9.1-beta.25330.2
+          sign code trusted-signing `
+            --trusted-signing-endpoint "https://cus.codesigning.azure.net/" `
+            --trusted-signing-account "sinesync-signing" `
+            --trusted-signing-certificate-profile "sinesync-code-signing" `
+            --file-digest SHA256 `
+            --timestamp-url "http://timestamp.acs.microsoft.com" `
+            -v Debug `
             "${{ github.workspace }}\${{ env.BINARY_NAME }}.exe"
-
-          if ($LASTEXITCODE -ne 0) { throw "SignTool failed with exit code $LASTEXITCODE" }
 
       - name: Create archive
         shell: bash
