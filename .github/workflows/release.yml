@@ -184,7 +184,7 @@ jobs:
         if: matrix.os == 'windows'
         uses: azure/login@v2
         with:
-          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"ac4786f3-b446-4da5-8d85-53484c6680ad"}'
 
       - name: Sign Windows binary
         if: matrix.os == 'windows'
