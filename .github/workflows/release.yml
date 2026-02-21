@@ -179,35 +179,17 @@ jobs:
             echo "Skipping notarization - credentials not configured"
           fi
 
-      # Debug: verify Azure credentials are correct in CI
-      - name: Verify Azure credentials
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          $body = @{
-            client_id     = "${{ secrets.AZURE_CLIENT_ID }}"
-            client_secret = "${{ secrets.AZURE_CLIENT_SECRET }}"
-            scope         = "https://codesigning.azure.net/.default"
-            grant_type    = "client_credentials"
-          }
-          try {
-            $resp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/${{ secrets.AZURE_TENANT_ID }}/oauth2/v2.0/token" -Method Post -Body $body
-            Write-Output "Auth OK - token length: $($resp.access_token.Length)"
-            Write-Output "Client ID starts with: $("${{ secrets.AZURE_CLIENT_ID }}".Substring(0,8))..."
-            Write-Output "Tenant ID starts with: $("${{ secrets.AZURE_TENANT_ID }}".Substring(0,8))..."
-          } catch {
-            Write-Output "Auth FAILED: $_"
-            exit 1
-          }
-
       # Windows code signing via Azure Trusted Signing
+      - name: Azure Login
+        if: matrix.os == 'windows'
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
       - name: Sign Windows binary
         if: matrix.os == 'windows'
         uses: azure/trusted-signing-action@v1.1.0
         with:
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           endpoint: https://cus.codesigning.azure.net/
           trusted-signing-account-name: sinesync-signing
           certificate-profile-name: sinesync-code-signing
@@ -216,12 +198,12 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
+          exclude-environment-credential: true
           exclude-workload-identity-credential: true
           exclude-managed-identity-credential: true
           exclude-shared-token-cache-credential: true
           exclude-visual-studio-credential: true
           exclude-visual-studio-code-credential: true
-          exclude-azure-cli-credential: true
           exclude-azure-powershell-credential: true
           exclude-azure-developer-cli-credential: true
 
