@@ -116,6 +116,11 @@ jobs:
 
             # Import certificate — use printf to avoid echo mangling base64
             printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+
+            # Debug: verify p12 is valid and password works before security import
+            echo "p12 file size: $(wc -c < certificate.p12) bytes"
+            openssl pkcs12 -in certificate.p12 -passin pass:"$MACOS_CERTIFICATE_PWD" -nokeys | head -5
+
             security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" build.keychain
 
