@@ -36,6 +36,9 @@ coverage/
 /sinesync
 *.exe
 
+# Certificates
+certs/
+
 # Misc
 *.tgz
 .cache/
