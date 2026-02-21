@@ -106,13 +106,16 @@ jobs:
           KEYCHAIN_PWD: ${{ secrets.KEYCHAIN_PWD }}
         run: |
           if [ -n "$MACOS_CERTIFICATE" ]; then
+            KEYCHAIN_PWD="${KEYCHAIN_PWD:-build-$(date +%s)}"
+
             # Create keychain
             security create-keychain -p "$KEYCHAIN_PWD" build.keychain
             security default-keychain -s build.keychain
             security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
+            security set-keychain-settings -lut 3600 build.keychain
 
-            # Import certificate
-            echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+            # Import certificate — use printf to avoid echo mangling base64
+            printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
             security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
             security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" build.keychain
 
