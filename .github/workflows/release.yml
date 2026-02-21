@@ -201,8 +201,10 @@ jobs:
           Install-Package Microsoft.Windows.SDK.BuildTools -RequiredVersion $buildToolsVer -Source nuget.org -Destination $basePath -Force -SkipDependencies
           Install-Package Microsoft.Trusted.Signing.Client -RequiredVersion $clientVer -Source nuget.org -Destination $basePath -Force -SkipDependencies
 
-          $signtool = "$basePath\Microsoft.Windows.SDK.BuildTools.$buildToolsVer\bin\$buildToolsVer\x64\signtool.exe"
-          $dlib = "$basePath\Microsoft.Trusted.Signing.Client.$clientVer\bin\x64\Azure.CodeSigning.Dlib.dll"
+          $signtool = (Get-ChildItem -Path $basePath -Recurse -Filter "signtool.exe" | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1).FullName
+          $dlib = (Get-ChildItem -Path $basePath -Recurse -Filter "Azure.CodeSigning.Dlib.dll" | Where-Object { $_.FullName -match "x64" } | Select-Object -First 1).FullName
+          Write-Output "signtool: $signtool"
+          Write-Output "dlib: $dlib"
 
           # Write metadata - only set ExcludeCredentials for non-env types
           $metadata = @{
