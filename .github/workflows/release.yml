@@ -179,6 +179,35 @@ jobs:
             echo "Skipping notarization - credentials not configured"
           fi
 
+      - name: Test signing API from runner
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          $body = @{
+            client_id     = $env:AZURE_CLIENT_ID
+            client_secret = $env:AZURE_CLIENT_SECRET
+            scope         = "https://codesigning.azure.net/.default"
+            grant_type    = "client_credentials"
+          }
+          $tokenResp = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$($env:AZURE_TENANT_ID)/oauth2/v2.0/token" -Method Post -Body $body
+          Write-Output "Token acquired, length: $($tokenResp.access_token.Length)"
+
+          $headers = @{ Authorization = "Bearer $($tokenResp.access_token)"; "Content-Type" = "application/json" }
+          $signBody = '{"signatureAlgorithm":"RS256","digest":"dGVzdA=="}'
+          try {
+            $resp = Invoke-WebRequest -Uri "https://cus.codesigning.azure.net/codesigningaccounts/sinesync-signing/certificateprofiles/sinesync-code-signing/sign?api-version=2024-06-15" -Method Post -Headers $headers -Body $signBody -UseBasicParsing
+            Write-Output "Sign API response: $($resp.StatusCode)"
+          } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            Write-Output "Sign API response: $status"
+            if ($status -eq 400) { Write-Output "400 = AUTHORIZED (bad request body expected)" }
+            elseif ($status -eq 403) { Write-Output "403 = FORBIDDEN from runner IP" }
+          }
+
       # Windows code signing via Azure Trusted Signing (manual setup to control env)
       - name: Sign Windows binary
         if: matrix.os == 'windows'
