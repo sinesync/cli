@@ -2,6 +2,7 @@ package embeddings
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bufio"
 	"compress/gzip"
 	"fmt"
@@ -244,11 +245,14 @@ func (t *WordPieceTokenizer) wordPiece(word string) []int {
 
 // onnxLibPath returns the path to the ONNX runtime library
 func onnxLibPath() string {
-	libName := "libonnxruntime.so"
-	if runtime.GOOS == "darwin" {
-		libName = "libonnxruntime.dylib"
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(modelDir(), "lib", "libonnxruntime.dylib")
+	case "windows":
+		return filepath.Join(modelDir(), "lib", "onnxruntime.dll")
+	default:
+		return filepath.Join(modelDir(), "lib", "libonnxruntime.so")
 	}
-	return filepath.Join(modelDir(), "lib", libName)
 }
 
 // detectGPU checks for available GPU acceleration
@@ -500,6 +504,12 @@ func downloadONNXRuntime(useGPU bool, accel Accelerator) error {
 		} else {
 			url = fmt.Sprintf("https://github.com/microsoft/onnxruntime/releases/download/v%s/onnxruntime-osx-x86_64-%s.tgz", onnxVersion, onnxVersion)
 		}
+	case "windows":
+		if runtime.GOARCH == "amd64" {
+			url = fmt.Sprintf("https://github.com/microsoft/onnxruntime/releases/download/v%s/onnxruntime-win-x64-%s.zip", onnxVersion, onnxVersion)
+		} else if runtime.GOARCH == "arm64" {
+			url = fmt.Sprintf("https://github.com/microsoft/onnxruntime/releases/download/v%s/onnxruntime-win-arm64-%s.zip", onnxVersion, onnxVersion)
+		}
 	default:
 		return fmt.Errorf("unsupported platform: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
@@ -508,7 +518,7 @@ func downloadONNXRuntime(useGPU bool, accel Accelerator) error {
 		return fmt.Errorf("unsupported architecture: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
-	// Download the tarball
+	// Download the archive
 	resp, err := http.Get(url)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
@@ -525,8 +535,15 @@ func downloadONNXRuntime(useGPU bool, accel Accelerator) error {
 		return fmt.Errorf("create lib dir: %w", err)
 	}
 
-	// Extract the tarball
-	gzr, err := gzip.NewReader(resp.Body)
+	if runtime.GOOS == "windows" {
+		return extractONNXZip(resp.Body, libDir)
+	}
+	return extractONNXTarGz(resp.Body, libDir)
+}
+
+// extractONNXTarGz extracts the ONNX runtime shared library from a .tgz archive (Linux/macOS)
+func extractONNXTarGz(r io.Reader, libDir string) error {
+	gzr, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("gzip reader: %w", err)
 	}
@@ -568,6 +585,57 @@ func downloadONNXRuntime(useGPU bool, accel Accelerator) error {
 				os.Remove(linkPath)
 				os.Symlink(name, linkPath)
 			}
+		}
+	}
+
+	return nil
+}
+
+// extractONNXZip extracts the ONNX runtime DLL from a .zip archive (Windows)
+func extractONNXZip(r io.Reader, libDir string) error {
+	// archive/zip needs a ReaderAt, so download to a temp file first
+	tmpFile, err := os.CreateTemp("", "onnxruntime-*.zip")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	if _, err := io.Copy(tmpFile, r); err != nil {
+		return fmt.Errorf("download to temp: %w", err)
+	}
+
+	stat, err := tmpFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat temp file: %w", err)
+	}
+
+	zr, err := zip.NewReader(tmpFile, stat.Size())
+	if err != nil {
+		return fmt.Errorf("zip reader: %w", err)
+	}
+
+	for _, f := range zr.File {
+		name := filepath.Base(f.Name)
+		if name == "onnxruntime.dll" {
+			rc, err := f.Open()
+			if err != nil {
+				return fmt.Errorf("open zip entry: %w", err)
+			}
+			outPath := filepath.Join(libDir, name)
+			outFile, err := os.Create(outPath)
+			if err != nil {
+				rc.Close()
+				return fmt.Errorf("create file: %w", err)
+			}
+			if _, err := io.Copy(outFile, rc); err != nil {
+				outFile.Close()
+				rc.Close()
+				return fmt.Errorf("extract file: %w", err)
+			}
+			outFile.Close()
+			rc.Close()
+			break
 		}
 	}
 
