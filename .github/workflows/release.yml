@@ -171,7 +171,12 @@ jobs:
               --apple-id "$APPLE_ID" \
               --password "$APPLE_ID_PWD" \
               --team-id "$APPLE_TEAM_ID" \
-              --wait
+              --wait \
+              --timeout 10m || {
+              echo "::warning::Notarization failed or timed out — binary is signed but not notarized"
+              rm -f sinesync-notarize.zip
+              exit 0
+            }
 
             rm sinesync-notarize.zip
             echo "Binary notarized successfully"
