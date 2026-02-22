@@ -113,7 +113,7 @@ jobs:
           fi
 
           if [ "${{ matrix.os }}" = "windows" ]; then
-            go build -ldflags "${LDFLAGS} -extldflags '-static'" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
+            go build -ldflags "${LDFLAGS} -extldflags '-static -Wl,--allow-multiple-definition'" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
           else
             go build -ldflags "${LDFLAGS}" -o ${{ env.BINARY_NAME }} ./cmd/sinesync
           fi
