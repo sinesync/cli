@@ -631,26 +631,26 @@ func extractONNXZip(r io.Reader, libDir string) error {
 
 	for _, f := range zr.File {
 		name := filepath.Base(f.Name)
-		if name == "onnxruntime.dll" {
-			rc, err := f.Open()
-			if err != nil {
-				return fmt.Errorf("open zip entry: %w", err)
-			}
-			outPath := filepath.Join(libDir, name)
-			outFile, err := os.Create(outPath)
-			if err != nil {
-				rc.Close()
-				return fmt.Errorf("create file: %w", err)
-			}
-			if _, err := io.Copy(outFile, rc); err != nil {
-				outFile.Close()
-				rc.Close()
-				return fmt.Errorf("extract file: %w", err)
-			}
+		if !strings.HasSuffix(name, ".dll") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("open zip entry %s: %w", name, err)
+		}
+		outPath := filepath.Join(libDir, name)
+		outFile, err := os.Create(outPath)
+		if err != nil {
+			rc.Close()
+			return fmt.Errorf("create file %s: %w", name, err)
+		}
+		if _, err := io.Copy(outFile, rc); err != nil {
 			outFile.Close()
 			rc.Close()
-			break
+			return fmt.Errorf("extract file %s: %w", name, err)
 		}
+		outFile.Close()
+		rc.Close()
 	}
 
 	return nil
