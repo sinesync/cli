@@ -96,7 +96,8 @@ jobs:
           CGO_ENABLED: 1
         run: |
           VERSION=${{ steps.version.outputs.version }}
-          LDFLAGS="-s -w -X main.version=${VERSION}"
+          COMMIT=$(git rev-parse --short HEAD)
+          LDFLAGS="-s -w -X main.ver=${VERSION} -X main.commit=${COMMIT}"
 
           # Set cross-compiler for Linux ARM64
           if [ "${{ matrix.os }}" = "linux" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
