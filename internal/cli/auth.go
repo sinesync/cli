@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -1775,7 +1776,7 @@ func registerDevice(apiBase, token, name, platform string) (*deviceResponse, err
 
 // Auth config storage
 func authConfigPath() string {
-	return config.ConfigDir() + "/auth.json"
+	return filepath.Join(config.ConfigDir(), "auth.json")
 }
 
 func saveAuthConfig(cfg *AuthConfig) error {

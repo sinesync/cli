@@ -58,6 +58,9 @@ type Server struct {
 	// Shared secret for hook API authentication
 	hookSecret string
 
+	// Graceful shutdown channel (used by /api/shutdown endpoint)
+	shutdownChan chan struct{}
+
 	// Subagent tracking
 	pendingSubagents   map[string]*pendingSubagent // keyed by agent_id
 	pendingSubagentsMu sync.Mutex
@@ -281,6 +284,7 @@ func (s *Server) Run() error {
 	// Health/status endpoints (no auth required)
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/shutdown", s.requireHookAuth(s.handleShutdown))
 
 	// Hook API endpoints (require hook secret)
 	mux.HandleFunc("/api/context", s.requireHookAuth(s.handleContext))
@@ -343,6 +347,7 @@ func (s *Server) Run() error {
 	// Start async hook processing queue
 	s.hookQueue = make(chan func(), 256)
 	s.hookDone = make(chan struct{})
+	s.shutdownChan = make(chan struct{}, 1)
 	s.pendingSubagents = make(map[string]*pendingSubagent)
 	go s.processHookQueue()
 
@@ -354,7 +359,10 @@ func (s *Server) Run() error {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-sigChan
+		select {
+		case <-sigChan:
+		case <-s.shutdownChan:
+		}
 		log.Printf("[daemon] Shutting down...")
 		s.syncManager.Stop()
 		s.hookShutdown.Store(true)
@@ -382,6 +390,19 @@ func (s *Server) Run() error {
 }
 
 // === Health endpoints ===
+
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"status": "shutting down"})
+	// Trigger graceful shutdown after responding
+	select {
+	case s.shutdownChan <- struct{}{}:
+	default:
+	}
+}
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{

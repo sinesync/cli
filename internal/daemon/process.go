@@ -241,16 +241,37 @@ func Stop() error {
 		return nil // Not running
 	}
 
+	// Try graceful shutdown via HTTP endpoint first (works on all platforms)
+	if IsHealthy(info.Port) {
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Post(
+			fmt.Sprintf("http://127.0.0.1:%d/api/shutdown", info.Port),
+			"", nil,
+		)
+		if err == nil {
+			resp.Body.Close()
+			// Wait for graceful shutdown
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				if !IsProcessAlive(info.PID) {
+					RemovePIDFile()
+					return nil
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+	}
+
+	// Graceful shutdown didn't work, send signal/kill
 	process, err := os.FindProcess(info.PID)
 	if err != nil {
 		RemovePIDFile()
 		return nil
 	}
 
-	// Send SIGTERM (or Kill on Windows)
 	signalTerminate(info.PID)
 
-	// Wait a bit for graceful shutdown, then force kill
+	// Wait a bit for shutdown, then force kill
 	time.Sleep(2 * time.Second)
 	if IsProcessAlive(info.PID) {
 		process.Kill()

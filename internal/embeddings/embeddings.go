@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -263,7 +264,7 @@ func detectGPU() (Accelerator, bool) {
 		if runtime.GOARCH == "arm64" {
 			return AcceleratorCoreML, true
 		}
-	case "linux", "windows":
+	case "linux":
 		// Check for NVIDIA GPU via nvidia-smi
 		if _, err := os.Stat("/usr/bin/nvidia-smi"); err == nil {
 			return AcceleratorCUDA, true
@@ -271,7 +272,14 @@ func detectGPU() (Accelerator, bool) {
 		if _, err := os.Stat("/usr/local/cuda"); err == nil {
 			return AcceleratorCUDA, true
 		}
-		// Check for environment variable
+		if os.Getenv("CUDA_VISIBLE_DEVICES") != "" {
+			return AcceleratorCUDA, true
+		}
+	case "windows":
+		// Check for NVIDIA GPU via nvidia-smi on Windows
+		if _, err := exec.LookPath("nvidia-smi"); err == nil {
+			return AcceleratorCUDA, true
+		}
 		if os.Getenv("CUDA_VISIBLE_DEVICES") != "" {
 			return AcceleratorCUDA, true
 		}
@@ -337,6 +345,12 @@ func newProviderInternal() (*Provider, error) {
 			return p, nil
 		}
 		fmt.Fprintf(os.Stderr, "sine~sync: ONNX runtime ready\n")
+	}
+
+	// On Windows, add the DLL's directory to the search path so transitive
+	// dependencies (e.g. vcruntime) can be found when loading onnxruntime.dll
+	if runtime.GOOS == "windows" {
+		addDLLDirectory(filepath.Dir(libPath))
 	}
 
 	// Set library path before initializing
