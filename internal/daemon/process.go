@@ -189,24 +189,29 @@ func startWindows(exePath string, port int) error {
 	}
 	logFile := filepath.Join(LogDir(), fmt.Sprintf("daemon-%s.log", time.Now().Format("2006-01-02")))
 
-	// Use PowerShell to start detached process
-	psCmd := fmt.Sprintf(
-		`Start-Process -FilePath '%s' -ArgumentList 'daemon','run','--port','%d' -WindowStyle Hidden -RedirectStandardOutput '%s' -RedirectStandardError '%s' -PassThru | Select-Object -ExpandProperty Id`,
-		exePath, port, logFile, logFile,
-	)
-
-	cmd := exec.Command("powershell", "-Command", psCmd)
-	output, err := cmd.Output()
+	// Open log file for stdout+stderr redirection
+	logFd, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to start daemon via PowerShell: %w", err)
+		return fmt.Errorf("failed to open log file: %w", err)
 	}
 
-	pid, err := strconv.Atoi(string(output))
-	if err != nil {
-		return fmt.Errorf("failed to parse PID: %w", err)
+	cmd := exec.Command(exePath, "daemon", "run", "--port", strconv.Itoa(port))
+	cmd.Stdout = logFd
+	cmd.Stderr = logFd
+	cmd.SysProcAttr = sysProcAttr()
+
+	if err := cmd.Start(); err != nil {
+		logFd.Close()
+		return fmt.Errorf("failed to start daemon: %w", err)
 	}
 
-	return waitForHealth(port, pid)
+	// Don't wait for the process
+	go func() {
+		cmd.Wait()
+		logFd.Close()
+	}()
+
+	return waitForHealth(port, cmd.Process.Pid)
 }
 
 func waitForHealth(port, pid int) error {

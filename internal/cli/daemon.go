@@ -151,7 +151,19 @@ func runDaemonLogs(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Use tail command
+	if runtime.GOOS == "windows" {
+		// PowerShell equivalent of tail
+		psArgs := fmt.Sprintf("Get-Content -Path '%s' -Tail %d", logFile, lines)
+		if follow {
+			psArgs += " -Wait"
+		}
+		tailCmd := exec.Command("powershell", "-Command", psArgs)
+		tailCmd.Stdout = os.Stdout
+		tailCmd.Stderr = os.Stderr
+		return tailCmd.Run()
+	}
+
+	// Unix: use tail command
 	tailArgs := []string{"-n", fmt.Sprintf("%d", lines)}
 	if follow {
 		tailArgs = append(tailArgs, "-f")

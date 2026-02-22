@@ -348,6 +348,10 @@ func registerMCPServer(binaryPath string) error {
 func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 	settingsPath := getClaudeSettingsPath()
 
+	// On Windows, convert backslashes to forward slashes in hook commands.
+	// Claude Code hooks run via bash which interprets backslashes as escapes.
+	hookBinaryPath := strings.ReplaceAll(binaryPath, "\\", "/")
+
 	// Read existing settings as raw JSON to preserve other fields
 	var settings map[string]interface{}
 	data, err := os.ReadFile(settingsPath)
@@ -371,7 +375,7 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				"hooks": []map[string]interface{}{
 					{
 						"type":    "command",
-						"command": binaryPath + " import",
+						"command": hookBinaryPath + " import",
 						"timeout": 120,
 					},
 				},
@@ -383,7 +387,7 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				"hooks": []map[string]interface{}{
 					{
 						"type":    "command",
-						"command": binaryPath + " context",
+						"command": hookBinaryPath + " context",
 						"timeout": 30,
 					},
 				},
@@ -403,7 +407,7 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				"hooks": []map[string]interface{}{
 					{
 						"type":    "command",
-						"command": binaryPath + " context",
+						"command": hookBinaryPath + " context",
 						"timeout": 60,
 					},
 				},
@@ -415,7 +419,7 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				"hooks": []map[string]interface{}{
 					{
 						"type":    "command",
-						"command": binaryPath + " capture",
+						"command": hookBinaryPath + " capture",
 						"timeout": 30,
 					},
 				},
@@ -426,7 +430,7 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				"hooks": []map[string]interface{}{
 					{
 						"type":    "command",
-						"command": binaryPath + " prompt",
+						"command": hookBinaryPath + " prompt",
 						"timeout": 10,
 					},
 				},
@@ -437,7 +441,7 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				"hooks": []map[string]interface{}{
 					{
 						"type":    "command",
-						"command": binaryPath + " summarize",
+						"command": hookBinaryPath + " summarize",
 						"timeout": 60,
 					},
 				},
@@ -448,7 +452,7 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				"hooks": []map[string]interface{}{
 					{
 						"type":    "command",
-						"command": binaryPath + " subagent-start",
+						"command": hookBinaryPath + " subagent-start",
 						"timeout": 10,
 					},
 				},
@@ -459,7 +463,7 @@ func configureAllHooks(binaryPath string, claudeMemMode bool) error {
 				"hooks": []map[string]interface{}{
 					{
 						"type":    "command",
-						"command": binaryPath + " subagent-stop",
+						"command": hookBinaryPath + " subagent-stop",
 						"timeout": 60,
 					},
 				},
