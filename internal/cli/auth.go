@@ -187,20 +187,32 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	if hasSecretKey {
 		// Existing device - re-derive key from stored secret key
 		fmt.Println("Verifying encryption key...")
-		if err := encMgr.SetupExistingDevice(password); err != nil {
-			return fmt.Errorf("encryption key setup failed: %w", err)
+		setupErr := encMgr.SetupExistingDevice(password)
+
+		staleKey := false
+		if setupErr != nil {
+			staleKey = true
+		} else {
+			// Verify with test blob from server
+			testBlob, err := fetchTestBlob(apiBase, loginResp.Token)
+			if err != nil {
+				fmt.Printf("Warning: could not verify encryption key: %v\n", err)
+			} else if !encMgr.VerifyKey(testBlob) {
+				staleKey = true
+			}
 		}
 
-		// Verify with test blob from server
-		testBlob, err := fetchTestBlob(apiBase, loginResp.Token)
-		if err != nil {
-			fmt.Printf("Warning: could not verify encryption key: %v\n", err)
-		} else if !encMgr.VerifyKey(testBlob) {
-			return fmt.Errorf("encryption key verification failed - please check your password")
+		if staleKey {
+			// Stale keychain data from a different user/account — clear and prompt for secret key
+			fmt.Println("Stored encryption key does not match this account — requesting secret key...")
+			keychain.Clear()
+			hasSecretKey = false
+		} else {
+			fmt.Println("✓ Encryption key verified")
 		}
+	}
 
-		fmt.Println("✓ Encryption key verified")
-	} else {
+	if !hasSecretKey {
 		// New device - need secret key from user
 		fmt.Println()
 		fmt.Println("This is a new device. To decrypt your data, you need your Secret Key.")

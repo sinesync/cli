@@ -12,9 +12,11 @@ import (
 	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
+	kr "github.com/zalando/go-keyring"
 
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/daemon"
+	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/spf13/cobra"
 )
 
@@ -100,11 +102,19 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 		fmt.Println("   Daemon was not running")
 	}
 
-	// Step 6: Ask about memory.db deletion (after daemon is stopped)
+	// Step 6: Clear keychain credentials (encryption keys, tokens, etc.)
+	fmt.Println("\n6. Clearing keychain credentials...")
+	keychain.Clear()
+	_ = kr.Delete(keyringService, "token")
+	_ = kr.Delete(keyringService, "refreshToken")
+	_ = kr.Delete(keyringService, "deviceToken")
+	fmt.Println("   ✓ Keychain credentials cleared")
+
+	// Step 7: Ask about memory.db deletion (after daemon is stopped)
 	memoryPath := filepath.Join(config.DataDir(), "memory.db")
 	_, statErr := os.Stat(memoryPath)
 	if statErr == nil {
-		fmt.Printf("\n6. Delete local memory database?\n")
+		fmt.Printf("\n7. Delete local memory database?\n")
 		fmt.Printf("   Path: %s\n", memoryPath)
 		fmt.Print("   Delete? [y/N]: ")
 		answer, _ := reader.ReadString('\n')
@@ -122,9 +132,9 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 			fmt.Println("   Kept (you can re-sync later with 'sinesync setup')")
 		}
 	} else if os.IsNotExist(statErr) {
-		fmt.Println("\n6. No local memory database found")
+		fmt.Println("\n7. No local memory database found")
 	} else {
-		fmt.Printf("\n6. ⚠ Could not check memory database: %v\n", statErr)
+		fmt.Printf("\n7. ⚠ Could not check memory database: %v\n", statErr)
 	}
 
 	// Summary
@@ -134,7 +144,6 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 	fmt.Println("What's preserved:")
 	fmt.Println("  • Cloud data (login again to re-sync)")
 	fmt.Println("  • Config (~/.sinesync/config.json)")
-	fmt.Println("  • Auth credentials (~/.sinesync/auth.json)")
 	fmt.Println("")
 	fmt.Println("To set up again: sinesync setup")
 
