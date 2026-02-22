@@ -103,14 +103,17 @@ jobs:
             export CC=aarch64-linux-gnu-gcc
           fi
 
-          # Set compiler for Windows (MSYS2 MinGW-w64)
+          # Set compiler for Windows (MSYS2 MinGW-w64) — statically link everything
           if [ "${{ matrix.os }}" = "windows" ]; then
             export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
             export CC=gcc
+            SQLCIPHER_DIR="$(go env GOMODCACHE)/github.com/miclip/go-sqlcipher/v4@v4.4.3-0.20260209183651-988da792235a"
+            export CGO_CFLAGS="-I${SQLCIPHER_DIR}"
+            export CGO_LDFLAGS="-static -L${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/lib"
           fi
 
           if [ "${{ matrix.os }}" = "windows" ]; then
-            go build -ldflags "${LDFLAGS}" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
+            go build -ldflags "${LDFLAGS} -extldflags '-static'" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
           else
             go build -ldflags "${LDFLAGS}" -o ${{ env.BINARY_NAME }} ./cmd/sinesync
           fi
@@ -210,13 +213,7 @@ jobs:
           ARCHIVE_NAME="${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
 
           if [ "${{ matrix.os }}" = "windows" ]; then
-            MINGW_BIN="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin"
-            # Bundle required DLLs so users don't need to install OpenSSL
-            cp "${MINGW_BIN}/libcrypto-3-x64.dll" .
-            cp "${MINGW_BIN}/libssl-3-x64.dll" .
-            cp "${MINGW_BIN}/libgcc_s_seh-1.dll" .
-            cp "${MINGW_BIN}/libwinpthread-1.dll" .
-            7z a "${ARCHIVE_NAME}.zip" ${{ env.BINARY_NAME }}.exe libcrypto-3-x64.dll libssl-3-x64.dll libgcc_s_seh-1.dll libwinpthread-1.dll
+            7z a "${ARCHIVE_NAME}.zip" ${{ env.BINARY_NAME }}.exe
             echo "archive=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
           else
             tar -czvf "${ARCHIVE_NAME}.tar.gz" ${{ env.BINARY_NAME }}
