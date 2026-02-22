@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func sysProcAttr() *syscall.SysProcAttr {
@@ -48,8 +50,8 @@ func redirectStderrToLog() {
 		fmt.Fprintf(os.Stderr, "sine~sync: failed to open log file %s: %v\n", logFile, err)
 		return
 	}
-	// Dup2 the log file onto fd 2 (stderr)
-	if err := syscall.Dup2(int(f.Fd()), 2); err != nil {
+	// Dup2 the log file onto fd 2 (stderr) — unix.Dup2 works on both macOS and Linux
+	if err := unix.Dup2(int(f.Fd()), 2); err != nil {
 		fmt.Fprintf(os.Stderr, "sine~sync: failed to redirect stderr: %v\n", err)
 		f.Close()
 		return
