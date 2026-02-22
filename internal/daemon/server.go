@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -776,7 +777,7 @@ func (s *Server) processSubagentStop(sessionID, agentID, transcriptPath, cwd str
 		if err == nil && len(calls) > 0 {
 			break
 		}
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			break // non-retryable error
 		}
 		if attempt < 5 {
@@ -784,7 +785,11 @@ func (s *Server) processSubagentStop(sessionID, agentID, transcriptPath, cwd str
 		}
 	}
 	if err != nil {
-		log.Printf("[subagent-stop] Failed to parse transcript after retries: %v", err)
+		if errors.Is(err, fs.ErrNotExist) {
+			log.Printf("[subagent-stop] Transcript not found (agent may have been short-lived): %s", transcriptPath)
+		} else {
+			log.Printf("[subagent-stop] Failed to parse transcript: %v", err)
+		}
 		return
 	}
 	if len(calls) == 0 {
