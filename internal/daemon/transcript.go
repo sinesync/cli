@@ -22,9 +22,9 @@ type pendingToolUse struct {
 }
 
 // parseTranscript reads a Claude Code subagent transcript JSONL file and extracts
-// tool calls with their responses. It handles two transcript formats:
-//   - Message format: {"role":"assistant","content":[{"type":"tool_use",...}]}
-//   - Event format:   {"type":"tool_use","name":"Bash","input":{...}}
+// tool calls with their responses. It handles Claude Code's wrapper format where
+// each line is {"type":"assistant","message":{"role":"assistant","content":[...]}}
+// as well as unwrapped message and event formats.
 //
 // Tool results are matched to tool_use events by their id/tool_use_id fields.
 // Results are returned in transcript order so capping is deterministic.
@@ -49,6 +49,12 @@ func parseTranscript(path string) ([]transcriptToolCall, error) {
 		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
 			log.Printf("[transcript] Skipping malformed line: %v", err)
 			continue
+		}
+
+		// Claude Code wraps messages: {"type":"assistant","message":{"role":"assistant","content":[...]}}
+		// Unwrap the inner message if present so the existing role-based checks work.
+		if msg, ok := raw["message"].(map[string]interface{}); ok {
+			raw = msg
 		}
 
 		// Check for message format: {"role":"assistant","content":[...]}
