@@ -172,9 +172,20 @@ func HasDeviceKey() bool {
 
 // Clear removes all stored credentials
 func Clear() error {
-	keys := []string{"session-token", "user-salt", "secret-key", "derived-key", "last-auth", "local-db-key", "device-key"}
-	for _, key := range keys {
-		keyring.Delete(serviceName, key) // Ignore errors
+	return ClearExcept(nil)
+}
+
+// ClearExcept removes all stored credentials except those in the keep list.
+func ClearExcept(keep []string) error {
+	allKeys := []string{"session-token", "user-salt", "secret-key", "derived-key", "last-auth", "local-db-key", "device-key"}
+	keepSet := make(map[string]bool, len(keep))
+	for _, k := range keep {
+		keepSet[k] = true
+	}
+	for _, key := range allKeys {
+		if !keepSet[key] {
+			keyring.Delete(serviceName, key) // Ignore errors
+		}
 	}
 	return nil
 }

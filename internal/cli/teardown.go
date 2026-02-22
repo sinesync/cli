@@ -102,19 +102,12 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 		fmt.Println("   Daemon was not running")
 	}
 
-	// Step 6: Clear keychain credentials (encryption keys, tokens, etc.)
-	fmt.Println("\n6. Clearing keychain credentials...")
-	keychain.Clear()
-	_ = kr.Delete(keyringService, "token")
-	_ = kr.Delete(keyringService, "refreshToken")
-	_ = kr.Delete(keyringService, "deviceToken")
-	fmt.Println("   ✓ Keychain credentials cleared")
-
-	// Step 7: Ask about memory.db deletion (after daemon is stopped)
+	// Step 6: Ask about memory.db deletion (after daemon is stopped)
+	deletedDB := false
 	memoryPath := filepath.Join(config.DataDir(), "memory.db")
 	_, statErr := os.Stat(memoryPath)
 	if statErr == nil {
-		fmt.Printf("\n7. Delete local memory database?\n")
+		fmt.Printf("\n6. Delete local memory database?\n")
 		fmt.Printf("   Path: %s\n", memoryPath)
 		fmt.Print("   Delete? [y/N]: ")
 		answer, _ := reader.ReadString('\n')
@@ -127,15 +120,32 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 				fmt.Printf("   ⚠ Failed to delete: %v\n", err)
 			} else {
 				fmt.Println("   ✓ Memory database deleted")
+				deletedDB = true
 			}
 		} else {
 			fmt.Println("   Kept (you can re-sync later with 'sinesync setup')")
 		}
 	} else if os.IsNotExist(statErr) {
-		fmt.Println("\n7. No local memory database found")
+		fmt.Println("\n6. No local memory database found")
+		deletedDB = true // no DB means nothing to preserve keys for
 	} else {
-		fmt.Printf("\n7. ⚠ Could not check memory database: %v\n", statErr)
+		fmt.Printf("\n6. ⚠ Could not check memory database: %v\n", statErr)
+		fmt.Println("   Proceeding as if database were deleted; related keychain entries will be cleared.")
+		deletedDB = true
 	}
+
+	// Step 7: Clear keychain credentials (encryption keys, tokens, etc.)
+	// Preserve local-db-key if the user kept the database, so it remains accessible.
+	fmt.Println("\n7. Clearing keychain credentials...")
+	var keysToKeep []string
+	if !deletedDB {
+		keysToKeep = append(keysToKeep, "local-db-key")
+	}
+	keychain.ClearExcept(keysToKeep)
+	_ = kr.Delete(keyringService, "token")
+	_ = kr.Delete(keyringService, "refreshToken")
+	_ = kr.Delete(keyringService, "deviceToken")
+	fmt.Println("   ✓ Keychain credentials cleared")
 
 	// Summary
 	fmt.Println("\n─────────────────────────────────────────")

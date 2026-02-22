@@ -202,6 +202,8 @@ var statusCmd = &cobra.Command{
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
+	go checkForUpdate()
+
 	fmt.Println("sine~sync status")
 	fmt.Println("─────────────────────────────────────────")
 

@@ -67,6 +67,8 @@ func init() {
 }
 
 func runDaemonStart(cmd *cobra.Command, args []string) error {
+	go checkForUpdate()
+
 	port, _ := cmd.Flags().GetInt("port")
 
 	// Check if already running

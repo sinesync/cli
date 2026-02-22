@@ -1017,6 +1017,10 @@ func (m *SyncManager) getManifestMeta(token string) (*manifestMeta, error) {
 	}
 	defer resp.Body.Close()
 
+	if err := httputil.CheckUpdateRequired(resp); err != nil {
+		return nil, err
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
@@ -1046,6 +1050,10 @@ func (m *SyncManager) getCloudManifestCached(token string) (*manifestResponse, e
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if err := httputil.CheckUpdateRequired(resp); err != nil {
+		return nil, err
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

@@ -152,6 +152,10 @@ func (c *Client) GetManifest() ([]ManifestItem, error) {
 	}
 	defer resp.Body.Close()
 
+	if err := httputil.CheckUpdateRequired(resp); err != nil {
+		return nil, err
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
 	}
@@ -201,6 +205,10 @@ func (c *Client) Push(obs *storage.Observation) error {
 	}
 	defer resp.Body.Close()
 
+	if err := httputil.CheckUpdateRequired(resp); err != nil {
+		return err
+	}
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return fmt.Errorf("server returned %d", resp.StatusCode)
 	}
@@ -224,6 +232,10 @@ func (c *Client) Pull(id string) (*storage.Observation, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if err := httputil.CheckUpdateRequired(resp); err != nil {
+		return nil, err
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
@@ -324,6 +336,10 @@ func (c *Client) GetStatus() (map[string]interface{}, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if err := httputil.CheckUpdateRequired(resp); err != nil {
+		return nil, err
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
