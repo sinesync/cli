@@ -287,7 +287,7 @@ func (s *Server) handleSearch(args map[string]interface{}) interface{} {
 		limit = int(l)
 	}
 
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/search?q=%s&limit=%d",
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/mcp/search?query=%s&limit=%d",
 		s.daemonPort, url.QueryEscape(query), limit)
 
 	resp, err := s.httpClient.Get(apiURL)
@@ -301,26 +301,26 @@ func (s *Server) handleSearch(args map[string]interface{}) interface{} {
 		return errorResult("Failed to parse search results")
 	}
 
-	// Format for display
-	observations, _ := result["observations"].([]interface{})
+	// Format for display — /api/mcp/search returns "results" key
+	results, _ := result["results"].([]interface{})
 	var output []map[string]interface{}
-	for _, obs := range observations {
+	for _, obs := range results {
 		if o, ok := obs.(map[string]interface{}); ok {
 			output = append(output, map[string]interface{}{
-				"id":        o["id"],
-				"type":      o["type"],
-				"title":     o["title"],
-				"summary":   o["summary"],
-				"project":   o["project"],
-				"score":     o["score"],
-				"createdAt": o["createdAt"],
+				"id":         o["id"],
+				"type":       o["type"],
+				"title":      o["title"],
+				"summary":    o["summary"],
+				"project":    o["project"],
+				"score":      o["score"],
+				"created_at": o["created_at"],
 			})
 		}
 	}
 
 	return textResult(map[string]interface{}{
 		"query":        query,
-		"total":        result["total"],
+		"total":        len(output),
 		"observations": output,
 	})
 }
