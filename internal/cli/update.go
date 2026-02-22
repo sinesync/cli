@@ -91,15 +91,16 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Download archive and checksums
+	// Download archive and checksums from versioned subdirectory
+	versionURL := fmt.Sprintf("%s/%s", releaseBucketURL, latest)
 	fmt.Printf("Downloading %s...\n", archiveName)
 	archivePath := filepath.Join(tmpDir, archiveName)
-	if err := downloadFile(fmt.Sprintf("%s/%s", releaseBucketURL, archiveName), archivePath); err != nil {
+	if err := downloadFile(fmt.Sprintf("%s/%s", versionURL, archiveName), archivePath); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
 
 	checksumsPath := filepath.Join(tmpDir, "checksums.txt")
-	if err := downloadFile(fmt.Sprintf("%s/checksums.txt", releaseBucketURL), checksumsPath); err != nil {
+	if err := downloadFile(fmt.Sprintf("%s/checksums.txt", versionURL), checksumsPath); err != nil {
 		return fmt.Errorf("failed to download checksums: %w", err)
 	}
 
