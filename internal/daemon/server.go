@@ -112,12 +112,13 @@ func NewServer(port int) *Server {
 				if err := storage.RenameLegacyDir(config.DataDir()); err != nil {
 					log.Printf("[daemon] Failed to rename legacy dir: %v", err)
 				}
-
-				// Backfill embeddings for migrated observations in background
-				if embedder != nil {
-					go backfillEmbeddings(sqlBackend, embedder)
-				}
 			}
+		}
+
+		// Backfill embeddings for any observations missing them on startup
+		// (e.g. embedder was unavailable when they were captured)
+		if embedder != nil {
+			go backfillEmbeddings(sqlBackend, embedder)
 		}
 	} else {
 		log.Printf("[daemon] Falling back to JSON file storage")
@@ -159,14 +160,28 @@ func initSQLCipherBackend() *storage.SQLCipherStorage {
 // backfillEmbeddings generates embeddings for observations that lack them.
 func backfillEmbeddings(backend *storage.SQLCipherStorage, embedder *embeddings.Provider) {
 	if !embedder.IsReady() {
+		log.Printf("[backfill] Skipping: embedder not ready")
 		return
 	}
 
 	observations, err := backend.ListObservations()
 	if err != nil {
-		log.Printf("[migrate] Failed to list observations for embedding backfill: %v", err)
+		log.Printf("[backfill] Failed to list observations: %v", err)
 		return
 	}
+
+	// Count how many need embeddings
+	needsEmbedding := 0
+	for _, obs := range observations {
+		if !obs.Embedding.IsCompatibleWith(embeddings.ModelName, embeddings.TokenizerType, embeddings.Dimensions) {
+			needsEmbedding++
+		}
+	}
+	if needsEmbedding == 0 {
+		log.Printf("[backfill] All %d observations have compatible embeddings", len(observations))
+		return
+	}
+	log.Printf("[backfill] Starting: %d/%d observations need embeddings", needsEmbedding, len(observations))
 
 	backfilled := 0
 	failed := 0
@@ -193,9 +208,7 @@ func backfillEmbeddings(backend *storage.SQLCipherStorage, embedder *embeddings.
 		}
 	}
 
-	if backfilled > 0 || failed > 0 {
-		log.Printf("[migrate] Backfill complete: %d embedded, %d failed", backfilled, failed)
-	}
+	log.Printf("[backfill] Complete: %d embedded, %d failed, %d already had embeddings", backfilled, failed, len(observations)-needsEmbedding)
 }
 
 // getObservations returns cached observations, refreshing if stale
@@ -754,9 +767,28 @@ func (s *Server) processSubagentStop(sessionID, agentID, transcriptPath, cwd str
 		return
 	}
 
-	calls, err := parseTranscript(transcriptPath)
+	// Retry with backoff — Claude Code may not have finished writing the transcript yet.
+	// Retry on file-not-found (not yet created) and on empty results (partially written).
+	var calls []transcriptToolCall
+	var err error
+	for attempt := 0; attempt < 6; attempt++ {
+		calls, err = parseTranscript(transcriptPath)
+		if err == nil && len(calls) > 0 {
+			break
+		}
+		if err != nil && !os.IsNotExist(err) {
+			break // non-retryable error
+		}
+		if attempt < 5 {
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+		}
+	}
 	if err != nil {
-		log.Printf("[subagent-stop] Failed to parse transcript: %v", err)
+		log.Printf("[subagent-stop] Failed to parse transcript after retries: %v", err)
+		return
+	}
+	if len(calls) == 0 {
+		log.Printf("[subagent-stop] Transcript empty after retries: %s", transcriptPath)
 		return
 	}
 
@@ -1921,6 +1953,88 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pagination
+	params := r.URL.Query()
+	page, limit := 1, 50
+	fmt.Sscanf(params.Get("page"), "%d", &page)
+	fmt.Sscanf(params.Get("limit"), "%d", &limit)
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 200 {
+		limit = 50
+	}
+
+	// Use hybrid search (FTS5 + vector) when SQLCipher is available
+	if sqlBackend, ok := s.backend.(*storage.SQLCipherStorage); ok {
+		var queryVec []float32
+		if s.embedder != nil && s.embedder.IsReady() {
+			if vec, err := s.embedder.Embed(query); err == nil {
+				queryVec = vec
+			} else {
+				log.Printf("[search] Embed failed, using fallback: %v", err)
+				queryVec = embeddings.FallbackEmbed(query)
+			}
+		}
+
+		// Fetch page*limit+1 so we can slice to the requested page
+		// and detect whether more results exist beyond it
+		fetchLimit := page*limit + 1
+		allResults, err := sqlBackend.HybridSearch(query, queryVec, fetchLimit, storage.SearchFilters{})
+		if err == nil {
+			hasNext := len(allResults) > page*limit
+			if hasNext {
+				allResults = allResults[:page*limit]
+			}
+
+			// Slice to current page
+			offset := (page - 1) * limit
+			var pageResults []storage.SearchResult
+			if offset < len(allResults) {
+				end := offset + limit
+				if end > len(allResults) {
+					end = len(allResults)
+				}
+				pageResults = allResults[offset:end]
+			}
+
+			totalPages := page
+			if hasNext {
+				totalPages = page + 1
+			}
+
+			output := make([]map[string]interface{}, len(pageResults))
+			for i, r := range pageResults {
+				output[i] = map[string]interface{}{
+					"id":             r.ID,
+					"title":          r.Title,
+					"summary":        r.Summary,
+					"type":           r.Type,
+					"project":        r.Project,
+					"createdAt":      r.CreatedAt,
+					"created_at":     r.CreatedAt,
+					"score":          r.Score,
+					"tags":           []string{},
+					"classification": "",
+					"starred":        false,
+				}
+			}
+
+			writeJSON(w, map[string]interface{}{
+				"observations": output,
+				"total":        len(allResults),
+				"page":         page,
+				"limit":        limit,
+				"totalPages":   totalPages,
+				"hasNext":      hasNext,
+				"hasPrev":      page > 1,
+				"query":        query,
+			})
+			return
+		}
+	}
+
+	// Fallback: brute-force vector search for LocalStorage backend
 	observations := s.getObservations()
 
 	var queryEmbedding []float32
@@ -1950,18 +2064,6 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].score > results[j].score
 	})
-
-	// Pagination
-	params := r.URL.Query()
-	page, limit := 1, 50
-	fmt.Sscanf(params.Get("page"), "%d", &page)
-	fmt.Sscanf(params.Get("limit"), "%d", &limit)
-	if page < 1 {
-		page = 1
-	}
-	if limit < 1 || limit > 200 {
-		limit = 50
-	}
 
 	totalResults := len(results)
 	totalPages := (totalResults + limit - 1) / limit

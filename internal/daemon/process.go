@@ -19,6 +19,12 @@ func findProcess(pid int) (*os.Process, error) {
 	return os.FindProcess(pid)
 }
 
+// RedirectStderrToLog reopens stderr to the daemon log file.
+// Called by "daemon run" to ensure all output (Go + C libraries) goes to the log.
+func RedirectStderrToLog() {
+	redirectStderrToLog()
+}
+
 // PIDInfo stores daemon process information
 type PIDInfo struct {
 	PID       int       `json:"pid"`

@@ -133,6 +133,11 @@ func runDaemonStatus(cmd *cobra.Command, args []string) error {
 func runDaemonForeground(cmd *cobra.Command, args []string) error {
 	port, _ := cmd.Flags().GetInt("port")
 
+	// Ensure all output (Go log + C libraries) goes to the log file.
+	// Even though the parent sets cmd.Stderr, some C libraries (CoreML/ONNX)
+	// may write to the original fd 2. Redirect at the process level.
+	daemon.RedirectStderrToLog()
+
 	server := daemon.NewServer(port)
 	return server.Run()
 }

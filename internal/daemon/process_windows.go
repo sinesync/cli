@@ -53,3 +53,6 @@ func isProcessAlive(pid int) bool {
 	}
 	return exitCode == stillActive
 }
+
+// redirectStderrToLog is a no-op on Windows; fd redirection via cmd.Stderr suffices.
+func redirectStderrToLog() {}
