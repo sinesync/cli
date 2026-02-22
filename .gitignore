@@ -35,6 +35,7 @@ coverage/
 # Go
 /sinesync
 *.exe
+.gocache/
 
 # Certificates
 certs/
