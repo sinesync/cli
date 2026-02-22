@@ -151,7 +151,7 @@ jobs:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_SIGNING_IDENTITY" ]; then
-            codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" ${{ env.BINARY_NAME }}
+            codesign --force --options runtime --entitlements entitlements.plist --sign "$MACOS_SIGNING_IDENTITY" ${{ env.BINARY_NAME }}
             codesign --verify --verbose ${{ env.BINARY_NAME }}
             echo "Binary signed successfully"
           else
