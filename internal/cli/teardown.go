@@ -12,7 +12,6 @@ import (
 	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
-	kr "github.com/zalando/go-keyring"
 
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/daemon"
@@ -142,9 +141,9 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 		keysToKeep = append(keysToKeep, "local-db-key")
 	}
 	keychain.ClearExcept(keysToKeep)
-	_ = kr.Delete(keyringService, "token")
-	_ = kr.Delete(keyringService, "refreshToken")
-	_ = kr.Delete(keyringService, "deviceToken")
+	_ = keychain.Delete("token")
+	_ = keychain.Delete("refreshToken")
+	_ = keychain.Delete("deviceToken")
 	fmt.Println("   ✓ Keychain credentials cleared")
 
 	// Summary

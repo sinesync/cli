@@ -23,8 +23,8 @@ import (
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/miclip/sinesync/internal/httputil"
+	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/storage"
-	"github.com/zalando/go-keyring"
 )
 
 func init() {
@@ -36,8 +36,8 @@ func init() {
 }
 
 const (
-	SyncInterval    = 10 * time.Minute
-	DefaultAPIBase  = "https://api.sinesync.ai/v1"
+	SyncInterval   = 10 * time.Minute
+	DefaultAPIBase = "https://api.sinesync.ai/v1"
 )
 
 // LocalVaultConfig stores vault configuration locally
@@ -155,12 +155,12 @@ func getVaultKey(vaultID string, encMgr *encryption.Manager) []byte {
 
 // SyncManager handles background cloud sync
 type SyncManager struct {
-	backend  storage.StorageBackend
-	apiBase  string
-	mode     string // "standalone" or "adapter"
-	stopChan chan struct{}
-	wg       sync.WaitGroup
-	mu       sync.Mutex
+	backend        storage.StorageBackend
+	apiBase        string
+	mode           string // "standalone" or "adapter"
+	stopChan       chan struct{}
+	wg             sync.WaitGroup
+	mu             sync.Mutex
 	lastSync       time.Time
 	lastError      string
 	syncing        bool
@@ -462,13 +462,12 @@ func (m *SyncManager) setError(err string) {
 }
 
 func (m *SyncManager) getAuthToken() (string, error) {
-	const keyringService = "sinesync"
 
 	// Check keyring first (preferred secure storage)
-	if token, err := keyring.Get(keyringService, "token"); err == nil && token != "" {
+	if token, err := keychain.Get("token"); err == nil && token != "" {
 		return token, nil
 	}
-	if deviceToken, err := keyring.Get(keyringService, "deviceToken"); err == nil && deviceToken != "" {
+	if deviceToken, err := keychain.Get("deviceToken"); err == nil && deviceToken != "" {
 		return deviceToken, nil
 	}
 
@@ -498,10 +497,9 @@ func (m *SyncManager) getAuthToken() (string, error) {
 }
 
 func (m *SyncManager) getRefreshToken() (string, error) {
-	const keyringService = "sinesync"
 
 	// Check keyring first
-	if refreshToken, err := keyring.Get(keyringService, "refreshToken"); err == nil && refreshToken != "" {
+	if refreshToken, err := keychain.Get("refreshToken"); err == nil && refreshToken != "" {
 		return refreshToken, nil
 	}
 
@@ -565,15 +563,14 @@ func (m *SyncManager) refreshAccessToken() (string, error) {
 	}
 
 	// Store new token in keyring
-	const keyringService = "sinesync"
-	if err := keyring.Set(keyringService, "token", result.Token); err != nil {
+	if err := keychain.Set("token", result.Token); err != nil {
 		// Also update auth.json as fallback
 		m.updateStoredToken(result.Token)
 	}
 
 	// Store rotated refresh token if provided
 	if result.RefreshToken != "" {
-		if err := keyring.Set(keyringService, "refreshToken", result.RefreshToken); err != nil {
+		if err := keychain.Set("refreshToken", result.RefreshToken); err != nil {
 			log.Printf("[sync] Warning: failed to store rotated refresh token in keyring — user will need to re-login")
 		}
 	}

@@ -18,9 +18,9 @@ import (
 	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/miclip/sinesync/internal/httputil"
+	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
-	kr "github.com/zalando/go-keyring"
 )
 
 // Vault types matching backend
@@ -1146,7 +1146,7 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 									continue
 								}
 								holders = append(holders, map[string]string{
-									"userId":                admin.UserID,
+									"userId":                 admin.UserID,
 									"encryptedOrgPrivateKey": sealed,
 								})
 							}
@@ -1278,10 +1278,10 @@ func doVaultRequest(client *http.Client, req *http.Request, token *string) (*htt
 
 func getAuthTokenForVault() (string, error) {
 	// Check keyring
-	if token, err := kr.Get(keyringService, "deviceToken"); err == nil && token != "" {
+	if token, err := keychain.Get("deviceToken"); err == nil && token != "" {
 		return token, nil
 	}
-	if token, err := kr.Get(keyringService, "token"); err == nil && token != "" {
+	if token, err := keychain.Get("token"); err == nil && token != "" {
 		return token, nil
 	}
 

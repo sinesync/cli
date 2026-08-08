@@ -29,7 +29,6 @@ import (
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/storage"
-	"github.com/zalando/go-keyring"
 )
 
 //go:embed static/*
@@ -132,7 +131,9 @@ func NewServer(port int) *Server {
 			go backfillEmbeddings(sqlBackend, embedder)
 		}
 	} else {
-		log.Printf("[daemon] Falling back to JSON file storage")
+		// initSQLCipherBackend has already explained why, at length. This line
+		// only records what was chosen as a result.
+		log.Printf("[daemon] Falling back to UNENCRYPTED JSON file storage")
 		backend = storage.NewLocalStorage()
 	}
 
@@ -148,19 +149,58 @@ func NewServer(port int) *Server {
 }
 
 // initSQLCipherBackend attempts to create a SQLCipher storage backend.
-// Returns nil if key is unavailable or database creation fails.
+// Returns nil if the key is unavailable or the database cannot be opened.
+//
+// Every failure here is loud, and deliberately so: the caller's fallback writes
+// observations as PLAINTEXT JSON. That is a silent reversal of the product's
+// central claim, and a one-line log is not enough warning for it. Worse, if an
+// encrypted memory.db already exists, falling back does not just lose
+// encryption — it hides everything already in that database, which reads to the
+// user as data loss.
 func initSQLCipherBackend() *storage.SQLCipherStorage {
 	dbPath := filepath.Join(config.DataDir(), "memory.db")
+	_, dbExists := func() (os.FileInfo, bool) {
+		fi, err := os.Stat(dbPath)
+		return fi, err == nil
+	}()
+
+	warnPlaintext := func(reason, remedy string) {
+		log.Printf("[daemon] ================ ENCRYPTION UNAVAILABLE ================")
+		log.Printf("[daemon] %s", reason)
+		log.Printf("[daemon] Observations will be written as PLAINTEXT JSON under %s.", config.DataDir())
+		if dbExists {
+			log.Printf("[daemon] An encrypted database exists at %s and will NOT be readable", dbPath)
+			log.Printf("[daemon] in this session. Its contents are intact but hidden — this is not data loss.")
+		}
+		log.Printf("[daemon] %s", remedy)
+		log.Printf("[daemon] ========================================================")
+	}
 
 	key, err := keychain.GetOrCreateDBKey()
 	if err != nil {
-		log.Printf("[daemon] Failed to resolve DB key: %v", err)
+		if errors.Is(err, keychain.ErrNoKeychainSession) {
+			// Expected whenever the daemon is started outside a desktop session:
+			// nohup, SSH, CI, or spawned by another tool. No keychain call was
+			// made, so nothing prompted and no key was replaced.
+			warnPlaintext(
+				"No OS keychain is reachable from this process, so the database key could not be resolved.",
+				"Start the daemon from a desktop session, or set SINESYNC_NO_KEYCHAIN=1 to acknowledge this deliberately.",
+			)
+		} else {
+			warnPlaintext(
+				fmt.Sprintf("The database key could not be resolved: %v", err),
+				"This is unexpected in a desktop session — check the keychain entry for 'sinesync'.",
+			)
+		}
 		return nil
 	}
 
 	db, err := storage.NewSQLCipherStorage(dbPath, key)
 	if err != nil {
-		log.Printf("[daemon] SQLCipher init failed: %v", err)
+		warnPlaintext(
+			fmt.Sprintf("The encrypted database could not be opened: %v", err),
+			"If the keychain entry was replaced, the existing database cannot be decrypted with the current key.",
+		)
 		return nil
 	}
 
@@ -655,13 +695,12 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 
 // isAuthenticated checks if user has valid auth tokens
 func (s *Server) isAuthenticated() bool {
-	const keyringService = "sinesync"
 
 	// Check keyring first (preferred secure storage)
-	if token, err := keyring.Get(keyringService, "token"); err == nil && token != "" {
+	if token, err := keychain.Get("token"); err == nil && token != "" {
 		return true
 	}
-	if deviceToken, err := keyring.Get(keyringService, "deviceToken"); err == nil && deviceToken != "" {
+	if deviceToken, err := keychain.Get("deviceToken"); err == nil && deviceToken != "" {
 		return true
 	}
 

@@ -29,7 +29,6 @@ import (
 	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/srp"
 	"github.com/spf13/cobra"
-	kr "github.com/zalando/go-keyring"
 	"golang.org/x/term"
 )
 
@@ -39,8 +38,6 @@ func zeroBytes(b []byte) {
 		b[i] = 0
 	}
 }
-
-const keyringService = "sinesync"
 
 const DefaultAPIBase = "https://api.sinesync.ai/v1"
 
@@ -267,8 +264,8 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	authCfg := &AuthConfig{
 		UserID:       loginResp.User.ID,
 		Email:        loginResp.User.Email,
-		Token:        deviceResp.Token,         // Device access token
-		RefreshToken: deviceResp.RefreshToken,  // Device refresh token
+		Token:        deviceResp.Token,        // Device access token
+		RefreshToken: deviceResp.RefreshToken, // Device refresh token
 		ExpiresAt:    deviceResp.ExpiresAt,
 		DeviceID:     deviceResp.Device.ID,
 		DeviceToken:  deviceResp.Token,
@@ -1397,8 +1394,8 @@ func runSignup(cmd *cobra.Command, args []string) error {
 	authCfg := &AuthConfig{
 		UserID:       signupResp.User.ID,
 		Email:        signupResp.User.Email,
-		Token:        deviceResp.Token,         // Device access token
-		RefreshToken: deviceResp.RefreshToken,  // Device refresh token
+		Token:        deviceResp.Token,        // Device access token
+		RefreshToken: deviceResp.RefreshToken, // Device refresh token
 		ExpiresAt:    deviceResp.ExpiresAt,
 		DeviceID:     deviceResp.Device.ID,
 		DeviceToken:  deviceResp.Token,
@@ -1791,17 +1788,17 @@ func saveAuthConfig(cfg *AuthConfig) error {
 
 	// Store tokens in system keychain — fail if keychain is unavailable
 	if cfg.Token != "" {
-		if err := kr.Set(keyringService, "token", cfg.Token); err != nil {
+		if err := keychain.Set("token", cfg.Token); err != nil {
 			return fmt.Errorf("system keychain unavailable — cannot store tokens securely: %w", err)
 		}
 	}
 	if cfg.RefreshToken != "" {
-		if err := kr.Set(keyringService, "refreshToken", cfg.RefreshToken); err != nil {
+		if err := keychain.Set("refreshToken", cfg.RefreshToken); err != nil {
 			return fmt.Errorf("failed to store refresh token in keychain: %w", err)
 		}
 	}
 	if cfg.DeviceToken != "" {
-		if err := kr.Set(keyringService, "deviceToken", cfg.DeviceToken); err != nil {
+		if err := keychain.Set("deviceToken", cfg.DeviceToken); err != nil {
 			return fmt.Errorf("failed to store device token in keychain: %w", err)
 		}
 	}
@@ -1840,13 +1837,13 @@ func loadAuthConfig() (*AuthConfig, error) {
 	cfg.DeviceToken = ""
 
 	// Load tokens from keychain
-	if token, err := kr.Get(keyringService, "token"); err == nil {
+	if token, err := keychain.Get("token"); err == nil {
 		cfg.Token = token
 	}
-	if refreshToken, err := kr.Get(keyringService, "refreshToken"); err == nil {
+	if refreshToken, err := keychain.Get("refreshToken"); err == nil {
 		cfg.RefreshToken = refreshToken
 	}
-	if deviceToken, err := kr.Get(keyringService, "deviceToken"); err == nil {
+	if deviceToken, err := keychain.Get("deviceToken"); err == nil {
 		cfg.DeviceToken = deviceToken
 	}
 
@@ -1913,13 +1910,13 @@ func refreshAccessToken(apiBase string) (string, error) {
 	}
 
 	// Save new access token to keyring
-	if err := kr.Set(keyringService, "token", result.Token); err != nil {
+	if err := keychain.Set("token", result.Token); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to store access token in keyring: %v\n", err)
 	}
 
 	// Save rotated refresh token if provided
 	if result.RefreshToken != "" {
-		if err := kr.Set(keyringService, "refreshToken", result.RefreshToken); err != nil {
+		if err := keychain.Set("refreshToken", result.RefreshToken); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to store rotated refresh token in keyring — run 'sinesync login' to re-authenticate\n")
 		}
 	}
@@ -1956,9 +1953,9 @@ func isAccountDeletedError(err error) bool {
 
 func removeAuthConfig() error {
 	// Remove from keychain
-	_ = kr.Delete(keyringService, "token")
-	_ = kr.Delete(keyringService, "refreshToken")
-	_ = kr.Delete(keyringService, "deviceToken")
+	_ = keychain.Delete("token")
+	_ = keychain.Delete("refreshToken")
+	_ = keychain.Delete("deviceToken")
 
 	// Clear encryption keys
 	keychain.Clear()
