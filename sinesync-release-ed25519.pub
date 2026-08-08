@@ -1,0 +1,19 @@
+PLACEHOLDER-NOT-A-KEY
+
+This file is a stand-in, not a public key. A build embedding it refuses to
+install updates: `sinesync update` exits with "this build has no release
+signing key; refusing to install an unverified update".
+
+To make releases verifiable, replace this ENTIRE file with a single line
+holding the base64-encoded raw 32-byte Ed25519 public key (44 characters
+ending in "="). Delete these notes when you do — the parser reads the whole
+file, so leaving them behind produces a malformed-key error rather than a
+working build.
+
+The matching private key is never stored here or anywhere else in the repo.
+It lives only in the GitHub Actions secret RELEASE_ED25519_PRIVATE_KEY and is
+generated outside any agent session, piped straight into the secret without
+touching disk.
+
+See release_key.go for how this is embedded, and internal/cli/update.go for
+how signatures over checksums.txt are verified.

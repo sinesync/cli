@@ -289,7 +289,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		fmt.Println("  • Background sync every 10 minutes")
 	}
 	fmt.Println("")
-	fmt.Println("Dashboard: http://127.0.0.1:5741")
+	fmt.Println("Dashboard: run 'sinesync dashboard' to open it (port 5741)")
 	fmt.Println("")
 	fmt.Println("Restart Claude Code to apply changes.")
 
@@ -299,11 +299,18 @@ func runSetup(cmd *cobra.Command, args []string) error {
 // triggerDaemonSync sends a POST to the daemon's sync endpoint to force an immediate sync.
 func triggerDaemonSync(port int) error {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d/api/sync", port), "", nil)
+	req, err := authedRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/api/sync", port), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if hookAuthError(resp, "sync") {
+		return fmt.Errorf("daemon rejected the hook secret")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}

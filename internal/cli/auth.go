@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miclip/sinesync/internal/browser"
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/encryption"
@@ -1284,19 +1284,12 @@ func ssoNewDeviceLink(apiBase, token, hostname, platform string) error {
 }
 
 // openBrowserForSAML opens the given URL in the user's default browser.
+//
+// The URL is built from the SAML discovery response, so part of it is chosen by
+// the server. openURL validates before dispatching and never routes through a
+// command interpreter — see browser.go.
 func openBrowserForSAML(url string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "linux":
-		cmd = exec.Command("xdg-open", url)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", "", url)
-	default:
-		return fmt.Errorf("unsupported platform")
-	}
-	return cmd.Start()
+	return browser.Open(url)
 }
 
 func runSignup(cmd *cobra.Command, args []string) error {

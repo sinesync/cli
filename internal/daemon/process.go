@@ -247,13 +247,24 @@ func Stop() error {
 		return nil // Not running
 	}
 
-	// Try graceful shutdown via HTTP endpoint first (works on all platforms)
+	// Try graceful shutdown via HTTP endpoint first (works on all platforms).
+	// /api/shutdown requires the hook secret; without it the daemon answers 401,
+	// this loop waits out the full five seconds and then falls back to signalling
+	// the process — so a missing header turns every stop into a hard kill.
 	if IsHealthy(info.Port) {
 		client := &http.Client{Timeout: 2 * time.Second}
-		resp, err := client.Post(
+		req, reqErr := http.NewRequest(
+			http.MethodPost,
 			fmt.Sprintf("http://127.0.0.1:%d/api/shutdown", info.Port),
-			"", nil,
+			nil,
 		)
+		if reqErr != nil {
+			return reqErr
+		}
+		if secret := ReadHookSecret(); secret != "" {
+			req.Header.Set("X-Hook-Secret", secret)
+		}
+		resp, err := client.Do(req)
 		if err == nil {
 			resp.Body.Close()
 			// Wait for graceful shutdown

@@ -5,9 +5,12 @@ import (
 	"archive/zip"
 	"bufio"
 	"compress/gzip"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +23,7 @@ import (
 
 	"regexp"
 
+	sinesync "github.com/miclip/sinesync"
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/miclip/sinesync/internal/version"
@@ -104,7 +108,29 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to download checksums: %w", err)
 	}
 
-	// Verify checksum
+	// Resolve the signing key before spending a download on the signature, so a
+	// build with no usable key fails with that reason rather than a network one.
+	pubKey, err := releasePublicKey()
+	if err != nil {
+		return err
+	}
+
+	// A missing signature is a hard failure, not a skip: an attacker who can
+	// delete the .sig from the bucket must not thereby disable verification.
+	sigPath := filepath.Join(tmpDir, "checksums.txt.sig")
+	if err := downloadFile(fmt.Sprintf("%s/checksums.txt.sig", versionURL), sigPath); err != nil {
+		return fmt.Errorf("failed to download release signature: %w", err)
+	}
+
+	// Gate 1: the signature proves checksums.txt is the file the release signer
+	// produced. Nothing in checksums.txt is trusted before this passes.
+	fmt.Println("Verifying release signature...")
+	if err := verifyChecksumsSignature(checksumsPath, sigPath, pubKey); err != nil {
+		return fmt.Errorf("release signature verification failed: %w", err)
+	}
+
+	// Gate 2: the now-trusted checksums.txt proves the archive is the one that
+	// was signed.
 	fmt.Println("Verifying checksum...")
 	if err := verifyChecksum(archivePath, checksumsPath, archiveName); err != nil {
 		return fmt.Errorf("checksum verification failed: %w", err)
@@ -154,6 +180,15 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// fetchLatestVersion reads the bucket's /latest pointer.
+//
+// KNOWN GAP (not addressed here): /latest is unsigned. Signature verification
+// proves that whatever version we fetch is authentic, but it cannot prove the
+// version is current — an attacker with write access to the bucket can rewrite
+// /latest to an older release that was legitimately signed, pinning users to a
+// version with known vulnerabilities. Closing this needs a signed, monotonic
+// version manifest rather than a bare string. checkForUpdate reads the same
+// unsigned pointer.
 func fetchLatestVersion() (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(releaseBucketURL + "/latest")
@@ -198,6 +233,93 @@ func downloadFile(url, dest string) error {
 
 	_, err = io.Copy(f, resp.Body)
 	return err
+}
+
+// Release signature verification.
+//
+// The trust chain has two links. checksums.txt.sig is a detached Ed25519
+// signature over the exact bytes of checksums.txt, verified against a public key
+// baked into this binary at build time; checksums.txt in turn carries the SHA256
+// of every platform archive. Verifying the signature first and the archive's
+// SHA256 second means an attacker who can write to the release bucket cannot
+// substitute either one without holding the private key.
+//
+// Consequence worth knowing when reading test names: an archive modified after
+// signing is rejected as a *checksum* failure, not a signature failure. The
+// signature covers checksums.txt, and the SHA256 chain covers the archive. Both
+// paths reject; only the error class differs.
+var (
+	// errNoReleaseKey means this build has no usable signing key embedded.
+	errNoReleaseKey = errors.New("this build has no release signing key; refusing to install an unverified update")
+	// errMalformedKey means the embedded key is present but not a valid key.
+	errMalformedKey = errors.New("embedded release public key is malformed")
+	// errMalformedSignature means checksums.txt.sig is not a well-formed signature.
+	errMalformedSignature = errors.New("release signature is malformed")
+	// errBadSignature means the signature did not verify against the public key.
+	errBadSignature = errors.New("release signature verification failed")
+)
+
+// placeholderKeyPrefix marks a key file that is a stand-in rather than a real
+// key. A build carrying one refuses to update rather than silently skipping
+// verification.
+const placeholderKeyPrefix = "PLACEHOLDER"
+
+// parseReleasePublicKey decodes a base64-encoded raw 32-byte Ed25519 public key.
+// Callers pass the embedded key; tests pass one they generated.
+func parseReleasePublicKey(encoded string) (ed25519.PublicKey, error) {
+	trimmed := strings.TrimSpace(encoded)
+	if trimmed == "" || strings.HasPrefix(trimmed, placeholderKeyPrefix) {
+		return nil, errNoReleaseKey
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("%w: not valid base64: %v", errMalformedKey, err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("%w: got %d bytes, want %d", errMalformedKey, len(raw), ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(raw), nil
+}
+
+// releasePublicKey returns the key this binary was built with.
+func releasePublicKey() (ed25519.PublicKey, error) {
+	return parseReleasePublicKey(sinesync.ReleaseEd25519PublicKey)
+}
+
+// verifyChecksumsSignature checks that sigPath is a valid detached Ed25519
+// signature by pub over the exact bytes of checksumsPath.
+//
+// The signature file must be base64-encoded. Raw binary is deliberately not
+// accepted as a fallback: a parser that guesses between encodings is a parser an
+// attacker can steer.
+func verifyChecksumsSignature(checksumsPath, sigPath string, pub ed25519.PublicKey) error {
+	if len(pub) != ed25519.PublicKeySize {
+		return errNoReleaseKey
+	}
+
+	checksums, err := os.ReadFile(checksumsPath)
+	if err != nil {
+		return fmt.Errorf("cannot read checksums: %w", err)
+	}
+
+	encoded, err := os.ReadFile(sigPath)
+	if err != nil {
+		return fmt.Errorf("cannot read signature: %w", err)
+	}
+
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encoded)))
+	if err != nil {
+		return fmt.Errorf("%w: not valid base64: %v", errMalformedSignature, err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("%w: got %d bytes, want %d", errMalformedSignature, len(sig), ed25519.SignatureSize)
+	}
+
+	if !ed25519.Verify(pub, checksums, sig) {
+		return errBadSignature
+	}
+	return nil
 }
 
 func verifyChecksum(archivePath, checksumsPath, archiveName string) error {
@@ -404,6 +526,10 @@ func copyFile(src, dst string) error {
 
 // checkForUpdate is a non-blocking check that prints a notice if a newer version exists.
 // Called as a fire-and-forget goroutine from status and daemon start.
+//
+// This reads the same unsigned /latest pointer as fetchLatestVersion — see the
+// KNOWN GAP note there. It only prints a notice and installs nothing, so the
+// exposure is limited to suppressing or faking an update prompt.
 func checkForUpdate() {
 	checkFile := filepath.Join(config.DataDir(), "update-check.json")
 

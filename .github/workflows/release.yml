@@ -306,6 +306,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Needed by the Ed25519 signing step below. Pinned rather than relying
+      # on whatever Go the runner ships, so a toolchain mismatch cannot turn
+      # into a release published without the signature clients require.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
       - name: Get version
         id: version
         run: |
@@ -363,6 +371,27 @@ jobs:
           else
             echo "Skipping GPG signing — no key configured"
           fi
+
+      # checksums.txt.asc above is the OpenPGP signature humans can check with
+      # gpg. This is the one `sinesync update` requires: a raw Ed25519 signature
+      # it verifies with crypto/ed25519, which has nothing subtle to get wrong.
+      #
+      # Deliberately NOT conditional on the secret being present. A release
+      # published without checksums.txt.sig is one that no verifying client can
+      # install, so a missing key must fail the release rather than quietly
+      # produce an unusable one — the mistake would otherwise only surface on
+      # user machines.
+      - name: Ed25519 sign checksums
+        env:
+          RELEASE_ED25519_PRIVATE_KEY: ${{ secrets.RELEASE_ED25519_PRIVATE_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          go run ./tools/signrelease \
+            --expect-pubkey "$(tr -d '\n' < sinesync-release-ed25519.pub)" \
+            "upload/${VERSION}/checksums.txt" \
+            > "upload/${VERSION}/checksums.txt.sig"
+          echo "Ed25519 signature written:"
+          cat "upload/${VERSION}/checksums.txt.sig"
 
       - name: Upload to GCS
         run: |

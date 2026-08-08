@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
-	"os/exec"
-	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/miclip/sinesync/internal/adapters"
+	"github.com/miclip/sinesync/internal/browser"
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/storage"
@@ -58,8 +58,34 @@ func NewServer(port int) *Server {
 	}
 }
 
-// Start starts the dashboard server
-func (s *Server) Start(openBrowser bool) error {
+// hostAllowed reports whether a request's Host header is exactly one of the
+// loopback forms this server listens on. The comparison is deliberately exact:
+// anything else (wrong port, missing port, non-loopback address, or a hostname
+// that merely resembles one) is rejected, which blocks DNS rebinding attacks
+// that resolve an attacker-controlled name to 127.0.0.1.
+func hostAllowed(host string, port int) bool {
+	p := strconv.Itoa(port)
+	switch host {
+	case "127.0.0.1:" + p, "localhost:" + p, "[::1]:" + p:
+		return true
+	}
+	return false
+}
+
+// requireLoopbackHost wraps h so every request — API and static alike — is
+// rejected with 403 unless its Host header names this server's loopback address.
+func (s *Server) requireLoopbackHost(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !hostAllowed(r.Host, s.port) {
+			http.Error(w, "forbidden: invalid Host header", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// routes builds the full request handler: the mux wrapped in Host validation.
+func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
 	// API routes
@@ -75,10 +101,15 @@ func (s *Server) Start(openBrowser bool) error {
 	staticFS, _ := fs.Sub(staticFiles, "static")
 	mux.Handle("/", http.FileServer(http.FS(staticFS)))
 
+	return s.requireLoopbackHost(mux)
+}
+
+// Start starts the dashboard server
+func (s *Server) Start(openBrowser bool) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
 	s.httpServer = &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      s.routes(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
@@ -139,12 +170,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			// Adapter sync stats
 			if syncStats, err := adapter.GetSyncStats(); err == nil {
 				stats["adapterSync"] = map[string]interface{}{
-					"nativeInClaudeMem":      syncStats.NativeInClaudeMem,
-					"exportedToClaudeMem":    syncStats.ExportedToClaudeMem,
-					"chromaEmbeddings":       syncStats.ChromaEmbeddings,
-					"chromaUniqueObs":        syncStats.ChromaUniqueObservations,
-					"chromaAvailable":        syncStats.ChromaAvailable,
-					"embeddingBacklog":       count - syncStats.ChromaUniqueObservations,
+					"nativeInClaudeMem":   syncStats.NativeInClaudeMem,
+					"exportedToClaudeMem": syncStats.ExportedToClaudeMem,
+					"chromaEmbeddings":    syncStats.ChromaEmbeddings,
+					"chromaUniqueObs":     syncStats.ChromaUniqueObservations,
+					"chromaAvailable":     syncStats.ChromaAvailable,
+					"embeddingBacklog":    count - syncStats.ChromaUniqueObservations,
 				}
 			}
 
@@ -595,19 +626,9 @@ func filterObservations(observations []storage.Observation, predicate func(stora
 	return result
 }
 
+// openURL opens a URL in the default browser. See internal/browser for why the
+// command is not built here: `cmd /c start` runs the URL through the Windows
+// command interpreter, and non-HTTP schemes reach arbitrary applications.
 func openURL(url string) {
-	var cmd *exec.Cmd
-
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "linux":
-		cmd = exec.Command("xdg-open", url)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
-	default:
-		return
-	}
-
-	cmd.Start()
+	_ = browser.Open(url)
 }

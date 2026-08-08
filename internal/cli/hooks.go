@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/miclip/sinesync/internal/config"
@@ -105,14 +104,45 @@ var hookClient = &http.Client{Timeout: 3 * time.Second}
 // contextClient has a longer timeout since context injection reads the full response.
 var contextClient = &http.Client{Timeout: 10 * time.Second}
 
-// readHookSecret reads the daemon hook secret from the data directory.
-func readHookSecret() string {
-	secretPath := filepath.Join(config.DataDir(), "hook-secret")
-	data, err := os.ReadFile(secretPath)
-	if err != nil {
-		return ""
+// The daemon owns the secret file, so it owns the path too — defining it twice
+// is how the writer and the reader end up disagreeing.
+func hookSecretPath() string { return daemon.HookSecretPath() }
+
+func readHookSecret() string { return daemon.ReadHookSecret() }
+
+// hookAuthError reports whether resp is a 401 and, if so, explains the cause on
+// stderr. The daemon rejects any request without the shared secret it writes to
+// $(DataDir)/hook-secret at startup, so a bare "unauthorized" would be
+// mystifying — the actionable fact is that the file is missing or unreadable.
+func hookAuthError(resp *http.Response, op string) bool {
+	if resp.StatusCode != http.StatusUnauthorized {
+		return false
 	}
-	return strings.TrimSpace(string(data))
+	secretPath := filepath.Join(config.DataDir(), "hook-secret")
+	if readHookSecret() == "" {
+		fmt.Fprintf(os.Stderr, "[sine~sync] %s: cannot read the daemon hook secret at %s. The daemon writes it on startup; run 'sinesync restart'.\n", op, secretPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "[sine~sync] %s: the daemon rejected the hook secret at %s — it is probably stale. Run 'sinesync restart'.\n", op, secretPath)
+	}
+	return true
+}
+
+// authedRequest builds a request to the daemon carrying the hook secret.
+//
+// Every /api/ route except health and status now requires it, so any caller
+// that builds its own request — rather than going through hookGet/hookPost —
+// must use this or it will silently start getting 401s. That is how `sinesync
+// status`, setup's sync trigger, and teardown's sync polling broke when the
+// read endpoints were protected.
+func authedRequest(method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if secret := readHookSecret(); secret != "" {
+		req.Header.Set("X-Hook-Secret", secret)
+	}
+	return req, nil
 }
 
 // hookPost sends a POST request to the daemon with the hook secret header.
@@ -177,6 +207,15 @@ func runContext(cmd *cobra.Command, args []string) error {
 	}
 	defer resp.Body.Close()
 
+	// Only a 200 body is context worth injecting. Copying an error page to
+	// stdout would splice "unauthorized" into the session's context block.
+	if resp.StatusCode != http.StatusOK {
+		if !hookAuthError(resp, "context injection failed") {
+			fmt.Fprintf(os.Stderr, "[sine~sync] context injection failed: daemon returned %d\n", resp.StatusCode)
+		}
+		return nil
+	}
+
 	_, err = io.Copy(os.Stdout, resp.Body)
 	return err
 }
@@ -187,6 +226,11 @@ func checkAuthStatus() string {
 		return ""
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		hookAuthError(resp, "sync status unavailable")
+		return "Cannot authenticate to the sine~sync daemon. Run 'sinesync restart'."
+	}
 
 	var status struct {
 		Authenticated bool   `json:"authenticated"`
@@ -207,7 +251,11 @@ func checkAuthStatus() string {
 
 // Fire-and-forget hooks: POST to daemon, drain and close body for keep-alive.
 
+// drainClose finishes with a fire-and-forget response. These hooks stay silent
+// about ordinary failures by design, but an auth failure is a misconfiguration
+// that would otherwise drop every observation without a word, so it is reported.
 func drainClose(resp *http.Response) {
+	hookAuthError(resp, "observation not recorded")
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 }

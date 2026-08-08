@@ -266,7 +266,11 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		info, err := daemon.EnsureRunning()
 		if err == nil {
 			client := &http.Client{Timeout: 5 * time.Second}
-			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/stats", info.Port))
+			req, reqErr := authedRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/stats", info.Port), nil)
+			if reqErr != nil {
+				return reqErr
+			}
+			resp, err := client.Do(req)
 			if err == nil {
 				defer resp.Body.Close()
 				var stats struct {

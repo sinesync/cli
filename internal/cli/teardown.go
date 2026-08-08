@@ -167,9 +167,17 @@ func waitForSyncComplete(port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/sync", port))
+		req, err := authedRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/sync", port), nil)
 		if err != nil {
 			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		if hookAuthError(resp, "sync status") {
+			resp.Body.Close()
+			return fmt.Errorf("daemon rejected the hook secret")
 		}
 		var status struct {
 			Syncing bool `json:"syncing"`
