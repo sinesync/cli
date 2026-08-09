@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/encryption"
@@ -37,17 +36,18 @@ var deviceApproveCmd = &cobra.Command{
 	Short: "Approve a new device for encryption key transfer",
 	Long: `Approve a pending device approval request.
 
-This command handles two types of requests:
+When you log in on a new device as an SSO user, that device generates an
+ephemeral keypair and waits for approval. Run this command on a device that
+already has your encryption keys to seal the credential bundle to the new
+device's public key.
 
-  1. Device linking (6-digit code): When a new device logs in via SSO and
-     shows a 6-digit linking code, run this command and enter the code to
-     transfer encryption keys securely.
+The bundle is sealed with X25519, so it is not readable in transit and the
+server is not given key material it can derive anything from.
 
-  2. SSO device recovery: When you log in on a new device and request
-     encryption keys for your account via SSO recovery, run this command
-     on one of your existing devices to approve the transfer.
-
-Run this command on an existing device that already has encryption keys.`,
+One limit worth knowing: the public key you seal to is supplied by the server,
+and there is no fingerprint to compare out of band. A compromised server could
+substitute its own key and read what you approve. Approve requests you are
+expecting, from devices you recognise.`,
 	RunE: runDeviceApprove,
 }
 
@@ -100,49 +100,6 @@ func loadDecryptedCredentialBundle(apiBase, token string) ([]byte, error) {
 	return bundleJSON, nil
 }
 
-// fetchPendingDeviceLinkRequests returns pending device link requests.
-func fetchPendingDeviceLinkRequests(apiBase, token string) ([]pendingApprovalRequest, error) {
-	req, err := http.NewRequest("GET", apiBase+"/device-link/pending", nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	httputil.SetClientHeaders(req)
-
-	resp, err := authHTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch device-link requests: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("device-link pending returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	var pendingResp struct {
-		Requests []struct {
-			ID         string `json:"id"`
-			DeviceName string `json:"deviceName"`
-			Platform   string `json:"platform"`
-		} `json:"requests"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&pendingResp); err != nil {
-		return nil, fmt.Errorf("decode device-link response: %w", err)
-	}
-
-	var results []pendingApprovalRequest
-	for _, r := range pendingResp.Requests {
-		results = append(results, pendingApprovalRequest{
-			ID:          r.ID,
-			DeviceName:  r.DeviceName,
-			Platform:    r.Platform,
-			RequestType: "device-link",
-		})
-	}
-	return results, nil
-}
-
 // fetchPendingSSORecoveries returns pending SSO recovery requests.
 func fetchPendingSSORecoveries(apiBase, token string) ([]pendingApprovalRequest, error) {
 	req, err := http.NewRequest("GET", apiBase+"/sso/credentials/recovery/pending", nil)
@@ -184,57 +141,6 @@ func fetchPendingSSORecoveries(apiBase, token string) ([]pendingApprovalRequest,
 		})
 	}
 	return results, nil
-}
-
-// approveDeviceLinkRequest approves a device link request using a 6-digit code.
-func approveDeviceLinkRequest(apiBase, token string, req pendingApprovalRequest, bundleJSON []byte, reader *bufio.Reader) error {
-	fmt.Print("Enter the 6-digit code shown on the new device: ")
-	codeInput, _ := reader.ReadString('\n')
-	code := strings.TrimSpace(strings.ReplaceAll(codeInput, "-", ""))
-
-	if len(code) != 6 {
-		return fmt.Errorf("invalid code — must be 6 digits")
-	}
-
-	transferSalt, err := crypto.GenerateSalt()
-	if err != nil {
-		return fmt.Errorf("generate transfer salt: %w", err)
-	}
-	transferKey := crypto.DeriveKeyFromCode(code, transferSalt)
-
-	encryptedTransfer, err := encryption.EncryptForDeviceLink(bundleJSON, transferKey)
-	if err != nil {
-		return fmt.Errorf("encrypt for transfer: %w", err)
-	}
-
-	approveBody, _ := json.Marshal(map[string]string{
-		"code":            code,
-		"encryptedBundle": base64.StdEncoding.EncodeToString(encryptedTransfer),
-		"transferSalt":    base64.StdEncoding.EncodeToString(transferSalt),
-	})
-
-	approveReq, err := http.NewRequest("POST",
-		fmt.Sprintf("%s/device-link/%s/approve", apiBase, req.ID),
-		bytes.NewReader(approveBody))
-	if err != nil {
-		return err
-	}
-	approveReq.Header.Set("Content-Type", "application/json")
-	approveReq.Header.Set("Authorization", "Bearer "+token)
-	httputil.SetClientHeaders(approveReq)
-
-	approveResp, err := authHTTPClient.Do(approveReq)
-	if err != nil {
-		return fmt.Errorf("approve request: %w", err)
-	}
-	defer approveResp.Body.Close()
-
-	if approveResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(approveResp.Body)
-		return fmt.Errorf("approve failed: %d - %s", approveResp.StatusCode, string(body))
-	}
-
-	return nil
 }
 
 // approveSSORecoveryRequest approves an SSO recovery request using X25519 sealing.
@@ -287,13 +193,6 @@ func runDeviceApprove(cmd *cobra.Command, args []string) error {
 	// Fetch both types of pending requests
 	var allRequests []pendingApprovalRequest
 
-	linkReqs, linkErr := fetchPendingDeviceLinkRequests(apiBase, token)
-	if linkErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not check device-link requests: %v\n", linkErr)
-	} else {
-		allRequests = append(allRequests, linkReqs...)
-	}
-
 	ssoReqs, ssoErr := fetchPendingSSORecoveries(apiBase, token)
 	if ssoErr != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not check SSO recovery requests: %v\n", ssoErr)
@@ -301,7 +200,7 @@ func runDeviceApprove(cmd *cobra.Command, args []string) error {
 		allRequests = append(allRequests, ssoReqs...)
 	}
 
-	if linkErr != nil && ssoErr != nil {
+	if ssoErr != nil {
 		return fmt.Errorf("failed to fetch pending requests — check your connection and try again")
 	}
 
@@ -316,26 +215,18 @@ func runDeviceApprove(cmd *cobra.Command, args []string) error {
 	var selected pendingApprovalRequest
 	if len(allRequests) == 1 {
 		selected = allRequests[0]
-		label := "device-link"
-		if selected.RequestType == "sso-recovery" {
-			label = "recovery"
-		}
 		if selected.Platform != "" {
-			fmt.Printf("New device '%s' (%s) is requesting access [%s].\n", selected.DeviceName, selected.Platform, label)
+			fmt.Printf("New device '%s' (%s) is requesting access recovery].\n", selected.DeviceName, selected.Platform)
 		} else {
-			fmt.Printf("New device '%s' is requesting access [%s].\n", selected.DeviceName, label)
+			fmt.Printf("New device '%s' is requesting access recovery].\n", selected.DeviceName)
 		}
 	} else {
 		fmt.Printf("%d devices are requesting access:\n", len(allRequests))
 		for i, r := range allRequests {
-			label := "device-link"
-			if r.RequestType == "sso-recovery" {
-				label = "recovery"
-			}
 			if r.Platform != "" {
-				fmt.Printf("  %d. '%s' (%s) [%s]\n", i+1, r.DeviceName, r.Platform, label)
+				fmt.Printf("  %d. '%s' (%s) recovery]\n", i+1, r.DeviceName, r.Platform)
 			} else {
-				fmt.Printf("  %d. '%s' [%s]\n", i+1, r.DeviceName, label)
+				fmt.Printf("  %d. '%s' recovery]\n", i+1, r.DeviceName)
 			}
 		}
 		fmt.Print("\nSelect device number: ")
@@ -357,10 +248,6 @@ func runDeviceApprove(cmd *cobra.Command, args []string) error {
 
 	// Dispatch based on request type
 	switch selected.RequestType {
-	case "device-link":
-		if err := approveDeviceLinkRequest(apiBase, token, selected, bundleJSON, reader); err != nil {
-			return err
-		}
 	case "sso-recovery":
 		if err := approveSSORecoveryRequest(apiBase, token, selected, bundleJSON); err != nil {
 			return err
