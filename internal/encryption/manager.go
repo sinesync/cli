@@ -18,7 +18,6 @@ const (
 	AADObservation      = "sinesync-observation-v1"
 	AADTestBlob         = "sinesync-test-blob-v1"
 	AADCredentialBundle = "sinesync-credential-bundle-v1"
-	AADDeviceLink       = "sinesync-device-link-v1"
 
 	// KeyTestString is the known string encrypted for key verification
 	KeyTestString = "sinesync-key-test-v1"
@@ -483,14 +482,4 @@ func EncryptCredentialBundle(bundle, deviceKey []byte) ([]byte, error) {
 // DecryptCredentialBundle decrypts an SSO credential bundle with a device key
 func DecryptCredentialBundle(encrypted, deviceKey []byte) ([]byte, error) {
 	return crypto.Decrypt(encrypted, deviceKey, AADCredentialBundle)
-}
-
-// EncryptForDeviceLink encrypts a credential bundle with a transfer key for device linking
-func EncryptForDeviceLink(bundle, transferKey []byte) ([]byte, error) {
-	return crypto.Encrypt(bundle, transferKey, AADDeviceLink)
-}
-
-// DecryptForDeviceLink decrypts a credential bundle encrypted for device linking
-func DecryptForDeviceLink(encrypted, transferKey []byte) ([]byte, error) {
-	return crypto.Decrypt(encrypted, transferKey, AADDeviceLink)
 }

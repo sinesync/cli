@@ -12,7 +12,6 @@ import (
 	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
-	kr "github.com/zalando/go-keyring"
 
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/daemon"
@@ -142,9 +141,9 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 		keysToKeep = append(keysToKeep, "local-db-key")
 	}
 	keychain.ClearExcept(keysToKeep)
-	_ = kr.Delete(keyringService, "token")
-	_ = kr.Delete(keyringService, "refreshToken")
-	_ = kr.Delete(keyringService, "deviceToken")
+	_ = keychain.Delete("token")
+	_ = keychain.Delete("refreshToken")
+	_ = keychain.Delete("deviceToken")
 	fmt.Println("   ✓ Keychain credentials cleared")
 
 	// Summary
@@ -167,9 +166,17 @@ func waitForSyncComplete(port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/sync", port))
+		req, err := authedRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/sync", port), nil)
 		if err != nil {
 			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		if hookAuthError(resp, "sync status") {
+			resp.Body.Close()
+			return fmt.Errorf("daemon rejected the hook secret")
 		}
 		var status struct {
 			Syncing bool `json:"syncing"`

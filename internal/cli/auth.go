@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miclip/sinesync/internal/browser"
 	"github.com/miclip/sinesync/internal/config"
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/encryption"
@@ -29,7 +29,6 @@ import (
 	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/srp"
 	"github.com/spf13/cobra"
-	kr "github.com/zalando/go-keyring"
 	"golang.org/x/term"
 )
 
@@ -39,8 +38,6 @@ func zeroBytes(b []byte) {
 		b[i] = 0
 	}
 }
-
-const keyringService = "sinesync"
 
 const DefaultAPIBase = "https://api.sinesync.ai/v1"
 
@@ -267,8 +264,8 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	authCfg := &AuthConfig{
 		UserID:       loginResp.User.ID,
 		Email:        loginResp.User.Email,
-		Token:        deviceResp.Token,         // Device access token
-		RefreshToken: deviceResp.RefreshToken,  // Device refresh token
+		Token:        deviceResp.Token,        // Device access token
+		RefreshToken: deviceResp.RefreshToken, // Device refresh token
 		ExpiresAt:    deviceResp.ExpiresAt,
 		DeviceID:     deviceResp.Device.ID,
 		DeviceToken:  deviceResp.Token,
@@ -907,6 +904,25 @@ func ssoDeviceRecovery(apiBase, token, deviceID string) error {
 		return fmt.Errorf("generate ephemeral keypair: %w", err)
 	}
 
+	// Show the fingerprint of the key we generated. The approving device holds
+	// the fingerprint of the key the SERVER handed it, and its operator is
+	// asked to type in what this screen says; if a compromised server
+	// substituted its own key to read the bundle, the two do not match.
+	//
+	// A hard stop rather than a skipped line. This is the display half of that
+	// check, so printing nothing leaves the approver with nothing to type and
+	// turns their side into a formality — the failure the invitee's side used
+	// to have. Nothing has been sent to the server at this point, so the cost
+	// of stopping is a re-run.
+	fp, err := crypto.KeyFingerprint(tempPubKey)
+	if err != nil {
+		return fmt.Errorf("could not fingerprint the key this device just generated (%w); "+
+			"the approving device would have nothing to check against, so recovery cannot continue safely", err)
+	}
+	fmt.Printf("This device's key fingerprint: %s\n", fp)
+	fmt.Println("Read it out to whoever approves this on your existing device — they will be asked to type it in.")
+	fmt.Println()
+
 	hostname := getHostname()
 
 	// 2. POST recovery request
@@ -1079,224 +1095,13 @@ func ssoDeviceRecovery(apiBase, token, deviceID string) error {
 	return nil
 }
 
-// ssoNewDeviceLink performs the device linking flow for a new device.
-// The server derives the device ID from the access token.
-func ssoNewDeviceLink(apiBase, token, hostname, platform string) error {
-	fmt.Println("This device needs to be linked to an existing device for encryption keys.")
-	fmt.Println()
-
-	// 1. Request a device link
-	reqBody, _ := json.Marshal(map[string]string{
-		"deviceName": hostname,
-		"platform":   platform,
-	})
-
-	req, err := http.NewRequest("POST", apiBase+"/device-link/request", bytes.NewReader(reqBody))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-	httputil.SetClientHeaders(req)
-
-	resp, err := authHTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("create link request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	var linkResult struct {
-		LinkRequestID string `json:"linkRequestId"`
-		DisplayCode   string `json:"displayCode"`
-		ExpiresAt     string `json:"expiresAt"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&linkResult); err != nil {
-		return err
-	}
-
-	// 2. Display linking code
-	code := linkResult.DisplayCode
-	if len(code) != 6 {
-		return fmt.Errorf("server returned invalid display code (length %d)", len(code))
-	}
-	fmt.Printf("Linking code: %s-%s\n", code[:3], code[3:])
-	fmt.Println()
-	fmt.Println("On an existing device, run:")
-	fmt.Println("  sinesync device approve")
-	fmt.Println()
-	fmt.Println("Waiting for approval...")
-
-	// 3. Poll for approval
-	pollURL := fmt.Sprintf("%s/device-link/%s/poll", apiBase, linkResult.LinkRequestID)
-	expiresAt, err := time.Parse(time.RFC3339, linkResult.ExpiresAt)
-	if err != nil {
-		return fmt.Errorf("invalid expiresAt in server response: %w", err)
-	}
-
-	var pollResult struct {
-		Status          string `json:"status"`
-		EncryptedBundle string `json:"encryptedBundle"`
-		TransferSalt    string `json:"transferSalt"`
-	}
-
-	for {
-		if time.Now().After(expiresAt) {
-			return fmt.Errorf("device link request expired")
-		}
-
-		time.Sleep(3 * time.Second)
-
-		pollReq, err := http.NewRequest("GET", pollURL, nil)
-		if err != nil {
-			continue
-		}
-		pollReq.Header.Set("Authorization", "Bearer "+token)
-		httputil.SetClientHeaders(pollReq)
-
-		pollResp, err := authHTTPClient.Do(pollReq)
-		if err != nil {
-			continue
-		}
-
-		if pollResp.StatusCode != http.StatusOK {
-			pollResp.Body.Close()
-			continue
-		}
-
-		if err := json.NewDecoder(pollResp.Body).Decode(&pollResult); err != nil {
-			pollResp.Body.Close()
-			continue
-		}
-		pollResp.Body.Close()
-
-		if pollResult.Status == "approved" {
-			break
-		}
-		if pollResult.Status == "expired" {
-			return fmt.Errorf("device link request expired")
-		}
-	}
-
-	fmt.Println("✓ Device approved!")
-
-	// 4. Derive transfer key from display code + salt
-	transferSalt, err := base64.StdEncoding.DecodeString(pollResult.TransferSalt)
-	if err != nil {
-		return fmt.Errorf("decode transfer salt: %w", err)
-	}
-	transferKey := crypto.DeriveKeyFromCode(code, transferSalt)
-
-	// 5. Decrypt the transfer bundle
-	encryptedBundle, err := base64.StdEncoding.DecodeString(pollResult.EncryptedBundle)
-	if err != nil {
-		return fmt.Errorf("decode bundle: %w", err)
-	}
-
-	bundleJSON, err := encryption.DecryptForDeviceLink(encryptedBundle, transferKey)
-	if err != nil {
-		return fmt.Errorf("decrypt transfer bundle: %w", err)
-	}
-
-	// 6. Parse bundle
-	var bundle struct {
-		AccountKey string `json:"accountKey"`
-		PrivateKey string `json:"privateKey"`
-	}
-	if err := json.Unmarshal(bundleJSON, &bundle); err != nil {
-		return fmt.Errorf("parse bundle: %w", err)
-	}
-
-	accountKey, err := base64.StdEncoding.DecodeString(bundle.AccountKey)
-	if err != nil {
-		return fmt.Errorf("decode account key: %w", err)
-	}
-
-	// 7. Generate new device key and store in keychain
-	newDeviceKey, err := crypto.GenerateKey(32)
-	if err != nil {
-		return fmt.Errorf("generate device key: %w", err)
-	}
-	if err := keychain.SetDeviceKey(newDeviceKey); err != nil {
-		return fmt.Errorf("store device key: %w", err)
-	}
-
-	// 8. Re-encrypt bundle with new device key
-	reEncrypted, err := encryption.EncryptCredentialBundle(bundleJSON, newDeviceKey)
-	if err != nil {
-		return fmt.Errorf("re-encrypt bundle: %w", err)
-	}
-
-	// 9. Upload new device's bundle
-	uploadBody, _ := json.Marshal(map[string]string{
-		"encryptedBundle": base64.StdEncoding.EncodeToString(reEncrypted),
-	})
-	uploadReq, err := http.NewRequest("POST", apiBase+"/sso/credentials/bundle", bytes.NewReader(uploadBody))
-	if err != nil {
-		return fmt.Errorf("create upload request: %w", err)
-	}
-	uploadReq.Header.Set("Content-Type", "application/json")
-	uploadReq.Header.Set("Authorization", "Bearer "+token)
-	httputil.SetClientHeaders(uploadReq)
-
-	uploadResp, err := authHTTPClient.Do(uploadReq)
-	if err != nil {
-		return fmt.Errorf("upload bundle: %w", err)
-	}
-	defer uploadResp.Body.Close()
-
-	if uploadResp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(uploadResp.Body)
-		return fmt.Errorf("upload failed: %d - %s", uploadResp.StatusCode, string(respBody))
-	}
-
-	// 10. Claim the link request
-	claimReq, err := http.NewRequest("POST", fmt.Sprintf("%s/device-link/%s/claim", apiBase, linkResult.LinkRequestID), nil)
-	if err != nil {
-		return fmt.Errorf("create claim request: %w", err)
-	}
-	claimReq.Header.Set("Authorization", "Bearer "+token)
-	httputil.SetClientHeaders(claimReq)
-
-	claimResp, err := authHTTPClient.Do(claimReq)
-	if err != nil {
-		return fmt.Errorf("claim request: %w", err)
-	}
-	defer claimResp.Body.Close()
-
-	if claimResp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(claimResp.Body)
-		return fmt.Errorf("claim failed: %d - %s", claimResp.StatusCode, string(respBody))
-	}
-
-	// 11. Set account key as the derived key
-	encMgr := encryption.GetManager()
-	if err := encMgr.SetKeyDirect(accountKey); err != nil {
-		return fmt.Errorf("set key: %w", err)
-	}
-
-	fmt.Println("✓ Encryption keys received and secured with device key")
-	return nil
-}
-
 // openBrowserForSAML opens the given URL in the user's default browser.
+//
+// The URL is built from the SAML discovery response, so part of it is chosen by
+// the server. openURL validates before dispatching and never routes through a
+// command interpreter — see browser.go.
 func openBrowserForSAML(url string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "linux":
-		cmd = exec.Command("xdg-open", url)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", "", url)
-	default:
-		return fmt.Errorf("unsupported platform")
-	}
-	return cmd.Start()
+	return browser.Open(url)
 }
 
 func runSignup(cmd *cobra.Command, args []string) error {
@@ -1404,8 +1209,8 @@ func runSignup(cmd *cobra.Command, args []string) error {
 	authCfg := &AuthConfig{
 		UserID:       signupResp.User.ID,
 		Email:        signupResp.User.Email,
-		Token:        deviceResp.Token,         // Device access token
-		RefreshToken: deviceResp.RefreshToken,  // Device refresh token
+		Token:        deviceResp.Token,        // Device access token
+		RefreshToken: deviceResp.RefreshToken, // Device refresh token
 		ExpiresAt:    deviceResp.ExpiresAt,
 		DeviceID:     deviceResp.Device.ID,
 		DeviceToken:  deviceResp.Token,
@@ -1685,38 +1490,6 @@ func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
 	}, nil
 }
 
-func doSignup(apiBase, email, srpSalt, srpVerifier string) (*authResponse, error) {
-	body, _ := json.Marshal(map[string]string{
-		"email":       email,
-		"srpSalt":     srpSalt,
-		"srpVerifier": srpVerifier,
-	})
-
-	req, err := http.NewRequest("POST", apiBase+"/auth/signup", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	httputil.SetClientHeaders(req)
-	resp, err := authHTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var result authResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	return &result, nil
-}
-
 func doSignupWithKeypair(apiBase, email, srpSalt, srpVerifier, publicKey, encryptedPrivateKey string) (*authResponse, error) {
 	body, _ := json.Marshal(map[string]string{
 		"email":               email,
@@ -1798,17 +1571,17 @@ func saveAuthConfig(cfg *AuthConfig) error {
 
 	// Store tokens in system keychain — fail if keychain is unavailable
 	if cfg.Token != "" {
-		if err := kr.Set(keyringService, "token", cfg.Token); err != nil {
+		if err := keychain.Set("token", cfg.Token); err != nil {
 			return fmt.Errorf("system keychain unavailable — cannot store tokens securely: %w", err)
 		}
 	}
 	if cfg.RefreshToken != "" {
-		if err := kr.Set(keyringService, "refreshToken", cfg.RefreshToken); err != nil {
+		if err := keychain.Set("refreshToken", cfg.RefreshToken); err != nil {
 			return fmt.Errorf("failed to store refresh token in keychain: %w", err)
 		}
 	}
 	if cfg.DeviceToken != "" {
-		if err := kr.Set(keyringService, "deviceToken", cfg.DeviceToken); err != nil {
+		if err := keychain.Set("deviceToken", cfg.DeviceToken); err != nil {
 			return fmt.Errorf("failed to store device token in keychain: %w", err)
 		}
 	}
@@ -1847,13 +1620,13 @@ func loadAuthConfig() (*AuthConfig, error) {
 	cfg.DeviceToken = ""
 
 	// Load tokens from keychain
-	if token, err := kr.Get(keyringService, "token"); err == nil {
+	if token, err := keychain.Get("token"); err == nil {
 		cfg.Token = token
 	}
-	if refreshToken, err := kr.Get(keyringService, "refreshToken"); err == nil {
+	if refreshToken, err := keychain.Get("refreshToken"); err == nil {
 		cfg.RefreshToken = refreshToken
 	}
-	if deviceToken, err := kr.Get(keyringService, "deviceToken"); err == nil {
+	if deviceToken, err := keychain.Get("deviceToken"); err == nil {
 		cfg.DeviceToken = deviceToken
 	}
 
@@ -1920,13 +1693,13 @@ func refreshAccessToken(apiBase string) (string, error) {
 	}
 
 	// Save new access token to keyring
-	if err := kr.Set(keyringService, "token", result.Token); err != nil {
+	if err := keychain.Set("token", result.Token); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to store access token in keyring: %v\n", err)
 	}
 
 	// Save rotated refresh token if provided
 	if result.RefreshToken != "" {
-		if err := kr.Set(keyringService, "refreshToken", result.RefreshToken); err != nil {
+		if err := keychain.Set("refreshToken", result.RefreshToken); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to store rotated refresh token in keyring — run 'sinesync login' to re-authenticate\n")
 		}
 	}
@@ -1963,9 +1736,9 @@ func isAccountDeletedError(err error) bool {
 
 func removeAuthConfig() error {
 	// Remove from keychain
-	_ = kr.Delete(keyringService, "token")
-	_ = kr.Delete(keyringService, "refreshToken")
-	_ = kr.Delete(keyringService, "deviceToken")
+	_ = keychain.Delete("token")
+	_ = keychain.Delete("refreshToken")
+	_ = keychain.Delete("deviceToken")
 
 	// Clear encryption keys
 	keychain.Clear()

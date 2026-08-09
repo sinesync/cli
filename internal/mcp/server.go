@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/miclip/sinesync/internal/adapters"
@@ -68,6 +70,48 @@ type Server struct {
 	mode       string // "standalone" or "adapter"
 	daemonPort int
 	httpClient *http.Client
+}
+
+// readHookSecret loads the daemon's shared secret from its 0600 file. A missing
+// or unreadable file yields an empty secret rather than an error, so the MCP
+// server still starts and can answer tools/list; the daemon then rejects the
+// API calls with 401 and apiError explains that the secret file is the cause.
+func readHookSecret() string {
+	b, err := os.ReadFile(filepath.Join(config.DataDir(), "hook-secret"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// daemonURL builds an absolute URL for a daemon API path.
+func (s *Server) daemonURL(path string) string {
+	return fmt.Sprintf("http://127.0.0.1:%d%s", s.daemonPort, path)
+}
+
+// do issues a request to the daemon with the hook secret attached. Every daemon
+// call goes through here so no endpoint can silently skip authentication.
+//
+// The secret is re-read per request rather than cached at startup, matching the
+// hook client in internal/cli/hooks.go: the daemon generates a fresh secret
+// every time it starts, and an MCP server outlives daemon restarts, so a cached
+// copy would go stale and reject every subsequent call.
+func (s *Server) do(method, url string, body io.Reader, contentType string) (*http.Response, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if secret := readHookSecret(); secret != "" {
+		req.Header.Set("X-Hook-Secret", secret)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return s.httpClient.Do(req)
+}
+
+func (s *Server) get(path string) (*http.Response, error) {
+	return s.do(http.MethodGet, s.daemonURL(path), nil, "")
 }
 
 // Sync tools (both modes)
@@ -169,6 +213,10 @@ func StartServer() error {
 		daemonPort: info.Port,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
+	if readHookSecret() == "" {
+		fmt.Fprintf(os.Stderr, "sine~sync MCP: warning: no hook secret at %s; the daemon will reject every API call until it is readable\n",
+			filepath.Join(config.DataDir(), "hook-secret"))
+	}
 
 	// Select tools based on mode
 	var tools []Tool
@@ -184,7 +232,7 @@ func StartServer() error {
 	}
 
 	fmt.Fprintf(os.Stderr, "  → Daemon: http://127.0.0.1:%d\n", info.Port)
-	fmt.Fprintf(os.Stderr, "  → Dashboard: http://127.0.0.1:%d\n", info.Port)
+	fmt.Fprintf(os.Stderr, "  → Dashboard: run 'sinesync dashboard' (port %d)\n", info.Port)
 
 	// Read JSON-RPC messages from stdin
 	scanner := bufio.NewScanner(os.Stdin)
@@ -262,11 +310,15 @@ func (s *Server) handleToolCall(params json.RawMessage) interface{} {
 }
 
 func (s *Server) handleStatus() interface{} {
-	resp, err := s.httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/status", s.daemonPort))
+	resp, err := s.get("/api/status")
 	if err != nil {
 		return errorResult(fmt.Sprintf("Daemon error: %v", err))
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return apiError("Status", resp)
+	}
 
 	var status map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
@@ -287,14 +339,17 @@ func (s *Server) handleSearch(args map[string]interface{}) interface{} {
 		limit = int(l)
 	}
 
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/mcp/search?query=%s&limit=%d",
-		s.daemonPort, url.QueryEscape(query), limit)
+	apiPath := fmt.Sprintf("/api/mcp/search?query=%s&limit=%d", url.QueryEscape(query), limit)
 
-	resp, err := s.httpClient.Get(apiURL)
+	resp, err := s.get(apiPath)
 	if err != nil {
 		return errorResult(fmt.Sprintf("Search error: %v", err))
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return apiError("Search", resp)
+	}
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -326,11 +381,15 @@ func (s *Server) handleSearch(args map[string]interface{}) interface{} {
 }
 
 func (s *Server) handleProjects() interface{} {
-	resp, err := s.httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/projects", s.daemonPort))
+	resp, err := s.get("/api/projects")
 	if err != nil {
 		return errorResult(fmt.Sprintf("Projects error: %v", err))
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return apiError("Projects", resp)
+	}
 
 	var projects []interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
@@ -368,16 +427,14 @@ func (s *Server) handleMCPSearch(args map[string]interface{}) interface{} {
 		params.Set("dateEnd", de)
 	}
 
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/mcp/search?%s", s.daemonPort, params.Encode())
-	resp, err := s.httpClient.Get(apiURL)
+	resp, err := s.get("/api/mcp/search?" + params.Encode())
 	if err != nil {
 		return errorResult(fmt.Sprintf("Search error: %v", err))
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return errorResult(fmt.Sprintf("Search failed (%d): %s", resp.StatusCode, string(body)))
+	if resp.StatusCode != http.StatusOK {
+		return apiError("Search", resp)
 	}
 
 	var result map[string]interface{}
@@ -404,16 +461,14 @@ func (s *Server) handleMCPTimeline(args map[string]interface{}) interface{} {
 		params.Set("depth_after", fmt.Sprintf("%d", int(da)))
 	}
 
-	apiURL := fmt.Sprintf("http://127.0.0.1:%d/api/mcp/timeline?%s", s.daemonPort, params.Encode())
-	resp, err := s.httpClient.Get(apiURL)
+	resp, err := s.get("/api/mcp/timeline?" + params.Encode())
 	if err != nil {
 		return errorResult(fmt.Sprintf("Timeline error: %v", err))
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return errorResult(fmt.Sprintf("Timeline failed (%d): %s", resp.StatusCode, string(body)))
+	if resp.StatusCode != http.StatusOK {
+		return apiError("Timeline", resp)
 	}
 
 	var result map[string]interface{}
@@ -441,19 +496,19 @@ func (s *Server) handleMCPGetObservations(args map[string]interface{}) interface
 	}
 
 	reqBody, _ := json.Marshal(map[string]interface{}{"ids": ids})
-	resp, err := s.httpClient.Post(
-		fmt.Sprintf("http://127.0.0.1:%d/api/mcp/observations", s.daemonPort),
-		"application/json",
+	resp, err := s.do(
+		http.MethodPost,
+		s.daemonURL("/api/mcp/observations"),
 		bytes.NewReader(reqBody),
+		"application/json",
 	)
 	if err != nil {
 		return errorResult(fmt.Sprintf("Get observations error: %v", err))
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return errorResult(fmt.Sprintf("Get observations failed (%d): %s", resp.StatusCode, string(body)))
+	if resp.StatusCode != http.StatusOK {
+		return apiError("Get observations", resp)
 	}
 
 	var result map[string]interface{}
@@ -462,6 +517,25 @@ func (s *Server) handleMCPGetObservations(args map[string]interface{}) interface
 	}
 
 	return textResult(result)
+}
+
+// apiError converts a non-200 daemon response into a tool error. A 401 gets an
+// actionable message instead of the daemon's bare "unauthorized": the caller
+// needs to know the secret file is the problem, not the query.
+func apiError(op string, resp *http.Response) interface{} {
+	if resp.StatusCode == http.StatusUnauthorized {
+		secretPath := filepath.Join(config.DataDir(), "hook-secret")
+		if readHookSecret() == "" {
+			return errorResult(fmt.Sprintf(
+				"%s failed: cannot read the daemon hook secret at %s. The daemon writes it on startup; run 'sinesync restart'.",
+				op, secretPath))
+		}
+		return errorResult(fmt.Sprintf(
+			"%s failed: the daemon rejected the hook secret at %s — it is probably stale. Run 'sinesync restart'.",
+			op, secretPath))
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return errorResult(fmt.Sprintf("%s failed (%d): %s", op, resp.StatusCode, strings.TrimSpace(string(body))))
 }
 
 func textResult(data interface{}) interface{} {
@@ -474,9 +548,16 @@ func textResult(data interface{}) interface{} {
 }
 
 func errorResult(msg string) interface{} {
+	// Marshalled rather than interpolated: messages now carry filesystem paths
+	// and daemon response bodies, either of which can contain a quote or a
+	// newline that would produce malformed JSON.
+	payload, err := json.Marshal(map[string]string{"error": msg})
+	if err != nil {
+		payload = []byte(`{"error": "unknown error"}`)
+	}
 	return map[string]interface{}{
 		"content": []map[string]interface{}{
-			{"type": "text", "text": fmt.Sprintf(`{"error": "%s"}`, msg)},
+			{"type": "text", "text": string(payload)},
 		},
 		"isError": true,
 	}

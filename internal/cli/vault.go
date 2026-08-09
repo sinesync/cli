@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,9 +19,9 @@ import (
 	"github.com/miclip/sinesync/internal/daemon"
 	"github.com/miclip/sinesync/internal/encryption"
 	"github.com/miclip/sinesync/internal/httputil"
+	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/storage"
 	"github.com/spf13/cobra"
-	kr "github.com/zalando/go-keyring"
 )
 
 // Vault types matching backend
@@ -56,9 +57,6 @@ type VaultInvite struct {
 	InviteType              string `json:"inviteType"`
 	EncryptedVaultKey       string `json:"encryptedVaultKey"`
 	EncryptedTempPrivateKey string `json:"encryptedTempPrivateKey,omitempty"`
-	TempPublicKey           string `json:"tempPublicKey,omitempty"`
-	EmailCodeHash           string `json:"emailCodeHash,omitempty"`
-	InviteCodeHash          string `json:"inviteCodeHash,omitempty"`
 	Salt                    string `json:"salt,omitempty"`
 	Status                  string `json:"status"`
 	ExpiresAt               string `json:"expiresAt"`
@@ -1146,7 +1144,7 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 									continue
 								}
 								holders = append(holders, map[string]string{
-									"userId":                admin.UserID,
+									"userId":                 admin.UserID,
 									"encryptedOrgPrivateKey": sealed,
 								})
 							}
@@ -1278,10 +1276,10 @@ func doVaultRequest(client *http.Client, req *http.Request, token *string) (*htt
 
 func getAuthTokenForVault() (string, error) {
 	// Check keyring
-	if token, err := kr.Get(keyringService, "deviceToken"); err == nil && token != "" {
+	if token, err := keychain.Get("deviceToken"); err == nil && token != "" {
 		return token, nil
 	}
-	if token, err := kr.Get(keyringService, "token"); err == nil && token != "" {
+	if token, err := keychain.Get("token"); err == nil && token != "" {
 		return token, nil
 	}
 
@@ -1828,6 +1826,38 @@ func runVaultConfirm(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Confirming invite for %s to vault %s...\n", targetInvite.InviteeEmail, targetInvite.VaultName)
 
+	// The public key is relayed by the server, so confirming blind would let a
+	// compromised server substitute its own and read the vault key. Show a
+	// fingerprint the invitee can read back over any channel that is not this
+	// one — the email address alone proves nothing, since the server supplies
+	// that too.
+	fingerprint, err := crypto.KeyFingerprint(targetInvite.InviteePublicKey)
+	if err != nil {
+		return fmt.Errorf("the invitee's public key is unusable (%w); refusing to seal the vault key to it", err)
+	}
+
+	// The fingerprint this machine computed is deliberately not shown before
+	// the prompt: the invitee reads theirs out, the owner types it, and the
+	// comparison happens here over all 60 bits. Printing it first would invite
+	// the owner to type what is already on their own screen, which a
+	// substituted key passes trivially.
+	ok := confirmFingerprintByTyping(os.Stdout, bufio.NewReader(os.Stdin), fingerprint, fingerprintPromptText{
+		intro: []string{
+			fmt.Sprintf("Ask %s to run 'sinesync vault pending' and read out the fingerprint it shows.", targetInvite.InviteeEmail),
+			"Use a channel that is not this one — a phone call, in person. Not the invite itself.",
+			"Then type it in exactly as they read it. Case, dashes and spaces do not matter.",
+		},
+		label:    "Fingerprint they read out: ",
+		declined: []string{"Cancelled. The vault key was not shared."},
+		mismatchHint: []string{
+			"A fingerprint that does not match means the public key this server relayed is not",
+			"the one on their machine. Do not retry until you know why.",
+		},
+	})
+	if !ok {
+		return nil
+	}
+
 	// Get the vault key from local storage
 	vaultKey, err := GetVaultKey(targetInvite.VaultID)
 	if err != nil {
@@ -2153,6 +2183,12 @@ func runVaultPending(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Reported unconditionally, and before the empty-list return. The owner asks
+	// the invitee to compare this AFTER they accept — by which point the invite
+	// has moved to awaiting_confirmation and no longer appears below, so gating
+	// it on having pending invites would hide it exactly when it is wanted.
+	reportOwnKeyFingerprint(token)
+
 	if len(result.Invites) == 0 {
 		fmt.Println("No pending vault invites.")
 		return nil
@@ -2174,6 +2210,109 @@ func runVaultPending(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// Causes of a failed own-key derivation that the invitee has to tell apart.
+var (
+	// errKeypairUnavailable: the server never handed back a usable keypair
+	// response — transport failure, non-200, or a body that would not parse.
+	errKeypairUnavailable = errors.New("your key material could not be retrieved from the server")
+
+	// errKeyMaterialUnusable: the private key decrypted under our own master
+	// key but will not yield a fingerprint.
+	errKeyMaterialUnusable = errors.New("your key material is not usable")
+)
+
+// ownKeyFingerprint derives this user's fingerprint from their own private key.
+//
+// Derived, never fetched: a malicious server would report a substituted key's
+// fingerprint to both sides and the comparison would agree. The private key
+// arrives encrypted to our own master key, so a substituted one simply would
+// not decrypt.
+func ownKeyFingerprint(token string) (string, error) {
+	priv, err := fetchAndDecryptPrivateKey(token)
+	if err != nil {
+		return "", err
+	}
+	pub, err := crypto.PublicKeyFromPrivate(priv)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errKeyMaterialUnusable, err)
+	}
+	fp, err := crypto.KeyFingerprint(pub)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errKeyMaterialUnusable, err)
+	}
+	return fp, nil
+}
+
+// fingerprintFailure explains a failed derivation in terms the invitee can act
+// on.
+//
+// The causes are not interchangeable. A keychain this process cannot read is
+// routine, happens with no attacker anywhere near it, and is fixed locally —
+// the derivation needs the master key. A server that will not return the key
+// material is the adversary this control exists to stop, doing the one thing
+// that suppresses the check. Key material that will not decrypt under our own
+// master key is the exact shape of a substituted key. Reporting any of these as
+// another either wastes the invitee's alarm or spends it in the wrong place.
+func fingerprintFailure(err error) (cause string, advice []string) {
+	switch {
+	case errors.Is(err, encryption.ErrNoKey):
+		return "this machine cannot read its own encryption key, so nothing could be decrypted locally", []string{
+			"Nothing here points at an attacker: deriving the fingerprint needs your master key, and this machine does not currently have it.",
+			"Unlock your login keychain, or run 'sinesync login' on this machine, then run this command again.",
+			"'sinesync doctor' reports more about keychain access.",
+		}
+	case errors.Is(err, errKeypairUnavailable):
+		return "the server did not return your key material", []string{
+			"This may be an outage. It is also exactly how a compromised server would suppress this check, so it does not get the benefit of the doubt.",
+			"Try again. While it keeps failing, do not confirm a vault invite and do not read a fingerprint to anyone.",
+		}
+	default:
+		return "your key material did not decrypt to a usable key", []string{
+			"Treat this as suspicious. The key material stored for you is encrypted to your master key, so it should decrypt here; a private key that does not is what a substituted one looks like.",
+			"Do not accept or confirm a vault invite until this command prints a fingerprint.",
+		}
+	}
+}
+
+// reportOwnKeyFingerprint shows the invitee the value a vault owner will ask
+// them to read back — or, failing that, says so loudly.
+//
+// Silence is the dangerous outcome, and it is the server that can trigger it:
+// the derivation starts with an authenticated GET, so a 500 or a mangled body
+// is enough. The owner's side already refuses outright to seal a vault key to a
+// public key it cannot fingerprint. The invitee's side is the one that anchors
+// trust locally, so it must not degrade to printing nothing — the owner would
+// be reading out a fingerprint (possibly a substituted key's) while the invitee
+// has nothing to compare and no reason to suspect anything.
+//
+// The listing still prints: this command is how an invitee finds their invites,
+// and withholding them helps no one. The warning goes to stderr so that piping
+// or grepping the list cannot swallow it.
+func reportOwnKeyFingerprint(token string) {
+	fp, err := ownKeyFingerprint(token)
+	if err == nil {
+		fmt.Printf("Your key fingerprint: %s\n", fp)
+		fmt.Println("Anyone sharing a vault with you should see this same value before they confirm.")
+		fmt.Println()
+		return
+	}
+
+	cause, advice := fingerprintFailure(err)
+	w := os.Stderr
+	fmt.Fprintln(w, "!! Your key fingerprint could NOT be derived.")
+	fmt.Fprintf(w, "   Cause:  %s.\n", cause)
+	fmt.Fprintf(w, "   Detail: %v\n", err)
+	fmt.Fprintln(w)
+	for _, line := range advice {
+		fmt.Fprintf(w, "   %s\n", line)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "   Until a fingerprint appears here there is nothing for a vault owner to")
+	fmt.Fprintln(w, "   check against, and a compromised server can put its own key in place of")
+	fmt.Fprintln(w, "   yours without either of you seeing it.")
+	fmt.Fprintln(w)
 }
 
 // normalizeVaultKey ensures the encrypted vault key is in AES-GCM format.
@@ -2221,21 +2360,25 @@ func fetchAndDecryptPrivateKey(token string) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	httputil.SetClientHeaders(req)
 
+	// Everything the server controls is tagged with errKeypairUnavailable, so a
+	// caller can tell "the server gave us nothing to work with" apart from "we
+	// have no key to decrypt with" and from "what it gave us is not ours".
+	// Those three want different reactions from the user.
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch keypair: %w", err)
+		return "", fmt.Errorf("%w: %w", errKeypairUnavailable, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("keypair fetch returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("%w: keypair fetch returned status %d", errKeypairUnavailable, resp.StatusCode)
 	}
 
 	var result struct {
 		EncryptedPrivateKey string `json:"encryptedPrivateKey"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: keypair response did not parse: %w", errKeypairUnavailable, err)
 	}
 
 	encMgr := encryption.GetManager()

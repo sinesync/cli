@@ -74,7 +74,7 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 	// Check if already running
 	if running, info := daemon.IsRunning(); running {
 		fmt.Printf("Daemon already running (PID %d, port %d)\n", info.PID, info.Port)
-		fmt.Printf("Dashboard: http://127.0.0.1:%d\n", info.Port)
+		fmt.Printf("Dashboard: run 'sinesync dashboard' (port %d)\n", info.Port)
 		return nil
 	}
 
@@ -87,7 +87,7 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 	_, info := daemon.IsRunning()
 	if info != nil {
 		fmt.Printf("Daemon started (PID %d, port %d)\n", info.PID, info.Port)
-		fmt.Printf("Dashboard: http://127.0.0.1:%d\n", info.Port)
+		fmt.Printf("Dashboard: run 'sinesync dashboard' (port %d)\n", info.Port)
 	}
 
 	return nil
@@ -121,7 +121,7 @@ func runDaemonStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("PID: %d\n", info.PID)
 		fmt.Printf("Port: %d\n", info.Port)
 		fmt.Printf("Uptime: %s\n", uptime)
-		fmt.Printf("Dashboard: http://127.0.0.1:%d\n", info.Port)
+		fmt.Printf("Dashboard: run 'sinesync dashboard' (port %d)\n", info.Port)
 	} else {
 		fmt.Println("Status: stopped")
 		if info != nil {
@@ -182,22 +182,4 @@ func runDaemonLogs(cmd *cobra.Command, args []string) error {
 	tailCmd.Stderr = os.Stderr
 
 	return tailCmd.Run()
-}
-
-// openBrowser opens a URL in the default browser
-func openBrowser(url string) {
-	var cmd *exec.Cmd
-
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "linux":
-		cmd = exec.Command("xdg-open", url)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
-	default:
-		return
-	}
-
-	cmd.Start()
 }

@@ -3,8 +3,14 @@ package keychain
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/zalando/go-keyring"
@@ -12,28 +18,188 @@ import (
 
 const serviceName = "sinesync"
 
-// IsAvailable checks if keychain is available
-func IsAvailable() bool {
-	_, err := keyring.Get(serviceName, "test")
-	// If error is not "not found", keychain is not available
-	if err != nil && err != keyring.ErrNotFound {
+// securityBinary is the macOS keychain CLI, addressed absolutely.
+//
+// It must stay identical to go-keyring's own execPathKeychain
+// (keyring_darwin.go), which is unexported and so cannot be referenced from
+// here. The two are a matched pair: if this probe and the library disagree
+// about which binary they reach, the guard can veto a keychain the library
+// would have used.
+const securityBinary = "/usr/bin/security"
+
+// ErrNoKeychainSession means this process cannot reach an OS keychain without
+// blocking on user interaction, so no keychain call was attempted.
+//
+// Callers must treat it as "unknown", never as "absent". Reacting by creating a
+// replacement key would orphan a database encrypted with the real one.
+var ErrNoKeychainSession = errors.New("no keychain session available in this context")
+
+// usable reports whether the OS keychain can be reached without raising UI.
+//
+// This exists because of a specific, destructive failure. When a process with no
+// GUI session touches the macOS keychain — a daemon started via nohup, an MCP
+// server spawned by an agent, anything over SSH, CI — the Security framework
+// does not return an error. It puts a modal "Keychain Not Found" panel on
+// screen whose primary button is "Reset To Defaults", which would discard the
+// user's stored secret key and session tokens. A headless process must
+// therefore decide BEFORE calling, not handle an error afterwards.
+//
+// Probed once: the answer cannot change within a process lifetime, and the
+// darwin probe shells out.
+var usable = sync.OnceValue(detectUsable)
+
+func detectUsable() bool {
+	return detectUsableFor(runtime.GOOS)
+}
+
+// detectUsableFor takes the platform as a parameter rather than reading
+// runtime.GOOS so that every platform's answer is reachable from a test on any
+// machine. The previous Linux branch was a hand-rolled D-Bus discovery that no
+// one working on a Mac could execute, which is part of how it drifted from the
+// library it was standing in front of.
+func detectUsableFor(goos string) bool {
+	// Explicit override, for containers and anywhere the heuristics are wrong.
+	if v := os.Getenv("SINESYNC_NO_KEYCHAIN"); v != "" && v != "0" {
 		return false
 	}
-	return true
+
+	switch goos {
+	case "darwin":
+		// Probe the exact condition that fails: no DEFAULT keychain. That is
+		// what raised the modal — the process had a perfectly good GUI session,
+		// it just could not resolve a keychain, because it had been started with
+		// an environment whose HOME did not point at one. Session-type checks
+		// like `launchctl managername` return "Aqua" in that case and miss it.
+		//
+		// Probing through the `security` CLI rather than in-process is the whole
+		// trick. It is a subprocess with no GUI connection, so the same
+		// condition comes back as text on stderr and a non-zero result instead
+		// of a panel offering to reset the user's keychain.
+		//
+		// By absolute path, not through $PATH. go-keyring reaches this same
+		// binary as a hard-coded /usr/bin/security, so a $PATH that cannot
+		// resolve `security` — empty, minimal, a daemon's inherited environment,
+		// or one whose leading empty element makes Go refuse the match as a
+		// relative path — would make this guard answer "no keychain" while the
+		// library it stands in front of would have succeeded. That disagreement
+		// is not a safe default: it drops the daemon to plaintext JSON and hides
+		// the existing encrypted database. Fixing the path also means the probe
+		// can never execute a `security` someone left in the working directory.
+		out, err := exec.Command(securityBinary, "default-keychain").CombinedOutput()
+		if err != nil {
+			return false
+		}
+		// `security` exits 0 even when it cannot find one, so read the output.
+		// On success it prints the default keychain's path; on failure it prints
+		// a SecKeychainCopyDefault error. Match the failure, not the success —
+		// the keychain's filename is user-configurable, so requiring it to look
+		// a particular way would reject valid custom keychains and drop the user
+		// to plaintext storage for no reason.
+		text := strings.TrimSpace(string(out))
+		if text == "" ||
+			strings.Contains(text, "could not be found") ||
+			strings.Contains(text, "SecKeychainCopyDefault") {
+			return false
+		}
+		// Deliberately NOT also rejecting a locked keychain, though
+		// `security show-keychain-info` could detect one. A locked keychain
+		// raises an ordinary unlock prompt: expected, benign, and dismissible
+		// by unlocking. What this guard exists to prevent is the panel raised
+		// when there is no default keychain at all, whose primary button erases
+		// the user's stored secrets. Rejecting locked keychains too would trade
+		// a benign prompt for more false negatives, and a false negative here
+		// silently drops the user to plaintext storage — the worse outcome.
+		return true
+
+	default:
+		// Every other platform, Linux included: do not gate. Answer "usable" and
+		// let go-keyring report its own failure.
+		//
+		// This guard exists for one specific thing — the macOS panel whose
+		// primary button erases the user's secrets, which must be avoided BEFORE
+		// calling because it is not an error you can handle afterwards. Nothing
+		// off darwin has that property. Windows Credential Manager works without
+		// a desktop session, and Linux Secret Service returns a D-Bus error
+		// rather than prompting. With no modal to prevent, a Linux gate had no
+		// upside left, only the cost of being wrong.
+		//
+		// And it was wrong in the destructive direction. It tried to predict
+		// whether godbus could find a session bus, but godbus's real discovery
+		// (dbus/v5@v5.1.0 conn.go:76 getSessionBusAddress, conn_other.go) is
+		// strictly more permissive than any reimplementation can be: go-keyring
+		// reaches it via dbus.SessionBus, which passes autolaunch=true, so when
+		// no address and no /run/user socket exist it still runs `dbus-launch`
+		// and can succeed. A probe cannot mirror that — replicating it means
+		// spawning a daemon to answer a question, which is not something a probe
+		// gets to do. So the check was permanently a subset of the library, and
+		// a subset here means false negatives: the daemon silently drops to
+		// plaintext JSON and an existing encrypted database becomes invisible.
+		// (godbus is also more forgiving on stat: conn_other.go:89 accepts any
+		// error that is not IsNotExist, where the guard demanded err == nil.)
+		//
+		// The two properties the guard was carrying are not lost:
+		//
+		//   - Nothing invents a replacement key. GetOrCreateDBKey only generates
+		//     one on keyring.ErrNotFound, and go-keyring's Linux backend
+		//     produces that solely from an empty search result
+		//     (keyring_unix.go:73). A bus that cannot be reached surfaces the
+		//     dbus error verbatim (keyring_unix.go:104-108), which is not
+		//     ErrNotFound, so the create path stays closed.
+		//   - SINESYNC_NO_KEYCHAIN still short-circuits above, so anyone who
+		//     needs to opt a headless box out entirely still can.
+		//
+		// What is given up is a tailored message: a headless Linux daemon now
+		// reports the raw D-Bus error instead of ErrNoKeychainSession. Both land
+		// in the same plaintext-fallback warning, and a real error beats a
+		// guess about one.
+		return true
+	}
+}
+
+// Get, Set and Delete are the ONLY paths from this codebase to the OS keychain.
+//
+// They exist because a guard is worth nothing if callers can route around it,
+// and they could: the daemon and CLI previously reached for go-keyring directly
+// with the same "sinesync" service name, so the availability check protected
+// database-key resolution and nothing else. Session tokens and sync credentials
+// went straight to the Security framework and could still raise the modal these
+// functions exist to prevent.
+//
+// Nothing outside this package should import go-keyring.
+
+func Get(key string) (string, error) {
+	if !usable() {
+		return "", ErrNoKeychainSession
+	}
+	return keyring.Get(serviceName, key)
+}
+
+func Set(key, value string) error {
+	if !usable() {
+		return ErrNoKeychainSession
+	}
+	return keyring.Set(serviceName, key, value)
+}
+
+func Delete(key string) error {
+	if !usable() {
+		return ErrNoKeychainSession
+	}
+	return keyring.Delete(serviceName, key)
 }
 
 // Session token
 func GetSessionToken() (string, error) {
-	return keyring.Get(serviceName, "session-token")
+	return Get("session-token")
 }
 
 func SetSessionToken(token string) error {
-	return keyring.Set(serviceName, "session-token", token)
+	return Set("session-token", token)
 }
 
 // User salt
 func GetUserSalt() ([]byte, error) {
-	encoded, err := keyring.Get(serviceName, "user-salt")
+	encoded, err := Get("user-salt")
 	if err != nil {
 		return nil, err
 	}
@@ -42,21 +208,21 @@ func GetUserSalt() ([]byte, error) {
 
 func SetUserSalt(salt []byte) error {
 	encoded := base64.StdEncoding.EncodeToString(salt)
-	return keyring.Set(serviceName, "user-salt", encoded)
+	return Set("user-salt", encoded)
 }
 
 // Secret key
 func GetSecretKey() (string, error) {
-	return keyring.Get(serviceName, "secret-key")
+	return Get("secret-key")
 }
 
 func SetSecretKey(key string) error {
-	return keyring.Set(serviceName, "secret-key", key)
+	return Set("secret-key", key)
 }
 
 // Derived key
 func GetDerivedKey() ([]byte, error) {
-	encoded, err := keyring.Get(serviceName, "derived-key")
+	encoded, err := Get("derived-key")
 	if err != nil {
 		return nil, err
 	}
@@ -65,16 +231,16 @@ func GetDerivedKey() ([]byte, error) {
 
 func SetDerivedKey(key []byte) error {
 	encoded := base64.StdEncoding.EncodeToString(key)
-	return keyring.Set(serviceName, "derived-key", encoded)
+	return Set("derived-key", encoded)
 }
 
 func ClearDerivedKey() error {
-	return keyring.Delete(serviceName, "derived-key")
+	return Delete("derived-key")
 }
 
 // Last auth timestamp
 func GetLastAuth() (time.Time, error) {
-	ts, err := keyring.Get(serviceName, "last-auth")
+	ts, err := Get("last-auth")
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -86,7 +252,7 @@ func GetLastAuth() (time.Time, error) {
 }
 
 func SetLastAuth(t time.Time) error {
-	return keyring.Set(serviceName, "last-auth", strconv.FormatInt(t.Unix(), 10))
+	return Set("last-auth", strconv.FormatInt(t.Unix(), 10))
 }
 
 // NeedsReauth checks if re-authentication is needed (24 hours)
@@ -100,7 +266,7 @@ func NeedsReauth() bool {
 
 // Local DB key (for SQLCipher encryption before login)
 func GetLocalDBKey() ([]byte, error) {
-	encoded, err := keyring.Get(serviceName, "local-db-key")
+	encoded, err := Get("local-db-key")
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +275,7 @@ func GetLocalDBKey() ([]byte, error) {
 
 func SetLocalDBKey(key []byte) error {
 	encoded := base64.StdEncoding.EncodeToString(key)
-	return keyring.Set(serviceName, "local-db-key", encoded)
+	return Set("local-db-key", encoded)
 }
 
 // GetOrCreateDBKey resolves the encryption key for SQLCipher.
@@ -117,6 +283,15 @@ func SetLocalDBKey(key []byte) error {
 // Only generates a new key when both are genuinely missing (ErrNotFound),
 // not on other errors like decode failures, to avoid making an existing DB inaccessible.
 func GetOrCreateDBKey() ([]byte, error) {
+	// Guard the whole function, not just the reads. The create path below
+	// responds to "not found" by generating a replacement key — correct when the
+	// keychain is genuinely empty, catastrophic when it merely could not be
+	// reached, because the existing database would no longer decrypt. In a
+	// context with no keychain session, "not found" carries no information.
+	if !usable() {
+		return nil, ErrNoKeychainSession
+	}
+
 	// Try derived key first (authenticated user)
 	key, err := GetDerivedKey()
 	if err == nil && len(key) > 0 {
@@ -149,7 +324,7 @@ func GetOrCreateDBKey() ([]byte, error) {
 // Device key (for SSO credential bundle encryption)
 
 func GetDeviceKey() ([]byte, error) {
-	encoded, err := keyring.Get(serviceName, "device-key")
+	encoded, err := Get("device-key")
 	if err != nil {
 		return nil, err
 	}
@@ -158,11 +333,11 @@ func GetDeviceKey() ([]byte, error) {
 
 func SetDeviceKey(key []byte) error {
 	encoded := base64.StdEncoding.EncodeToString(key)
-	return keyring.Set(serviceName, "device-key", encoded)
+	return Set("device-key", encoded)
 }
 
 func DeleteDeviceKey() error {
-	return keyring.Delete(serviceName, "device-key")
+	return Delete("device-key")
 }
 
 func HasDeviceKey() bool {
@@ -182,9 +357,12 @@ func ClearExcept(keep []string) error {
 	for _, k := range keep {
 		keepSet[k] = true
 	}
+	// Through the guarded Delete, not keyring.Delete. Teardown and stale-login
+	// cleanup both reach here, and both can run headless — deleting is exactly
+	// as capable of raising the modal as reading.
 	for _, key := range allKeys {
 		if !keepSet[key] {
-			keyring.Delete(serviceName, key) // Ignore errors
+			_ = Delete(key) // best effort: a key that was never set is not an error
 		}
 	}
 	return nil

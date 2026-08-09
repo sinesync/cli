@@ -49,12 +49,27 @@ jobs:
       - name: Get version
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            VERSION="${INPUT_VERSION}"
           else
-            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            VERSION="${GITHUB_REF#refs/tags/}"
           fi
+          # Reject anything that is not a strict release version. This value
+          # becomes a path prefix (upload/<v>/, gs://bucket/<v>/), the `latest`
+          # pointer, and the name under which signed checksums are published, so
+          # a malformed value corrupts the release even without code execution.
+          # It also blocks newline-bearing inputs from injecting extra lines
+          # into $GITHUB_OUTPUT / $GITHUB_ENV. [.] keeps the dots literal (an
+          # unquoted \. in [[ =~ ]] loses its backslash and matches any char).
+          version_re='^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.]+)?$'
+          if [[ ! "$VERSION" =~ $version_re ]]; then
+            echo "::error::Invalid release version '${VERSION}' — expected vMAJOR.MINOR.PATCH or vX.Y.Z-prerelease" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux build dependencies
         if: matrix.os == 'linux'
@@ -94,8 +109,8 @@ jobs:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: 1
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
           COMMIT=$(git rev-parse --short HEAD)
           LDFLAGS="-s -w -X main.ver=${VERSION} -X main.commit=${COMMIT}"
 
@@ -209,8 +224,9 @@ jobs:
 
       - name: Create archive
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
           ARCHIVE_NAME="${{ env.BINARY_NAME }}-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
 
           if [ "${{ matrix.os }}" = "windows" ]; then
@@ -240,12 +256,22 @@ jobs:
 
       - name: Get version
         id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            VERSION="${INPUT_VERSION}"
           else
-            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            VERSION="${GITHUB_REF#refs/tags/}"
           fi
+          # See the build job's Get version step for why this is validated.
+          version_re='^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.]+)?$'
+          if [[ ! "$VERSION" =~ $version_re ]]; then
+            echo "::error::Invalid release version '${VERSION}' — expected vMAJOR.MINOR.PATCH or vX.Y.Z-prerelease" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -306,14 +332,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Needed by the Ed25519 signing step below. Pinned rather than relying
+      # on whatever Go the runner ships, so a toolchain mismatch cannot turn
+      # into a release published without the signature clients require.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
       - name: Get version
         id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            VERSION="${INPUT_VERSION}"
           else
-            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            VERSION="${GITHUB_REF#refs/tags/}"
           fi
+          # See the build job's Get version step for why this is validated.
+          version_re='^v[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.]+)?$'
+          if [[ ! "$VERSION" =~ $version_re ]]; then
+            echo "::error::Invalid release version '${VERSION}' — expected vMAJOR.MINOR.PATCH or vX.Y.Z-prerelease" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -330,22 +374,23 @@ jobs:
           path: artifacts
 
       - name: Prepare release files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
-          mkdir -p upload/${VERSION}
+          mkdir -p "upload/${VERSION}"
 
           # Move archives into version directory
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} upload/${VERSION}/ \;
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} "upload/${VERSION}/" \;
 
           # Generate checksums
-          cd upload/${VERSION}
+          cd "upload/${VERSION}"
           sha256sum *.tar.gz *.zip > checksums.txt
           cat checksums.txt
           cd ../..
 
           # Copy public key to version dir and bucket root
           if [ -f sinesync-release.pub ]; then
-            cp sinesync-release.pub upload/${VERSION}/
+            cp sinesync-release.pub "upload/${VERSION}/"
             cp sinesync-release.pub upload/
           fi
 
@@ -353,21 +398,48 @@ jobs:
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
           if [ -n "$GPG_PRIVATE_KEY" ]; then
             echo "$GPG_PRIVATE_KEY" | gpg --batch --import
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
-              --detach-sign --armor upload/${VERSION}/checksums.txt
+              --detach-sign --armor "upload/${VERSION}/checksums.txt"
             echo "Checksums signed"
           else
             echo "Skipping GPG signing — no key configured"
           fi
 
-      - name: Upload to GCS
+      # checksums.txt.asc above is the OpenPGP signature humans can check with
+      # gpg. This is the one `sinesync update` requires: a raw Ed25519 signature
+      # it verifies with crypto/ed25519, which has nothing subtle to get wrong.
+      #
+      # Deliberately NOT conditional on the secret being present. A release
+      # published without checksums.txt.sig is one that no verifying client can
+      # install, so a missing key must fail the release rather than quietly
+      # produce an unusable one — the mistake would otherwise only surface on
+      # user machines.
+      #
+      # signrelease is handed the PATH of the public key and reads it itself.
+      # Passing the key material via "$(... < file)" meant a missing or renamed
+      # file became an empty argument, which the tool read as "nothing to check
+      # against" — the release got signed by whatever seed was in the
+      # environment and the step still exited 0. No command substitution here.
+      - name: Ed25519 sign checksums
+        env:
+          RELEASE_ED25519_PRIVATE_KEY: ${{ secrets.RELEASE_ED25519_PRIVATE_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
+          go run ./tools/signrelease \
+            --pubkey-file sinesync-release-ed25519.pub \
+            "upload/${VERSION}/checksums.txt" \
+            > "upload/${VERSION}/checksums.txt.sig"
+          echo "Ed25519 signature written:"
+          cat "upload/${VERSION}/checksums.txt.sig"
 
+      - name: Upload to GCS
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
           # Upload version directory (no-clobber to prevent overwriting existing releases)
           gsutil -m cp -r -n "upload/${VERSION}" "gs://${BUCKET}/"
 

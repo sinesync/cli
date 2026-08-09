@@ -13,6 +13,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,7 +30,6 @@ import (
 	"github.com/miclip/sinesync/internal/embeddings"
 	"github.com/miclip/sinesync/internal/keychain"
 	"github.com/miclip/sinesync/internal/storage"
-	"github.com/zalando/go-keyring"
 )
 
 //go:embed static/*
@@ -37,19 +37,19 @@ var staticFiles embed.FS
 
 // Server is the unified daemon server (dashboard + hook API)
 type Server struct {
-	port     int
-	backend  storage.StorageBackend
-	config   *config.Config
-	embedder *embeddings.Provider
-	httpServer *http.Server
-	mode       string // "standalone" or "adapter"
+	port        int
+	backend     storage.StorageBackend
+	config      *config.Config
+	embedder    *embeddings.Provider
+	httpServer  *http.Server
+	mode        string // "standalone" or "adapter"
 	syncManager *SyncManager
 
 	// Observation cache
-	obsCache      []storage.Observation
-	obsCacheTime  time.Time
-	obsCacheTTL   time.Duration
-	obsCacheMu    sync.Mutex
+	obsCache     []storage.Observation
+	obsCacheTime time.Time
+	obsCacheTTL  time.Duration
+	obsCacheMu   sync.Mutex
 
 	// Async hook processing queue
 	hookQueue    chan func()
@@ -58,6 +58,16 @@ type Server struct {
 
 	// Shared secret for hook API authentication
 	hookSecret string
+
+	// Single-use tickets the dashboard exchanges for a session token, so no
+	// long-lived credential ever travels in a URL and therefore never in argv.
+	ticketsMu sync.Mutex
+	tickets   map[string]time.Time
+
+	// Dashboard sessions: read-only, expiring, memory-only. Weaker than the
+	// hook secret on purpose — see internal/daemon/ticket.go.
+	sessionsMu sync.Mutex
+	sessions   map[string]time.Time
 
 	// Graceful shutdown channel (used by /api/shutdown endpoint)
 	shutdownChan chan struct{}
@@ -122,7 +132,9 @@ func NewServer(port int) *Server {
 			go backfillEmbeddings(sqlBackend, embedder)
 		}
 	} else {
-		log.Printf("[daemon] Falling back to JSON file storage")
+		// initSQLCipherBackend has already explained why, at length. This line
+		// only records what was chosen as a result.
+		log.Printf("[daemon] Falling back to UNENCRYPTED JSON file storage")
 		backend = storage.NewLocalStorage()
 	}
 
@@ -138,19 +150,63 @@ func NewServer(port int) *Server {
 }
 
 // initSQLCipherBackend attempts to create a SQLCipher storage backend.
-// Returns nil if key is unavailable or database creation fails.
+// Returns nil if the key is unavailable or the database cannot be opened.
+//
+// Every failure here is loud, and deliberately so: the caller's fallback writes
+// observations as PLAINTEXT JSON. That is a silent reversal of the product's
+// central claim, and a one-line log is not enough warning for it. Worse, if an
+// encrypted memory.db already exists, falling back does not just lose
+// encryption — it hides everything already in that database, which reads to the
+// user as data loss.
 func initSQLCipherBackend() *storage.SQLCipherStorage {
 	dbPath := filepath.Join(config.DataDir(), "memory.db")
+	_, dbExists := func() (os.FileInfo, bool) {
+		fi, err := os.Stat(dbPath)
+		return fi, err == nil
+	}()
+
+	warnPlaintext := func(reason, remedy string) {
+		log.Printf("[daemon] ================ ENCRYPTION UNAVAILABLE ================")
+		log.Printf("[daemon] %s", reason)
+		log.Printf("[daemon] Observations will be written as PLAINTEXT JSON under %s.", config.DataDir())
+		if dbExists {
+			log.Printf("[daemon] An encrypted database exists at %s and will NOT be readable", dbPath)
+			log.Printf("[daemon] in this session. Its contents are intact but hidden — this is not data loss.")
+		}
+		log.Printf("[daemon] %s", remedy)
+		log.Printf("[daemon] ========================================================")
+	}
 
 	key, err := keychain.GetOrCreateDBKey()
 	if err != nil {
-		log.Printf("[daemon] Failed to resolve DB key: %v", err)
+		if errors.Is(err, keychain.ErrNoKeychainSession) {
+			// Expected whenever the daemon is started outside a desktop session:
+			// nohup, SSH, CI, or spawned by another tool. No keychain call was
+			// made, so nothing prompted and no key was replaced.
+			warnPlaintext(
+				"No OS keychain is reachable from this process, so the database key could not be resolved.",
+				"Start the daemon from a desktop session, or set SINESYNC_NO_KEYCHAIN=1 to acknowledge this deliberately.",
+			)
+		} else {
+			// Off darwin this is the only branch a missing keychain can reach:
+			// there is no availability probe outside macOS, so an unreachable
+			// Secret Service arrives here as its own D-Bus error rather than as
+			// ErrNoKeychainSession. The remedy has to cover that case too.
+			warnPlaintext(
+				fmt.Sprintf("The database key could not be resolved: %v", err),
+				"In a desktop session this is unexpected — check the keychain entry for 'sinesync'. "+
+					"On a machine with no keyring service at all, set SINESYNC_NO_KEYCHAIN=1 to acknowledge this deliberately.",
+			)
+		}
 		return nil
 	}
 
 	db, err := storage.NewSQLCipherStorage(dbPath, key)
 	if err != nil {
-		log.Printf("[daemon] SQLCipher init failed: %v", err)
+		warnPlaintext(
+			fmt.Sprintf("The encrypted database could not be opened: %v", err),
+			"If the keychain entry was replaced, the existing database cannot be decrypted with the current key.",
+		)
 		return nil
 	}
 
@@ -264,14 +320,106 @@ func (s *Server) enqueueHook(fn func()) {
 }
 
 // requireHookAuth wraps a handler to require the hook secret in the X-Hook-Secret header.
+//
+// It fails closed: if s.hookSecret is empty the server has no way to
+// authenticate anyone, so every request is rejected rather than admitted. An
+// empty secret means secret generation failed, and the endpoints behind this
+// wrapper return observation content — serving them unauthenticated to every
+// local account would be worse than serving nothing. Run refuses to start in
+// that state, so this branch is a backstop rather than a live path.
 func (s *Server) requireHookAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.hookSecret != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Hook-Secret")), []byte(s.hookSecret)) != 1 {
+		if s.hookSecret == "" {
+			http.Error(w, "unauthorized: daemon has no hook secret configured", http.StatusUnauthorized)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Hook-Secret")), []byte(s.hookSecret)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
 	}
+}
+
+// requireDashboardAuth guards the endpoints the browser dashboard needs. It
+// accepts either the hook secret or a live dashboard session token, both
+// presented in X-Hook-Secret.
+//
+// The two are deliberately not equivalent, and the gap is the containment the
+// ticket race needs. The hook secret is the master credential and reaches
+// everything. A session token reaches only the handlers behind this wrapper —
+// capture, summarize, shutdown, ticket minting and the MCP routes all stay on
+// requireHookAuth — and, within them, cannot DELETE.
+//
+// DELETE is carved out specifically, rather than sessions being restricted to
+// GET, because the dashboard has a real non-GET feature that works: the sync
+// button POSTs to /api/sync, which is behind this wrapper and triggers a sync.
+// A GET-only session token would break it for no security gain — the worst a
+// spurious sync does is cost bandwidth, and it is repeatable.
+//
+// Deleting an observation is the opposite. handleDeleteObservation also marks
+// it for cloud deletion, so it propagates to every device and there is nothing
+// to undo it with. A credential that can be raced out of argv must not be able
+// to destroy data, so DELETE requires the hook secret, which in practice means
+// the CLI.
+//
+// PATCH on /api/observations/{id} is deliberately on the permitted side. The
+// dashboard's star, archive, tag and classification controls issue it, and a
+// session token can reach it. That is a considered position, not an oversight:
+// every field PATCH can touch is inert display metadata. Starred and Archived
+// are read only by the stats counters, by the archived filter on the list view,
+// and by the JSON projection; Classification is read only by a stats counter
+// and that same projection. Nothing in the tree branches on a classification
+// value — "sensitive" in particular gates no encryption, no vault routing and
+// no access decision. So the worst a raced session token achieves is scrambling
+// metadata the user can re-edit from the same UI, which is categorically unlike
+// DELETE destroying data on every device with nothing to undo it.
+//
+// Note for anyone widening this further: that argument is about these four
+// fields specifically, not about PATCH as a method. Admitting a field that some
+// other code path actually branches on — a vault ID, a notes body that gets
+// indexed, anything consulted for an access decision — would need this
+// reasoning redone, not merely extended.
+func (s *Server) requireDashboardAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.hookSecret == "" {
+			http.Error(w, "unauthorized: daemon has no hook secret configured", http.StatusUnauthorized)
+			return
+		}
+		presented := r.Header.Get("X-Hook-Secret")
+		if subtle.ConstantTimeCompare([]byte(presented), []byte(s.hookSecret)) == 1 {
+			next(w, r)
+			return
+		}
+		if s.validSession(presented) {
+			if r.Method == http.MethodDelete {
+				// 403 not 401: the credential is valid, the scope is not. A 401
+				// would tell the dashboard its token had expired and send the
+				// user round a re-authentication loop that cannot help.
+				http.Error(w, "forbidden: deleting requires the hook secret; use 'sinesync forget <id>'", http.StatusForbidden)
+				return
+			}
+			next(w, r)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}
+}
+
+// HookSecretPath is where the daemon writes its shared secret, mode 0600.
+func HookSecretPath() string {
+	return filepath.Join(config.DataDir(), "hook-secret")
+}
+
+// ReadHookSecret reads the secret a running daemon wrote at startup. Returns ""
+// when it cannot be read, which callers treat as "send no header" and let the
+// daemon answer 401 rather than guessing.
+func ReadHookSecret() string {
+	data, err := os.ReadFile(HookSecretPath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // generateHookSecret creates a random secret and writes it to a 0600 file.
@@ -282,23 +430,86 @@ func (s *Server) generateHookSecret() error {
 	}
 	s.hookSecret = fmt.Sprintf("%x", b)
 
-	secretPath := filepath.Join(config.DataDir(), "hook-secret")
-	return os.WriteFile(secretPath, []byte(s.hookSecret), 0600)
+	return os.WriteFile(HookSecretPath(), []byte(s.hookSecret), 0600)
 }
 
-// Run starts the server and blocks until shutdown
-func (s *Server) Run() error {
-	// Generate shared secret for hook API authentication
-	if err := s.generateHookSecret(); err != nil {
-		log.Printf("[daemon] Warning: failed to generate hook secret: %v (hook auth disabled)", err)
+// hostAllowed reports whether a request's Host header is exactly one of the
+// loopback forms this server listens on. The comparison is deliberately exact:
+// anything else (wrong port, missing port, non-loopback address, or a hostname
+// that merely resembles one) is rejected, which blocks DNS rebinding attacks
+// that resolve an attacker-controlled name to 127.0.0.1.
+func hostAllowed(host string, port int) bool {
+	p := strconv.Itoa(port)
+	switch host {
+	case "127.0.0.1:" + p, "localhost:" + p, "[::1]:" + p:
+		return true
 	}
+	return false
+}
 
+// absoluteFormTarget reports whether a request arrived with a non origin-form
+// request-target — an absolute-form target (`GET http://host/path HTTP/1.1`) or
+// the authority-form CONNECT uses.
+//
+// This has to be checked separately from hostAllowed because of how net/http
+// populates the request. Per RFC 7230 §5.3.2 the authority in an absolute-form
+// target takes precedence over the Host header, so net/http sets r.Host from the
+// target's authority and then DELETES the Host header from r.Header entirely.
+// The handler cannot see the header at all: r.Header.Get("Host") is "".
+//
+// So a request-target naming the loopback authority satisfies hostAllowed no
+// matter what the Host header said, and the header the guard exists to police is
+// unreachable by the time the guard runs:
+//
+//	GET http://127.0.0.1:5741/api/health HTTP/1.1
+//	Host: evil.example.com          <- discarded; r.Host is 127.0.0.1:5741
+//
+// Cross-checking the two against each other is therefore not implementable in an
+// http.Handler, and rejecting is the option that remains. It costs nothing: an
+// absolute-form target is what a client sends to a PROXY, and this is an origin
+// server on loopback. No browser emits one for an origin request, and no
+// legitimate client of this daemon has a reason to.
+func absoluteFormTarget(u *url.URL) bool {
+	return u.IsAbs() || u.Host != ""
+}
+
+// requireLoopbackHost wraps h so every request — API, status, and static alike —
+// is rejected with 403 unless it is an ordinary origin-form request whose Host
+// header names this server's loopback address.
+func (s *Server) requireLoopbackHost(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Before hostAllowed, not after: for a proxy-form target r.Host is
+		// attacker-chosen and would sail through the check below.
+		if absoluteFormTarget(r.URL) {
+			http.Error(w, "forbidden: absolute-form request-target", http.StatusForbidden)
+			return
+		}
+		if !hostAllowed(r.Host, s.port) {
+			http.Error(w, "forbidden: invalid Host header", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// routes builds the full request handler: the mux wrapped in Host validation.
+func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// Health/status endpoints (no auth required)
+	// Health/status endpoints (no auth required). Both return only daemon
+	// metadata — liveness, mode, port, counts, byte totals, embedder model —
+	// and never observation content. handleHealth in particular is polled by
+	// process.go to decide whether a daemon is already running, which happens
+	// before any client has a reason to have read the secret.
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/shutdown", s.requireHookAuth(s.handleShutdown))
+
+	// Dashboard bootstrap. Minting needs the secret; redeeming deliberately
+	// does not, because it is what the browser calls before it has one. Both
+	// still sit behind the loopback Host check applied in routes().
+	mux.HandleFunc("/api/auth/ticket", s.requireHookAuth(s.handleAuthTicket))
+	mux.HandleFunc("/api/auth/redeem", s.handleAuthRedeem)
 
 	// Hook API endpoints (require hook secret)
 	mux.HandleFunc("/api/context", s.requireHookAuth(s.handleContext))
@@ -309,41 +520,56 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/subagent-start", s.requireHookAuth(s.handleSubagentStart))
 	mux.HandleFunc("/api/subagent-stop", s.requireHookAuth(s.handleSubagentStop))
 
-	// Dashboard API endpoints
-	mux.HandleFunc("/api/stats", s.handleStats)
-	mux.HandleFunc("/api/observations", s.handleObservations)
-	mux.HandleFunc("/api/observations/", s.handleObservation)
-	mux.HandleFunc("/api/projects", s.handleProjects)
-	mux.HandleFunc("/api/tags", s.handleTags)
-	mux.HandleFunc("/api/search", s.handleSearch)
-	mux.HandleFunc("/api/sync", s.handleSync)
-	mux.HandleFunc("/api/vaults", s.handleVaults)
+	// Dashboard API endpoints (require hook secret — they return observation
+	// content, so they are no less sensitive than the hook write API).
+	mux.HandleFunc("/api/stats", s.requireDashboardAuth(s.handleStats))
+	mux.HandleFunc("/api/observations", s.requireDashboardAuth(s.handleObservations))
+	mux.HandleFunc("/api/observations/", s.requireDashboardAuth(s.handleObservation))
+	mux.HandleFunc("/api/projects", s.requireDashboardAuth(s.handleProjects))
+	mux.HandleFunc("/api/tags", s.requireDashboardAuth(s.handleTags))
+	mux.HandleFunc("/api/search", s.requireDashboardAuth(s.handleSearch))
+	mux.HandleFunc("/api/sync", s.requireDashboardAuth(s.handleSync))
+	mux.HandleFunc("/api/vaults", s.requireDashboardAuth(s.handleVaults))
 
-	// Analytics API endpoints
-	mux.HandleFunc("/api/analytics/activity-heatmap", s.handleActivityHeatmap)
-	mux.HandleFunc("/api/analytics/activity-by-hour", s.handleActivityByHour)
-	mux.HandleFunc("/api/analytics/type-trend", s.handleTypeTrend)
-	mux.HandleFunc("/api/analytics/sessions", s.handleAnalyticsSessions)
-	mux.HandleFunc("/api/analytics/file-hotspots", s.handleFileHotspots)
-	mux.HandleFunc("/api/analytics/project-breakdown", s.handleProjectBreakdown)
-	mux.HandleFunc("/api/analytics/concepts", s.handleConcepts)
-	mux.HandleFunc("/api/analytics/summary", s.handleAnalyticsSummary)
-	mux.HandleFunc("/api/analytics/bugfix-ratio", s.handleBugfixRatio)
-	mux.HandleFunc("/api/analytics/devices", s.handleDevices)
+	// Analytics API endpoints (require hook secret)
+	mux.HandleFunc("/api/analytics/activity-heatmap", s.requireDashboardAuth(s.handleActivityHeatmap))
+	mux.HandleFunc("/api/analytics/activity-by-hour", s.requireDashboardAuth(s.handleActivityByHour))
+	mux.HandleFunc("/api/analytics/type-trend", s.requireDashboardAuth(s.handleTypeTrend))
+	mux.HandleFunc("/api/analytics/sessions", s.requireDashboardAuth(s.handleAnalyticsSessions))
+	mux.HandleFunc("/api/analytics/file-hotspots", s.requireDashboardAuth(s.handleFileHotspots))
+	mux.HandleFunc("/api/analytics/project-breakdown", s.requireDashboardAuth(s.handleProjectBreakdown))
+	mux.HandleFunc("/api/analytics/concepts", s.requireDashboardAuth(s.handleConcepts))
+	mux.HandleFunc("/api/analytics/summary", s.requireDashboardAuth(s.handleAnalyticsSummary))
+	mux.HandleFunc("/api/analytics/bugfix-ratio", s.requireDashboardAuth(s.handleBugfixRatio))
+	mux.HandleFunc("/api/analytics/devices", s.requireDashboardAuth(s.handleDevices))
 
-	// MCP API endpoints (3-layer workflow)
-	mux.HandleFunc("/api/mcp/search", s.handleMCPSearch)
-	mux.HandleFunc("/api/mcp/timeline", s.handleMCPTimeline)
-	mux.HandleFunc("/api/mcp/observations", s.handleMCPGetObservations)
+	// MCP API endpoints (3-layer workflow, require hook secret)
+	mux.HandleFunc("/api/mcp/search", s.requireHookAuth(s.handleMCPSearch))
+	mux.HandleFunc("/api/mcp/timeline", s.requireHookAuth(s.handleMCPTimeline))
+	mux.HandleFunc("/api/mcp/observations", s.requireHookAuth(s.handleMCPGetObservations))
 
 	// Static files for dashboard
 	staticFS, _ := fs.Sub(staticFiles, "static")
 	mux.Handle("/", http.FileServer(http.FS(staticFS)))
 
+	return s.requireLoopbackHost(mux)
+}
+
+// Run starts the server and blocks until shutdown
+func (s *Server) Run() error {
+	// Generate shared secret for hook API authentication. This is fatal: the
+	// secret is the only thing standing between the API and every other user
+	// account on this machine, and requireHookAuth rejects everything without
+	// it, so a daemon that cannot write its secret would serve nothing useful
+	// while still holding the port.
+	if err := s.generateHookSecret(); err != nil {
+		return fmt.Errorf("cannot start daemon: %w", err)
+	}
+
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
 	s.httpServer = &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      s.routes(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 	}
@@ -393,7 +619,7 @@ func (s *Server) Run() error {
 
 	log.Printf("[daemon] sine~sync starting on http://%s", addr)
 	log.Printf("[daemon]   Mode: %s", s.mode)
-	log.Printf("[daemon]   Dashboard: http://%s", addr)
+	log.Printf("[daemon]   Dashboard: run 'sinesync dashboard' (listening on %s)", addr)
 	log.Printf("[daemon]   Hook API: http://%s/api/", addr)
 	log.Printf("[daemon]   Cloud sync: adaptive (base: %v, max: 60m)", SyncInterval)
 
@@ -429,8 +655,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	itemCount, storageBytes, _ := s.backend.GetStatus()
 
 	status := map[string]interface{}{
-		"mode":    s.mode,
-		"port":    s.port,
+		"mode": s.mode,
+		"port": s.port,
 		"storage": map[string]interface{}{
 			"observations": itemCount,
 			"bytes":        storageBytes,
@@ -530,13 +756,12 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 
 // isAuthenticated checks if user has valid auth tokens
 func (s *Server) isAuthenticated() bool {
-	const keyringService = "sinesync"
 
 	// Check keyring first (preferred secure storage)
-	if token, err := keyring.Get(keyringService, "token"); err == nil && token != "" {
+	if token, err := keychain.Get("token"); err == nil && token != "" {
 		return true
 	}
-	if deviceToken, err := keyring.Get(keyringService, "deviceToken"); err == nil && deviceToken != "" {
+	if deviceToken, err := keychain.Get("deviceToken"); err == nil && deviceToken != "" {
 		return true
 	}
 
@@ -1829,12 +2054,145 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, observationToMap(*obs))
 
+	case http.MethodPatch:
+		s.handlePatchObservation(w, r, id)
+
 	case http.MethodDelete:
 		s.handleDeleteObservation(w, r, id)
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// patchableFields are the only observation fields a PATCH may touch.
+var patchableFields = map[string]bool{
+	"starred":        true,
+	"archived":       true,
+	"tags":           true,
+	"classification": true,
+}
+
+// validClassifications are the values classification may be set to. The empty
+// string clears it, which is what the UI sends as JSON null.
+var validClassifications = map[string]bool{
+	"":          true,
+	"public":    true,
+	"team":      true,
+	"private":   true,
+	"sensitive": true,
+}
+
+// handlePatchObservation applies a partial update to user-managed metadata.
+// The body is decoded into a presence map so that an absent field and an
+// explicit JSON null are distinguishable — the UI clears classification by
+// sending null, which a plain *string could not tell apart from "not sent".
+//
+// How far an edit made here travels, because it is not obvious and the answer
+// is "less far than you would assume":
+//
+// Upload works. Bumping Core.UpdatedAt below is what makes it work — the push
+// decision compares the last-uploaded timestamp against Core.UpdatedAt, so an
+// edit that left UpdatedAt alone would never be pushed at all. Do not remove
+// that line.
+//
+// Download does not. The pull step only fetches IDs that are absent locally, so
+// a peer that already holds this observation never re-fetches it and keeps its
+// stale copy indefinitely. It will not push over the cloud copy either — it has
+// not modified the record, so its timestamps match and it correctly stays
+// quiet. Propagation is therefore upload-only: star something on one machine
+// and the second machine goes on showing it unstarred.
+//
+// Worse, if that second machine later edits the same observation, it pushes its
+// whole record and the first machine's edit is silently gone. There is no
+// field-level merge and no conflict detection; last writer wins at whole-record
+// granularity.
+//
+// This is a pre-existing property of the sync design, not something PATCH
+// introduced — PATCH is simply the first feature that makes it reachable from
+// the UI. Fixing it means giving the pull step a reason to re-fetch changed
+// records (a manifest that carries UpdatedAt, or per-record versioning) and is
+// deliberately out of scope here.
+func (s *Server) handlePatchObservation(w http.ResponseWriter, r *http.Request, id string) {
+	var updates map[string]json.RawMessage
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&updates); err != nil {
+		http.Error(w, "Invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	for field := range updates {
+		if !patchableFields[field] {
+			http.Error(w, "Field not patchable: "+field, http.StatusBadRequest)
+			return
+		}
+	}
+
+	obs, err := s.backend.GetObservation(id)
+	if err != nil {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	if raw, ok := updates["starred"]; ok {
+		var v *bool
+		if err := json.Unmarshal(raw, &v); err != nil || v == nil {
+			http.Error(w, "starred must be a boolean", http.StatusBadRequest)
+			return
+		}
+		obs.Meta.Starred = *v
+	}
+
+	if raw, ok := updates["archived"]; ok {
+		var v *bool
+		if err := json.Unmarshal(raw, &v); err != nil || v == nil {
+			http.Error(w, "archived must be a boolean", http.StatusBadRequest)
+			return
+		}
+		obs.Meta.Archived = *v
+	}
+
+	if raw, ok := updates["tags"]; ok {
+		// null clears the list; anything but an array of strings is a 400.
+		var v []string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			http.Error(w, "tags must be an array of strings or null", http.StatusBadRequest)
+			return
+		}
+		obs.Meta.Tags = v
+	}
+
+	if raw, ok := updates["classification"]; ok {
+		// null means "clear", which is stored as the empty string.
+		var v *string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			http.Error(w, "classification must be a string or null", http.StatusBadRequest)
+			return
+		}
+		value := ""
+		if v != nil {
+			value = *v
+		}
+		if !validClassifications[value] {
+			http.Error(w, "Invalid classification: "+value, http.StatusBadRequest)
+			return
+		}
+		obs.Meta.Classification = value
+	}
+
+	// SaveObservation persists UpdatedAt verbatim, and the sync push decision
+	// gates on it, so an edit that does not bump it never reaches the cloud.
+	obs.Core.UpdatedAt = time.Now()
+
+	if err := s.backend.SaveObservation(obs); err != nil {
+		http.Error(w, "Failed to update: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.invalidateCache()
+	s.syncManager.NotifyActivity()
+
+	log.Printf("[server] Updated observation %s (fields: %d)", id, len(updates))
+	writeJSON(w, observationToMap(*obs))
 }
 
 func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request, id string) {
@@ -2401,8 +2759,8 @@ func (s *Server) handleTypeTrend(w http.ResponseWriter, r *http.Request) {
 
 	type periodEntry struct {
 		Period    string         `json:"period"`
-		StartDate string        `json:"startDate"`
-		ByType   map[string]int `json:"byType"`
+		StartDate string         `json:"startDate"`
+		ByType    map[string]int `json:"byType"`
 	}
 
 	periodMap := make(map[string]*periodEntry)
@@ -2420,7 +2778,7 @@ func (s *Server) handleTypeTrend(w http.ResponseWriter, r *http.Request) {
 			periodMap[key] = &periodEntry{
 				Period:    key,
 				StartDate: weekStart.Format("2006-01-02"),
-				ByType:   make(map[string]int),
+				ByType:    make(map[string]int),
 			}
 		}
 		periodMap[key].ByType[obs.Core.Type]++
