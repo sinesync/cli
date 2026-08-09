@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/encryption"
@@ -17,13 +18,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// pendingApprovalRequest is a unified type for both device-link and SSO recovery requests.
+// pendingApprovalRequest is a device waiting to be granted encryption keys.
 type pendingApprovalRequest struct {
 	ID            string
 	DeviceName    string
-	Platform      string // device-link only
-	RequestType   string // "device-link" or "sso-recovery"
-	TempPublicKey string // sso-recovery only
+	Platform      string
+	RequestType   string // currently only "sso-recovery"
+	TempPublicKey string // the ephemeral key the bundle is sealed to
 }
 
 var deviceCmd = &cobra.Command{
@@ -44,10 +45,10 @@ device's public key.
 The bundle is sealed with X25519, so it is not readable in transit and the
 server is not given key material it can derive anything from.
 
-One limit worth knowing: the public key you seal to is supplied by the server,
-and there is no fingerprint to compare out of band. A compromised server could
-substitute its own key and read what you approve. Approve requests you are
-expecting, from devices you recognise.`,
+Because the public key you seal to is relayed by the server, both devices show a
+short fingerprint of it. Compare them before approving: if a compromised server
+had substituted its own key in order to read your credentials, the two would not
+match. Decline if they differ.`,
 	RunE: runDeviceApprove,
 }
 
@@ -144,10 +145,33 @@ func fetchPendingSSORecoveries(apiBase, token string) ([]pendingApprovalRequest,
 }
 
 // approveSSORecoveryRequest approves an SSO recovery request using X25519 sealing.
-func approveSSORecoveryRequest(apiBase, token string, req pendingApprovalRequest, bundleJSON []byte) error {
+//
+// The public key sealed to is relayed by the server, so approving blind would
+// let a compromised server substitute its own key and read the credential
+// bundle. The fingerprint check below is the only thing standing between that
+// and the product's zero-knowledge claim, so it is a hard stop rather than a
+// warning: declining costs a retry, approving the wrong key costs the account.
+func approveSSORecoveryRequest(apiBase, token string, req pendingApprovalRequest, bundleJSON []byte, reader *bufio.Reader) (approved bool, err error) {
+	fingerprint, err := crypto.KeyFingerprint(req.TempPublicKey)
+	if err != nil {
+		return false, fmt.Errorf("the requesting device sent an unusable public key (%w); refusing to seal your credentials to it", err)
+	}
+
+	fmt.Printf("Key fingerprint: %s\n", fingerprint)
+	fmt.Println("The device requesting access is showing this same fingerprint.")
+	fmt.Print("Do they match? [y/N]: ")
+	answer, _ := reader.ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+	default:
+		fmt.Println("Declined. Nothing was sent.")
+		fmt.Println("If the fingerprints differ, the request did not come from your device — do not retry until you know why.")
+		return false, nil
+	}
+
 	sealed, err := crypto.X25519Seal(bundleJSON, req.TempPublicKey)
 	if err != nil {
-		return fmt.Errorf("seal bundle: %w", err)
+		return false, fmt.Errorf("seal bundle: %w", err)
 	}
 
 	approveBody, _ := json.Marshal(map[string]string{
@@ -158,7 +182,7 @@ func approveSSORecoveryRequest(apiBase, token string, req pendingApprovalRequest
 		fmt.Sprintf("%s/sso/credentials/recovery/%s", apiBase, req.ID),
 		bytes.NewReader(approveBody))
 	if err != nil {
-		return err
+		return false, err
 	}
 	approveReq.Header.Set("Content-Type", "application/json")
 	approveReq.Header.Set("Authorization", "Bearer "+token)
@@ -166,16 +190,16 @@ func approveSSORecoveryRequest(apiBase, token string, req pendingApprovalRequest
 
 	approveResp, err := authHTTPClient.Do(approveReq)
 	if err != nil {
-		return fmt.Errorf("approve request: %w", err)
+		return false, fmt.Errorf("approve request: %w", err)
 	}
 	defer approveResp.Body.Close()
 
 	if approveResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(approveResp.Body)
-		return fmt.Errorf("approve failed: %d - %s", approveResp.StatusCode, string(body))
+		return false, fmt.Errorf("approve failed: %d - %s", approveResp.StatusCode, string(body))
 	}
 
-	return nil
+	return true, nil
 }
 
 func runDeviceApprove(cmd *cobra.Command, args []string) error {
@@ -190,18 +214,9 @@ func runDeviceApprove(cmd *cobra.Command, args []string) error {
 		token = authCfg.Token
 	}
 
-	// Fetch both types of pending requests
-	var allRequests []pendingApprovalRequest
-
-	ssoReqs, ssoErr := fetchPendingSSORecoveries(apiBase, token)
-	if ssoErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not check SSO recovery requests: %v\n", ssoErr)
-	} else {
-		allRequests = append(allRequests, ssoReqs...)
-	}
-
-	if ssoErr != nil {
-		return fmt.Errorf("failed to fetch pending requests — check your connection and try again")
+	allRequests, err := fetchPendingSSORecoveries(apiBase, token)
+	if err != nil {
+		return fmt.Errorf("failed to fetch pending requests — check your connection and try again: %w", err)
 	}
 
 	if len(allRequests) == 0 {
@@ -247,13 +262,23 @@ func runDeviceApprove(cmd *cobra.Command, args []string) error {
 	}
 
 	// Dispatch based on request type
+	var approved bool
 	switch selected.RequestType {
 	case "sso-recovery":
-		if err := approveSSORecoveryRequest(apiBase, token, selected, bundleJSON); err != nil {
+		approved, err = approveSSORecoveryRequest(apiBase, token, selected, bundleJSON, reader)
+		if err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("unknown request type: %s", selected.RequestType)
+	}
+
+	// A decline is the security-critical outcome. Reporting it as success would
+	// tell the user the suspicious key was rejected AND handled, while the
+	// request stays pending and the other device keeps polling for approval.
+	if !approved {
+		fmt.Println("The request is still pending. It will expire on its own, or you can approve it later.")
+		return nil
 	}
 
 	fmt.Println("✓ Device approved! The new device should now have access.")

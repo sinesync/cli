@@ -904,6 +904,17 @@ func ssoDeviceRecovery(apiBase, token, deviceID string) error {
 		return fmt.Errorf("generate ephemeral keypair: %w", err)
 	}
 
+	// Show the fingerprint of the key we generated. The approving device shows
+	// the fingerprint of the key the SERVER handed it; if a compromised server
+	// substituted its own key to read the bundle, these two strings differ.
+	// Without this there is nothing for the human to check and substitution is
+	// invisible.
+	if fp, fpErr := crypto.KeyFingerprint(tempPubKey); fpErr == nil {
+		fmt.Printf("This device's key fingerprint: %s\n", fp)
+		fmt.Println("Check it matches the one shown when you approve. If it does not, decline.")
+		fmt.Println()
+	}
+
 	hostname := getHostname()
 
 	// 2. POST recovery request

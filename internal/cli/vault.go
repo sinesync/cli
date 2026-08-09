@@ -1825,6 +1825,26 @@ func runVaultConfirm(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Confirming invite for %s to vault %s...\n", targetInvite.InviteeEmail, targetInvite.VaultName)
 
+	// The public key is relayed by the server, so confirming blind would let a
+	// compromised server substitute its own and read the vault key. Show a
+	// fingerprint the invitee can read back over any channel that is not this
+	// one — the email address alone proves nothing, since the server supplies
+	// that too.
+	fingerprint, err := crypto.KeyFingerprint(targetInvite.InviteePublicKey)
+	if err != nil {
+		return fmt.Errorf("the invitee's public key is unusable (%w); refusing to seal the vault key to it", err)
+	}
+	fmt.Printf("Their key fingerprint: %s\n", fingerprint)
+	fmt.Println("Ask them to confirm this matches what 'sinesync vault pending' shows on their machine.")
+	fmt.Print("Continue? [y/N]: ")
+	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+	default:
+		fmt.Println("Cancelled. The vault key was not shared.")
+		return nil
+	}
+
 	// Get the vault key from local storage
 	vaultKey, err := GetVaultKey(targetInvite.VaultID)
 	if err != nil {
@@ -2148,6 +2168,25 @@ func runVaultPending(cmd *cobra.Command, args []string) error {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return err
+	}
+
+	// Printed unconditionally, and before the empty-list return. The owner asks
+	// the invitee to compare this AFTER they accept — by which point the invite
+	// has moved to awaiting_confirmation and no longer appears below, so gating
+	// it on having pending invites would hide it exactly when it is wanted.
+	//
+	// Derived from the private key, never fetched: a malicious server would
+	// report the substituted key's fingerprint to both sides and the comparison
+	// would agree. The private key arrives encrypted to our own master key, so a
+	// substituted one simply would not decrypt.
+	if priv, err := fetchAndDecryptPrivateKey(token); err == nil {
+		if pub, err := crypto.PublicKeyFromPrivate(priv); err == nil {
+			if fp, fpErr := crypto.KeyFingerprint(pub); fpErr == nil {
+				fmt.Printf("Your key fingerprint: %s\n", fp)
+				fmt.Println("Anyone sharing a vault with you should see this same value before they confirm.")
+				fmt.Println()
+			}
+		}
 	}
 
 	if len(result.Invites) == 0 {

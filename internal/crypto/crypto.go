@@ -11,6 +11,7 @@ import (
 	"io"
 
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
 )
 
@@ -378,4 +379,83 @@ func X25519Open(ciphertext string, privateKey string) ([]byte, error) {
 	}
 
 	return plaintext, nil
+}
+
+// Public Key Fingerprints
+
+// fingerprintChars is how many base32 characters a fingerprint carries: 12 gives
+// 60 bits, which is far more than an attacker could grind out during the seconds
+// a human spends comparing two screens, while still being short enough that they
+// actually will.
+const fingerprintChars = 12
+
+// KeyFingerprint returns a short, human-comparable fingerprint of a base64
+// X25519 public key.
+//
+// It exists because both key-transfer paths seal to a public key the SERVER
+// relays — the SSO recovery bundle to a device's temp key, the vault key to an
+// invitee's key — and neither side can otherwise tell a substituted key from a
+// genuine one. Sealing to a key you have not checked means a compromised server
+// can read what you approve, which is precisely the trust the product claims not
+// to need. Comparing this string on both devices closes that gap without any
+// server involvement: the requester derives it from the key it generated, the
+// approver from the key it received, and a substitution makes them differ.
+//
+// The alphabet omits I, O, 0 and 1, so a fingerprint can be read aloud over a
+// phone call without the usual transcription errors.
+func KeyFingerprint(publicKeyB64 string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(publicKeyB64)
+	if err != nil {
+		return "", fmt.Errorf("decode public key: %w", err)
+	}
+	if len(raw) != 32 {
+		return "", fmt.Errorf("public key is %d bytes, want 32", len(raw))
+	}
+
+	sum := sha256.Sum256(raw)
+
+	// Hash first, then encode: fingerprinting the key bytes directly would let
+	// a chosen-key attack aim at the visible prefix rather than the whole key.
+	var out []byte
+	for _, c := range encodeBase32(sum[:]) {
+		if c == '-' {
+			continue
+		}
+		out = append(out, byte(c))
+		if len(out) == fingerprintChars {
+			break
+		}
+	}
+
+	// Grouped in fours so the eye can check them a group at a time.
+	var grouped []byte
+	for i, c := range out {
+		if i > 0 && i%4 == 0 {
+			grouped = append(grouped, '-')
+		}
+		grouped = append(grouped, c)
+	}
+	return string(grouped), nil
+}
+
+// PublicKeyFromPrivate derives the X25519 public key for a base64 private key.
+//
+// Needed so a fingerprint can be computed from something held locally rather
+// than something the server reports. A fingerprint fetched from the server is
+// worth nothing against a malicious one: it would simply report the substituted
+// key's fingerprint to both parties and the comparison would agree.
+func PublicKeyFromPrivate(privateKeyB64 string) (string, error) {
+	priv, err := base64.StdEncoding.DecodeString(privateKeyB64)
+	if err != nil {
+		return "", fmt.Errorf("decode private key: %w", err)
+	}
+	if len(priv) != 32 {
+		return "", fmt.Errorf("private key is %d bytes, want 32", len(priv))
+	}
+
+	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		return "", fmt.Errorf("derive public key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(pub), nil
 }
