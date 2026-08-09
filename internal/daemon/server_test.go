@@ -1,10 +1,17 @@
 package daemon
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/miclip/sinesync/internal/storage"
 )
 
 // hostCase is one Host header and whether strict loopback validation accepts it.
@@ -480,5 +487,458 @@ func TestRequireLoopbackHostUsesServerPort(t *testing.T) {
 		if rec.Code != c.want {
 			t.Errorf("Host %q: got status %d, want %d", c.host, rec.Code, c.want)
 		}
+	}
+}
+
+// --- PATCH /api/observations/{id} ---------------------------------------
+
+// fakeBackend is an in-memory storage.StorageBackend for handler tests. It
+// deep-copies on the way in and on the way out, exactly as the real SQLCipher
+// backend does by virtue of serializing through a database. Without that, a
+// handler that mutated the value it read from GetObservation would appear to
+// persist even if it never called SaveObservation, and the partial-update
+// assertions below would pass vacuously.
+type fakeBackend struct {
+	mu    sync.Mutex
+	obs   map[string]storage.Observation
+	saves int
+}
+
+func newFakeBackend(seed ...storage.Observation) *fakeBackend {
+	b := &fakeBackend{obs: make(map[string]storage.Observation)}
+	for _, o := range seed {
+		b.obs[o.ID] = cloneObservation(o)
+	}
+	return b
+}
+
+// cloneObservation copies the fields these tests mutate deeply enough that the
+// caller and the store never share backing arrays.
+func cloneObservation(o storage.Observation) storage.Observation {
+	c := o
+	if o.Meta.Tags != nil {
+		c.Meta.Tags = append([]string(nil), o.Meta.Tags...)
+	}
+	return c
+}
+
+func (b *fakeBackend) SaveObservation(obs *storage.Observation) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.obs[obs.ID] = cloneObservation(*obs)
+	b.saves++
+	return nil
+}
+
+func (b *fakeBackend) GetObservation(id string) (*storage.Observation, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	o, ok := b.obs[id]
+	if !ok {
+		return nil, fmt.Errorf("not found: %s", id)
+	}
+	c := cloneObservation(o)
+	return &c, nil
+}
+
+func (b *fakeBackend) ListObservations() ([]storage.Observation, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]storage.Observation, 0, len(b.obs))
+	for _, o := range b.obs {
+		out = append(out, cloneObservation(o))
+	}
+	return out, nil
+}
+
+func (b *fakeBackend) DeleteObservation(id string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.obs, id)
+	return nil
+}
+
+func (b *fakeBackend) ObservationExists(obs *storage.Observation) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.obs[obs.ID]
+	return ok, nil
+}
+
+func (b *fakeBackend) ExistsBySource(adapter, machine, sourceID string) (bool, error) {
+	return false, nil
+}
+
+func (b *fakeBackend) GetStatus() (int, int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.obs), 0, nil
+}
+
+func (b *fakeBackend) Close() error { return nil }
+
+// stored reads an observation straight out of the fake, bypassing the handler.
+func (b *fakeBackend) stored(t *testing.T, id string) storage.Observation {
+	t.Helper()
+	o, err := b.GetObservation(id)
+	if err != nil {
+		t.Fatalf("observation %s missing from backend: %v", id, err)
+	}
+	return *o
+}
+
+const patchTestSecret = "s3cret"
+
+// seedTime is a fixed past timestamp so "UpdatedAt advanced" is unambiguous.
+var seedTime = time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+
+// seedObservation is the fixture for the patch tests: every patchable field is
+// non-zero, so a handler that clobbers an untouched field is visible.
+func seedObservation() storage.Observation {
+	return storage.Observation{
+		ID: "obs-1",
+		Core: storage.Core{
+			Title:     "seed title",
+			Summary:   "seed summary",
+			Type:      "discovery",
+			Project:   "sinesync",
+			CreatedAt: seedTime,
+			UpdatedAt: seedTime,
+		},
+		Meta: storage.Meta{
+			Tags:           []string{"seed-tag"},
+			Classification: "private",
+			Starred:        true,
+			Archived:       true,
+		},
+		Source: storage.Source{Adapter: "sinesync"},
+	}
+}
+
+// newPatchTestServer builds a Server complete enough to serve PATCH: a backend,
+// a syncManager whose activityChan can absorb a NotifyActivity without blocking
+// (NotifyActivity has no nil-receiver guard, so a nil syncManager would panic),
+// and a long cache TTL so cache staleness is caused only by the handler.
+func newPatchTestServer(seed ...storage.Observation) (*Server, http.Handler, *fakeBackend) {
+	backend := newFakeBackend(seed...)
+	s := &Server{
+		port:        testPort,
+		mode:        "standalone",
+		hookSecret:  patchTestSecret,
+		backend:     backend,
+		syncManager: &SyncManager{activityChan: make(chan struct{}, 1)},
+		obsCacheTTL: time.Hour,
+	}
+	return s, s.routes(), backend
+}
+
+// patchRequest issues a real HTTP round trip through the full route stack —
+// loopback guard, auth wrapper, mux, handler.
+func patchRequest(t *testing.T, h http.Handler, id, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPatch, "/api/observations/"+id, strings.NewReader(body))
+	req.Host = "127.0.0.1:5741"
+	req.Header.Set("X-Hook-Secret", patchTestSecret)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestPatchObservationUIActions covers the four bodies app.js actually sends,
+// including the combined save whose `classification: null` means "clear it".
+func TestPatchObservationUIActions(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		check func(t *testing.T, got storage.Observation)
+	}{
+		{
+			name: "star",
+			body: `{"starred":true}`,
+			check: func(t *testing.T, got storage.Observation) {
+				if !got.Meta.Starred {
+					t.Error("starred = false, want true")
+				}
+			},
+		},
+		{
+			name: "unstar",
+			body: `{"starred":false}`,
+			check: func(t *testing.T, got storage.Observation) {
+				if got.Meta.Starred {
+					t.Error("starred = true, want false")
+				}
+			},
+		},
+		{
+			name: "archive",
+			body: `{"archived":true}`,
+			check: func(t *testing.T, got storage.Observation) {
+				if !got.Meta.Archived {
+					t.Error("archived = false, want true")
+				}
+			},
+		},
+		{
+			name: "unarchive",
+			body: `{"archived":false}`,
+			check: func(t *testing.T, got storage.Observation) {
+				if got.Meta.Archived {
+					t.Error("archived = true, want false")
+				}
+			},
+		},
+		{
+			name: "add tag",
+			body: `{"tags":["a"]}`,
+			check: func(t *testing.T, got storage.Observation) {
+				if len(got.Meta.Tags) != 1 || got.Meta.Tags[0] != "a" {
+					t.Errorf("tags = %v, want [a]", got.Meta.Tags)
+				}
+			},
+		},
+		{
+			// The btn-save body: tags plus an explicit null classification,
+			// which is how the dashboard's "None" option clears the field.
+			name: "combined save clearing classification",
+			body: `{"tags":["seed-tag","b"],"classification":null}`,
+			check: func(t *testing.T, got storage.Observation) {
+				if got.Meta.Classification != "" {
+					t.Errorf("classification = %q, want it cleared to \"\"", got.Meta.Classification)
+				}
+				if len(got.Meta.Tags) != 2 || got.Meta.Tags[0] != "seed-tag" || got.Meta.Tags[1] != "b" {
+					t.Errorf("tags = %v, want [seed-tag b]", got.Meta.Tags)
+				}
+			},
+		},
+		{
+			name: "set classification",
+			body: `{"classification":"team"}`,
+			check: func(t *testing.T, got storage.Observation) {
+				if got.Meta.Classification != "team" {
+					t.Errorf("classification = %q, want team", got.Meta.Classification)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, h, backend := newPatchTestServer(seedObservation())
+
+			rec := patchRequest(t, h, "obs-1", tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("PATCH %s: got status %d (%s), want 200", tc.body, rec.Code, rec.Body.String())
+			}
+			tc.check(t, backend.stored(t, "obs-1"))
+		})
+	}
+}
+
+// TestPatchObservationLeavesOtherFieldsUnchanged is the property the whole
+// load-read-merge-save shape exists to protect: patching one field must not
+// reset the three it did not mention, nor any core content.
+func TestPatchObservationLeavesOtherFieldsUnchanged(t *testing.T) {
+	// Each case names the field it patches; every other patchable field must
+	// still hold its seeded value afterwards.
+	cases := []struct {
+		field string
+		body  string
+	}{
+		{"starred", `{"starred":false}`},
+		{"archived", `{"archived":false}`},
+		{"tags", `{"tags":["replaced"]}`},
+		{"classification", `{"classification":"public"}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			seed := seedObservation()
+			_, h, backend := newPatchTestServer(seed)
+
+			rec := patchRequest(t, h, "obs-1", tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("got status %d (%s), want 200", rec.Code, rec.Body.String())
+			}
+			got := backend.stored(t, "obs-1")
+
+			if tc.field != "starred" && got.Meta.Starred != seed.Meta.Starred {
+				t.Errorf("patching %s changed starred: %v, want %v", tc.field, got.Meta.Starred, seed.Meta.Starred)
+			}
+			if tc.field != "archived" && got.Meta.Archived != seed.Meta.Archived {
+				t.Errorf("patching %s changed archived: %v, want %v", tc.field, got.Meta.Archived, seed.Meta.Archived)
+			}
+			if tc.field != "tags" && !reflect.DeepEqual(got.Meta.Tags, seed.Meta.Tags) {
+				t.Errorf("patching %s changed tags: %v, want %v", tc.field, got.Meta.Tags, seed.Meta.Tags)
+			}
+			if tc.field != "classification" && got.Meta.Classification != seed.Meta.Classification {
+				t.Errorf("patching %s changed classification: %q, want %q", tc.field, got.Meta.Classification, seed.Meta.Classification)
+			}
+
+			// Core content is not patchable at all and must survive untouched.
+			if got.Core.Title != seed.Core.Title || got.Core.Summary != seed.Core.Summary ||
+				got.Core.Type != seed.Core.Type || got.Core.Project != seed.Core.Project {
+				t.Errorf("patching %s altered core content: %+v", tc.field, got.Core)
+			}
+			if !got.Core.CreatedAt.Equal(seed.Core.CreatedAt) {
+				t.Errorf("patching %s altered createdAt: %v, want %v", tc.field, got.Core.CreatedAt, seed.Core.CreatedAt)
+			}
+		})
+	}
+}
+
+// TestPatchObservationRejectsUnknownFields verifies the allowlist. A rejected
+// body must leave the stored observation exactly as it was — no partial
+// application of the fields that happened to be valid.
+func TestPatchObservationRejectsUnknownFields(t *testing.T) {
+	bodies := []string{
+		`{"notes":"injected"}`,
+		`{"vaultId":"other-vault"}`,
+		`{"title":"rewritten"}`,
+		`{"id":"obs-2"}`,
+		`{"core":{"title":"rewritten"}}`,
+		// A valid field alongside an invalid one must still reject wholesale.
+		`{"starred":false,"notes":"injected"}`,
+		`{"tags":["a"],"embedding":{"vector":[1]}}`,
+	}
+
+	for _, body := range bodies {
+		t.Run(body, func(t *testing.T) {
+			seed := seedObservation()
+			_, h, backend := newPatchTestServer(seed)
+
+			rec := patchRequest(t, h, "obs-1", body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("PATCH %s: got status %d (%s), want 400", body, rec.Code, rec.Body.String())
+			}
+
+			got := backend.stored(t, "obs-1")
+			if !reflect.DeepEqual(got, seed) {
+				t.Errorf("rejected PATCH still modified the observation:\n got %+v\nwant %+v", got, seed)
+			}
+			if backend.saves != 0 {
+				t.Errorf("rejected PATCH called SaveObservation %d times, want 0", backend.saves)
+			}
+		})
+	}
+}
+
+// TestPatchObservationInvalidValues covers well-named fields carrying values
+// the handler cannot honour.
+func TestPatchObservationInvalidValues(t *testing.T) {
+	bodies := []string{
+		`{"starred":"yes"}`,
+		`{"starred":null}`,
+		`{"archived":1}`,
+		`{"tags":"a"}`,
+		`{"tags":[1]}`,
+		`{"classification":"top-secret"}`,
+		`{"classification":5}`,
+		`not json at all`,
+	}
+
+	for _, body := range bodies {
+		t.Run(body, func(t *testing.T) {
+			seed := seedObservation()
+			_, h, backend := newPatchTestServer(seed)
+
+			rec := patchRequest(t, h, "obs-1", body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("PATCH %s: got status %d (%s), want 400", body, rec.Code, rec.Body.String())
+			}
+			if got := backend.stored(t, "obs-1"); !reflect.DeepEqual(got, seed) {
+				t.Errorf("rejected PATCH modified the observation:\n got %+v\nwant %+v", got, seed)
+			}
+		})
+	}
+}
+
+// TestPatchObservationInvalidatesCache pins the reason invalidateCache is
+// called: the dashboard's list view is served from obsCache, so a PATCH that
+// does not invalidate leaves the UI showing the pre-edit value for a full TTL.
+// The TTL here is an hour, so only the invalidation can refresh it.
+func TestPatchObservationInvalidatesCache(t *testing.T) {
+	s, h, _ := newPatchTestServer(seedObservation())
+
+	// Prime the cache with the pre-edit value.
+	before := s.getObservations()
+	if len(before) != 1 {
+		t.Fatalf("primed cache has %d observations, want 1", len(before))
+	}
+	if !before[0].Meta.Starred {
+		t.Fatalf("primed cache: starred = false, want the seeded true")
+	}
+
+	rec := patchRequest(t, h, "obs-1", `{"starred":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got status %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+
+	after := s.getObservations()
+	if len(after) != 1 {
+		t.Fatalf("cache has %d observations after PATCH, want 1", len(after))
+	}
+	if after[0].Meta.Starred {
+		t.Error("cache still reports starred = true after PATCH; invalidateCache did not run")
+	}
+}
+
+// TestPatchObservationAdvancesUpdatedAt guards the sync path. SaveObservation
+// persists Core.UpdatedAt verbatim and the push decision gates on comparing it
+// to the last-uploaded timestamp, so a PATCH that leaves UpdatedAt alone is
+// never pushed to the cloud — the edit would be silently local-only forever.
+func TestPatchObservationAdvancesUpdatedAt(t *testing.T) {
+	_, h, backend := newPatchTestServer(seedObservation())
+
+	start := time.Now()
+	rec := patchRequest(t, h, "obs-1", `{"starred":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got status %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+
+	got := backend.stored(t, "obs-1").Core.UpdatedAt
+	if !got.After(seedTime) {
+		t.Errorf("updatedAt = %v, want strictly after the seeded %v", got, seedTime)
+	}
+	if got.Before(start) {
+		t.Errorf("updatedAt = %v, want at or after the request time %v", got, start)
+	}
+}
+
+// TestObservationRejectsUnsupportedMethods keeps the default arm of the method
+// switch covered: adding PATCH must not have opened the route to everything.
+func TestObservationRejectsUnsupportedMethods(t *testing.T) {
+	for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			_, h, backend := newPatchTestServer(seedObservation())
+
+			req := httptest.NewRequest(method, "/api/observations/obs-1", strings.NewReader(`{"starred":false}`))
+			req.Host = "127.0.0.1:5741"
+			req.Header.Set("X-Hook-Secret", patchTestSecret)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("%s: got status %d (%s), want 405", method, rec.Code, rec.Body.String())
+			}
+			if backend.saves != 0 {
+				t.Errorf("%s called SaveObservation %d times, want 0", method, backend.saves)
+			}
+		})
+	}
+}
+
+// TestPatchUnknownObservationIsNotFound checks the load step fails cleanly and
+// does not create an observation as a side effect.
+func TestPatchUnknownObservationIsNotFound(t *testing.T) {
+	_, h, backend := newPatchTestServer(seedObservation())
+
+	rec := patchRequest(t, h, "does-not-exist", `{"starred":true}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got status %d (%s), want 404", rec.Code, rec.Body.String())
+	}
+	if backend.saves != 0 {
+		t.Errorf("PATCH of a missing id called SaveObservation %d times, want 0", backend.saves)
 	}
 }

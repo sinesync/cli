@@ -363,12 +363,23 @@ func (s *Server) requireHookAuth(next http.HandlerFunc) http.HandlerFunc {
 // to destroy data, so DELETE requires the hook secret, which in practice means
 // the CLI.
 //
-// Note for anyone widening this: the dashboard's star, archive and tag controls
-// issue PATCH to /api/observations/{id}, and handleObservation implements only
-// GET and DELETE — PATCH falls through to 405 and app.js swallows it, so those
-// controls silently do nothing today. They are not a reason this wrapper admits
-// non-GET methods, and they are not evidence that session tokens can already
-// mutate observations.
+// PATCH on /api/observations/{id} is deliberately on the permitted side. The
+// dashboard's star, archive, tag and classification controls issue it, and a
+// session token can reach it. That is a considered position, not an oversight:
+// every field PATCH can touch is inert display metadata. Starred and Archived
+// are read only by the stats counters, by the archived filter on the list view,
+// and by the JSON projection; Classification is read only by a stats counter
+// and that same projection. Nothing in the tree branches on a classification
+// value — "sensitive" in particular gates no encryption, no vault routing and
+// no access decision. So the worst a raced session token achieves is scrambling
+// metadata the user can re-edit from the same UI, which is categorically unlike
+// DELETE destroying data on every device with nothing to undo it.
+//
+// Note for anyone widening this further: that argument is about these four
+// fields specifically, not about PATCH as a method. Admitting a field that some
+// other code path actually branches on — a vault ID, a notes body that gets
+// indexed, anything consulted for an access decision — would need this
+// reasoning redone, not merely extended.
 func (s *Server) requireDashboardAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.hookSecret == "" {
@@ -2043,12 +2054,145 @@ func (s *Server) handleObservation(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, observationToMap(*obs))
 
+	case http.MethodPatch:
+		s.handlePatchObservation(w, r, id)
+
 	case http.MethodDelete:
 		s.handleDeleteObservation(w, r, id)
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// patchableFields are the only observation fields a PATCH may touch.
+var patchableFields = map[string]bool{
+	"starred":        true,
+	"archived":       true,
+	"tags":           true,
+	"classification": true,
+}
+
+// validClassifications are the values classification may be set to. The empty
+// string clears it, which is what the UI sends as JSON null.
+var validClassifications = map[string]bool{
+	"":          true,
+	"public":    true,
+	"team":      true,
+	"private":   true,
+	"sensitive": true,
+}
+
+// handlePatchObservation applies a partial update to user-managed metadata.
+// The body is decoded into a presence map so that an absent field and an
+// explicit JSON null are distinguishable — the UI clears classification by
+// sending null, which a plain *string could not tell apart from "not sent".
+//
+// How far an edit made here travels, because it is not obvious and the answer
+// is "less far than you would assume":
+//
+// Upload works. Bumping Core.UpdatedAt below is what makes it work — the push
+// decision compares the last-uploaded timestamp against Core.UpdatedAt, so an
+// edit that left UpdatedAt alone would never be pushed at all. Do not remove
+// that line.
+//
+// Download does not. The pull step only fetches IDs that are absent locally, so
+// a peer that already holds this observation never re-fetches it and keeps its
+// stale copy indefinitely. It will not push over the cloud copy either — it has
+// not modified the record, so its timestamps match and it correctly stays
+// quiet. Propagation is therefore upload-only: star something on one machine
+// and the second machine goes on showing it unstarred.
+//
+// Worse, if that second machine later edits the same observation, it pushes its
+// whole record and the first machine's edit is silently gone. There is no
+// field-level merge and no conflict detection; last writer wins at whole-record
+// granularity.
+//
+// This is a pre-existing property of the sync design, not something PATCH
+// introduced — PATCH is simply the first feature that makes it reachable from
+// the UI. Fixing it means giving the pull step a reason to re-fetch changed
+// records (a manifest that carries UpdatedAt, or per-record versioning) and is
+// deliberately out of scope here.
+func (s *Server) handlePatchObservation(w http.ResponseWriter, r *http.Request, id string) {
+	var updates map[string]json.RawMessage
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&updates); err != nil {
+		http.Error(w, "Invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	for field := range updates {
+		if !patchableFields[field] {
+			http.Error(w, "Field not patchable: "+field, http.StatusBadRequest)
+			return
+		}
+	}
+
+	obs, err := s.backend.GetObservation(id)
+	if err != nil {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	if raw, ok := updates["starred"]; ok {
+		var v *bool
+		if err := json.Unmarshal(raw, &v); err != nil || v == nil {
+			http.Error(w, "starred must be a boolean", http.StatusBadRequest)
+			return
+		}
+		obs.Meta.Starred = *v
+	}
+
+	if raw, ok := updates["archived"]; ok {
+		var v *bool
+		if err := json.Unmarshal(raw, &v); err != nil || v == nil {
+			http.Error(w, "archived must be a boolean", http.StatusBadRequest)
+			return
+		}
+		obs.Meta.Archived = *v
+	}
+
+	if raw, ok := updates["tags"]; ok {
+		// null clears the list; anything but an array of strings is a 400.
+		var v []string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			http.Error(w, "tags must be an array of strings or null", http.StatusBadRequest)
+			return
+		}
+		obs.Meta.Tags = v
+	}
+
+	if raw, ok := updates["classification"]; ok {
+		// null means "clear", which is stored as the empty string.
+		var v *string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			http.Error(w, "classification must be a string or null", http.StatusBadRequest)
+			return
+		}
+		value := ""
+		if v != nil {
+			value = *v
+		}
+		if !validClassifications[value] {
+			http.Error(w, "Invalid classification: "+value, http.StatusBadRequest)
+			return
+		}
+		obs.Meta.Classification = value
+	}
+
+	// SaveObservation persists UpdatedAt verbatim, and the sync push decision
+	// gates on it, so an edit that does not bump it never reaches the cloud.
+	obs.Core.UpdatedAt = time.Now()
+
+	if err := s.backend.SaveObservation(obs); err != nil {
+		http.Error(w, "Failed to update: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.invalidateCache()
+	s.syncManager.NotifyActivity()
+
+	log.Printf("[server] Updated observation %s (fields: %d)", id, len(updates))
+	writeJSON(w, observationToMap(*obs))
 }
 
 func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request, id string) {
