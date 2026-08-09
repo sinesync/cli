@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/miclip/sinesync/internal/crypto"
 	"github.com/miclip/sinesync/internal/encryption"
@@ -157,15 +156,25 @@ func approveSSORecoveryRequest(apiBase, token string, req pendingApprovalRequest
 		return false, fmt.Errorf("the requesting device sent an unusable public key (%w); refusing to seal your credentials to it", err)
 	}
 
-	fmt.Printf("Key fingerprint: %s\n", fingerprint)
-	fmt.Println("The device requesting access is showing this same fingerprint.")
-	fmt.Print("Do they match? [y/N]: ")
-	answer, _ := reader.ReadString('\n')
-	switch strings.ToLower(strings.TrimSpace(answer)) {
-	case "y", "yes":
-	default:
-		fmt.Println("Declined. Nothing was sent.")
-		fmt.Println("If the fingerprints differ, the request did not come from your device — do not retry until you know why.")
+	// Not shown before the prompt. The requesting device prints the fingerprint
+	// of the key it generated; this one holds the fingerprint of the key the
+	// SERVER relayed. Displaying ours first would let the operator type it back
+	// off this screen and never look at the other device at all.
+	ok := confirmFingerprintByTyping(os.Stdout, reader, fingerprint, fingerprintPromptText{
+		intro: []string{
+			fmt.Sprintf("The device '%s' is showing a key fingerprint on its own screen.", req.DeviceName),
+			"Read it from that device — not from anything this one has told you.",
+			"Then type it in exactly. Case, dashes and spaces do not matter.",
+		},
+		label:    "Fingerprint shown on the requesting device: ",
+		declined: []string{"Declined. Nothing was sent."},
+		mismatchHint: []string{
+			"A fingerprint that does not match means the key this server relayed is not the one",
+			"that device generated — the request did not come from your device, or not intact.",
+			"Do not retry until you know why.",
+		},
+	})
+	if !ok {
 		return false, nil
 	}
 

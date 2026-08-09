@@ -904,16 +904,24 @@ func ssoDeviceRecovery(apiBase, token, deviceID string) error {
 		return fmt.Errorf("generate ephemeral keypair: %w", err)
 	}
 
-	// Show the fingerprint of the key we generated. The approving device shows
-	// the fingerprint of the key the SERVER handed it; if a compromised server
-	// substituted its own key to read the bundle, these two strings differ.
-	// Without this there is nothing for the human to check and substitution is
-	// invisible.
-	if fp, fpErr := crypto.KeyFingerprint(tempPubKey); fpErr == nil {
-		fmt.Printf("This device's key fingerprint: %s\n", fp)
-		fmt.Println("Check it matches the one shown when you approve. If it does not, decline.")
-		fmt.Println()
+	// Show the fingerprint of the key we generated. The approving device holds
+	// the fingerprint of the key the SERVER handed it, and its operator is
+	// asked to type in what this screen says; if a compromised server
+	// substituted its own key to read the bundle, the two do not match.
+	//
+	// A hard stop rather than a skipped line. This is the display half of that
+	// check, so printing nothing leaves the approver with nothing to type and
+	// turns their side into a formality — the failure the invitee's side used
+	// to have. Nothing has been sent to the server at this point, so the cost
+	// of stopping is a re-run.
+	fp, err := crypto.KeyFingerprint(tempPubKey)
+	if err != nil {
+		return fmt.Errorf("could not fingerprint the key this device just generated (%w); "+
+			"the approving device would have nothing to check against, so recovery cannot continue safely", err)
 	}
+	fmt.Printf("This device's key fingerprint: %s\n", fp)
+	fmt.Println("Read it out to whoever approves this on your existing device — they will be asked to type it in.")
+	fmt.Println()
 
 	hostname := getHostname()
 
