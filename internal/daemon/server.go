@@ -187,9 +187,14 @@ func initSQLCipherBackend() *storage.SQLCipherStorage {
 				"Start the daemon from a desktop session, or set SINESYNC_NO_KEYCHAIN=1 to acknowledge this deliberately.",
 			)
 		} else {
+			// Off darwin this is the only branch a missing keychain can reach:
+			// there is no availability probe outside macOS, so an unreachable
+			// Secret Service arrives here as its own D-Bus error rather than as
+			// ErrNoKeychainSession. The remedy has to cover that case too.
 			warnPlaintext(
 				fmt.Sprintf("The database key could not be resolved: %v", err),
-				"This is unexpected in a desktop session — check the keychain entry for 'sinesync'.",
+				"In a desktop session this is unexpected — check the keychain entry for 'sinesync'. "+
+					"On a machine with no keyring service at all, set SINESYNC_NO_KEYCHAIN=1 to acknowledge this deliberately.",
 			)
 		}
 		return nil

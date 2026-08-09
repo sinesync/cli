@@ -18,6 +18,15 @@ import (
 
 const serviceName = "sinesync"
 
+// securityBinary is the macOS keychain CLI, addressed absolutely.
+//
+// It must stay identical to go-keyring's own execPathKeychain
+// (keyring_darwin.go), which is unexported and so cannot be referenced from
+// here. The two are a matched pair: if this probe and the library disagree
+// about which binary they reach, the guard can veto a keychain the library
+// would have used.
+const securityBinary = "/usr/bin/security"
+
 // ErrNoKeychainSession means this process cannot reach an OS keychain without
 // blocking on user interaction, so no keychain call was attempted.
 //
@@ -40,12 +49,21 @@ var ErrNoKeychainSession = errors.New("no keychain session available in this con
 var usable = sync.OnceValue(detectUsable)
 
 func detectUsable() bool {
+	return detectUsableFor(runtime.GOOS)
+}
+
+// detectUsableFor takes the platform as a parameter rather than reading
+// runtime.GOOS so that every platform's answer is reachable from a test on any
+// machine. The previous Linux branch was a hand-rolled D-Bus discovery that no
+// one working on a Mac could execute, which is part of how it drifted from the
+// library it was standing in front of.
+func detectUsableFor(goos string) bool {
 	// Explicit override, for containers and anywhere the heuristics are wrong.
 	if v := os.Getenv("SINESYNC_NO_KEYCHAIN"); v != "" && v != "0" {
 		return false
 	}
 
-	switch runtime.GOOS {
+	switch goos {
 	case "darwin":
 		// Probe the exact condition that fails: no DEFAULT keychain. That is
 		// what raised the modal — the process had a perfectly good GUI session,
@@ -57,7 +75,17 @@ func detectUsable() bool {
 		// trick. It is a subprocess with no GUI connection, so the same
 		// condition comes back as text on stderr and a non-zero result instead
 		// of a panel offering to reset the user's keychain.
-		out, err := exec.Command("security", "default-keychain").CombinedOutput()
+		//
+		// By absolute path, not through $PATH. go-keyring reaches this same
+		// binary as a hard-coded /usr/bin/security, so a $PATH that cannot
+		// resolve `security` — empty, minimal, a daemon's inherited environment,
+		// or one whose leading empty element makes Go refuse the match as a
+		// relative path — would make this guard answer "no keychain" while the
+		// library it stands in front of would have succeeded. That disagreement
+		// is not a safe default: it drops the daemon to plaintext JSON and hides
+		// the existing encrypted database. Fixing the path also means the probe
+		// can never execute a `security` someone left in the working directory.
+		out, err := exec.Command(securityBinary, "default-keychain").CombinedOutput()
 		if err != nil {
 			return false
 		}
@@ -83,30 +111,47 @@ func detectUsable() bool {
 		// silently drops the user to plaintext storage — the worse outcome.
 		return true
 
-	case "linux":
-		// go-keyring talks to the Secret Service over the session bus. Without
-		// one it errors rather than prompting, so this is about a clear message
-		// instead of an obscure D-Bus failure.
-		if os.Getenv("DBUS_SESSION_BUS_ADDRESS") != "" {
-			return true
-		}
-		// Mirror godbus's own discovery, not a subset of it. A false negative
-		// here is not a harmless "be careful" — it disables encryption and hides
-		// an existing database, so the check must not be stricter than the
-		// library it is standing in front of.
-		uid := os.Getuid()
-		for _, path := range []string{
-			fmt.Sprintf("/run/user/%d/bus", uid),
-			fmt.Sprintf("/run/user/%d/dbus-session", uid),
-		} {
-			if _, err := os.Stat(path); err == nil {
-				return true
-			}
-		}
-		return false
-
 	default:
-		// Windows Credential Manager works without a desktop session.
+		// Every other platform, Linux included: do not gate. Answer "usable" and
+		// let go-keyring report its own failure.
+		//
+		// This guard exists for one specific thing — the macOS panel whose
+		// primary button erases the user's secrets, which must be avoided BEFORE
+		// calling because it is not an error you can handle afterwards. Nothing
+		// off darwin has that property. Windows Credential Manager works without
+		// a desktop session, and Linux Secret Service returns a D-Bus error
+		// rather than prompting. With no modal to prevent, a Linux gate had no
+		// upside left, only the cost of being wrong.
+		//
+		// And it was wrong in the destructive direction. It tried to predict
+		// whether godbus could find a session bus, but godbus's real discovery
+		// (dbus/v5@v5.1.0 conn.go:76 getSessionBusAddress, conn_other.go) is
+		// strictly more permissive than any reimplementation can be: go-keyring
+		// reaches it via dbus.SessionBus, which passes autolaunch=true, so when
+		// no address and no /run/user socket exist it still runs `dbus-launch`
+		// and can succeed. A probe cannot mirror that — replicating it means
+		// spawning a daemon to answer a question, which is not something a probe
+		// gets to do. So the check was permanently a subset of the library, and
+		// a subset here means false negatives: the daemon silently drops to
+		// plaintext JSON and an existing encrypted database becomes invisible.
+		// (godbus is also more forgiving on stat: conn_other.go:89 accepts any
+		// error that is not IsNotExist, where the guard demanded err == nil.)
+		//
+		// The two properties the guard was carrying are not lost:
+		//
+		//   - Nothing invents a replacement key. GetOrCreateDBKey only generates
+		//     one on keyring.ErrNotFound, and go-keyring's Linux backend
+		//     produces that solely from an empty search result
+		//     (keyring_unix.go:73). A bus that cannot be reached surfaces the
+		//     dbus error verbatim (keyring_unix.go:104-108), which is not
+		//     ErrNotFound, so the create path stays closed.
+		//   - SINESYNC_NO_KEYCHAIN still short-circuits above, so anyone who
+		//     needs to opt a headless box out entirely still can.
+		//
+		// What is given up is a tailored message: a headless Linux daemon now
+		// reports the raw D-Bus error instead of ErrNoKeychainSession. Both land
+		// in the same plaintext-fallback warning, and a real error beats a
+		// guess about one.
 		return true
 	}
 }
