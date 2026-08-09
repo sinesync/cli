@@ -21,7 +21,6 @@ import (
 type pendingApprovalRequest struct {
 	ID            string
 	DeviceName    string
-	Platform      string
 	RequestType   string // currently only "sso-recovery"
 	TempPublicKey string // the ephemeral key the bundle is sealed to
 }
@@ -239,19 +238,11 @@ func runDeviceApprove(cmd *cobra.Command, args []string) error {
 	var selected pendingApprovalRequest
 	if len(allRequests) == 1 {
 		selected = allRequests[0]
-		if selected.Platform != "" {
-			fmt.Printf("New device '%s' (%s) is requesting access recovery].\n", selected.DeviceName, selected.Platform)
-		} else {
-			fmt.Printf("New device '%s' is requesting access recovery].\n", selected.DeviceName)
-		}
+		fmt.Printf("New device '%s' is requesting access to your credentials.\n", selected.DeviceName)
 	} else {
 		fmt.Printf("%d devices are requesting access:\n", len(allRequests))
 		for i, r := range allRequests {
-			if r.Platform != "" {
-				fmt.Printf("  %d. '%s' (%s) recovery]\n", i+1, r.DeviceName, r.Platform)
-			} else {
-				fmt.Printf("  %d. '%s' recovery]\n", i+1, r.DeviceName)
-			}
+			fmt.Printf("  %d. '%s'\n", i+1, r.DeviceName)
 		}
 		fmt.Print("\nSelect device number: ")
 		var choice int
