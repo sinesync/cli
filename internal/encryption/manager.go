@@ -489,8 +489,3 @@ func DecryptCredentialBundle(encrypted, deviceKey []byte) ([]byte, error) {
 func EncryptForDeviceLink(bundle, transferKey []byte) ([]byte, error) {
 	return crypto.Encrypt(bundle, transferKey, AADDeviceLink)
 }
-
-// DecryptForDeviceLink decrypts a credential bundle encrypted for device linking
-func DecryptForDeviceLink(encrypted, transferKey []byte) ([]byte, error) {
-	return crypto.Decrypt(encrypted, transferKey, AADDeviceLink)
-}

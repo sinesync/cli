@@ -56,9 +56,6 @@ type VaultInvite struct {
 	InviteType              string `json:"inviteType"`
 	EncryptedVaultKey       string `json:"encryptedVaultKey"`
 	EncryptedTempPrivateKey string `json:"encryptedTempPrivateKey,omitempty"`
-	TempPublicKey           string `json:"tempPublicKey,omitempty"`
-	EmailCodeHash           string `json:"emailCodeHash,omitempty"`
-	InviteCodeHash          string `json:"inviteCodeHash,omitempty"`
 	Salt                    string `json:"salt,omitempty"`
 	Status                  string `json:"status"`
 	ExpiresAt               string `json:"expiresAt"`

@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -392,58 +391,4 @@ func X25519Open(ciphertext string, privateKey string) ([]byte, error) {
 	}
 
 	return plaintext, nil
-}
-
-// Invite Code Functions
-
-// GenerateInviteCode generates a random invite code with high entropy.
-// Format: XXXX-XXXX-XXXX-XXXX (16 characters = ~80 bits from base32)
-// Uses 12 bytes of random data for 96 bits of input entropy.
-func GenerateInviteCode() (string, error) {
-	// Generate 12 random bytes (96 bits of entropy)
-	bytes := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, bytes); err != nil {
-		return "", err
-	}
-
-	// Encode to base32
-	encoded := encodeBase32(bytes)
-	// Remove dashes and take first 16 characters
-	clean := ""
-	for _, c := range encoded {
-		if c != '-' {
-			clean += string(c)
-		}
-		if len(clean) >= 16 {
-			break
-		}
-	}
-
-	// Ensure we have exactly 16 characters
-	if len(clean) < 16 {
-		return "", fmt.Errorf("failed to generate invite code: insufficient characters")
-	}
-
-	// Format as XXXX-XXXX-XXXX-XXXX
-	return clean[:4] + "-" + clean[4:8] + "-" + clean[8:12] + "-" + clean[12:16], nil
-}
-
-// DeriveInviteKey derives an encryption key from email code and invite code
-// Uses Argon2id with the provided salt
-func DeriveInviteKey(emailCode, inviteCode string, salt []byte) []byte {
-	combined := emailCode + ":" + inviteCode
-	return argon2.IDKey(
-		[]byte(combined),
-		salt,
-		argonTime,
-		argonMemory,
-		argonThreads,
-		keyLength,
-	)
-}
-
-// HashCode computes SHA256 hash of a code and returns hex-encoded string
-func HashCode(code string) string {
-	h := sha256.Sum256([]byte(code))
-	return hex.EncodeToString(h[:])
 }

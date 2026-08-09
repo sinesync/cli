@@ -111,11 +111,6 @@ func detectUsable() bool {
 	}
 }
 
-// Available reports whether keychain operations will be attempted at all.
-// Unlike the old IsAvailable it performs no keychain call, so it is safe to ask
-// from any context.
-func Available() bool { return usable() }
-
 // Get, Set and Delete are the ONLY paths from this codebase to the OS keychain.
 //
 // They exist because a guard is worth nothing if callers can route around it,
@@ -146,22 +141,6 @@ func Delete(key string) error {
 		return ErrNoKeychainSession
 	}
 	return keyring.Delete(serviceName, key)
-}
-
-// IsAvailable checks if the keychain is available and reachable.
-//
-// Deprecated: prefer Available. This still performs a real keychain read, so it
-// must only be called once Available reports true.
-func IsAvailable() bool {
-	if !usable() {
-		return false
-	}
-	_, err := keyring.Get(serviceName, "test")
-	// If error is not "not found", keychain is not available
-	if err != nil && err != keyring.ErrNotFound {
-		return false
-	}
-	return true
 }
 
 // Session token
