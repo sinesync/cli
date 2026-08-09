@@ -356,28 +356,45 @@ func TestEmbeddedReleaseKeyIsUsableOrAbsent(t *testing.T) {
 	}
 }
 
-// TestCommittedPlaceholderRefusesUpdates pins today's committed state. While
-// sinesync-release-ed25519.pub is a placeholder, it must resolve to
-// errNoReleaseKey — the loud refusal — and never to a usable key.
+// TestCommittedReleaseKeyIsReal pins today's committed state: a real key is
+// present and update verification is live.
 //
-// The guard matters: if this file were ever replaced by something that parsed
-// as a key without actually being the release key, updates would verify against
-// the wrong root of trust. Skipping instead of failing when a real key is
-// present keeps this test correct after provisioning.
-func TestCommittedPlaceholderRefusesUpdates(t *testing.T) {
+// This replaces TestCommittedPlaceholderRefusesUpdates, which asserted the
+// opposite and skipped itself once a real key landed. Having served its purpose
+// it was pinning nothing, and the direction that now needs pinning is the
+// reverse: a revert of sinesync-release-ed25519.pub to a placeholder or an empty
+// file would disable updates for every client, and
+// TestEmbeddedReleaseKeyIsUsableOrAbsent deliberately passes in both states, so
+// without this test that regression ships with a green suite.
+//
+// Scope, honestly: this proves a usable key is committed, NOT that it is the
+// right key. Any 32 bytes parse. Substituting a well-formed key whose private
+// half an attacker holds is not detectable here — it is caught at release time
+// by tools/signrelease, which compares this file against the CI signing secret
+// and fails the release if they disagree.
+func TestCommittedReleaseKeyIsReal(t *testing.T) {
 	raw := strings.TrimSpace(sinesync.ReleaseEd25519PublicKey)
 
-	if !strings.HasPrefix(raw, placeholderKeyPrefix) {
-		t.Skip("a real release key is committed; placeholder assertions no longer apply")
+	if raw == "" {
+		t.Fatal("sinesync-release-ed25519.pub is empty — every client would refuse to update")
+	}
+	if strings.HasPrefix(raw, placeholderKeyPrefix) {
+		t.Fatalf("sinesync-release-ed25519.pub reverted to a placeholder (%q) — "+
+			"every client would refuse to update", raw)
 	}
 
-	if _, err := releasePublicKey(); !errors.Is(err, errNoReleaseKey) {
-		t.Fatalf("committed placeholder resolved to %v, want %v — this build would "+
-			"install updates without verifying them", err, errNoReleaseKey)
+	key, err := releasePublicKey()
+	if err != nil {
+		t.Fatalf("committed key does not resolve to a usable key: %v", err)
+	}
+	if len(key) != ed25519.PublicKeySize {
+		t.Fatalf("committed key is %d bytes, want %d", len(key), ed25519.PublicKeySize)
 	}
 
-	// A placeholder must not contain anything resembling key material.
-	if _, err := base64.StdEncoding.DecodeString(strings.SplitN(raw, "\n", 2)[0]); err == nil {
-		t.Error("placeholder's first line decodes as base64; it should be obviously not a key")
+	// The committed file must be exactly the key material: one line of standard
+	// base64, nothing else. tools/signrelease reads the same file and applies the
+	// same expectation.
+	if _, err := base64.StdEncoding.DecodeString(raw); err != nil {
+		t.Errorf("committed key is not a single line of standard base64: %v", err)
 	}
 }

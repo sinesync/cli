@@ -13,6 +13,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -350,13 +351,24 @@ func (s *Server) requireHookAuth(next http.HandlerFunc) http.HandlerFunc {
 // capture, summarize, shutdown, ticket minting and the MCP routes all stay on
 // requireHookAuth — and, within them, cannot DELETE.
 //
-// DELETE is carved out specifically. The dashboard genuinely mutates (it tags
-// via PATCH and triggers sync via POST), so restricting sessions to GET would
-// break real features for no security gain: those operations are recoverable.
-// Deleting an observation is not — handleObservation also marks it for cloud
-// deletion, so it propagates to every device. A credential that can be raced
-// out of argv must not be able to destroy data. Deleting from the dashboard
-// therefore requires the hook secret, which in practice means the CLI.
+// DELETE is carved out specifically, rather than sessions being restricted to
+// GET, because the dashboard has a real non-GET feature that works: the sync
+// button POSTs to /api/sync, which is behind this wrapper and triggers a sync.
+// A GET-only session token would break it for no security gain — the worst a
+// spurious sync does is cost bandwidth, and it is repeatable.
+//
+// Deleting an observation is the opposite. handleDeleteObservation also marks
+// it for cloud deletion, so it propagates to every device and there is nothing
+// to undo it with. A credential that can be raced out of argv must not be able
+// to destroy data, so DELETE requires the hook secret, which in practice means
+// the CLI.
+//
+// Note for anyone widening this: the dashboard's star, archive and tag controls
+// issue PATCH to /api/observations/{id}, and handleObservation implements only
+// GET and DELETE — PATCH falls through to 405 and app.js swallows it, so those
+// controls silently do nothing today. They are not a reason this wrapper admits
+// non-GET methods, and they are not evidence that session tokens can already
+// mutate observations.
 func (s *Server) requireDashboardAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.hookSecret == "" {
@@ -424,10 +436,43 @@ func hostAllowed(host string, port int) bool {
 	return false
 }
 
+// absoluteFormTarget reports whether a request arrived with a non origin-form
+// request-target — an absolute-form target (`GET http://host/path HTTP/1.1`) or
+// the authority-form CONNECT uses.
+//
+// This has to be checked separately from hostAllowed because of how net/http
+// populates the request. Per RFC 7230 §5.3.2 the authority in an absolute-form
+// target takes precedence over the Host header, so net/http sets r.Host from the
+// target's authority and then DELETES the Host header from r.Header entirely.
+// The handler cannot see the header at all: r.Header.Get("Host") is "".
+//
+// So a request-target naming the loopback authority satisfies hostAllowed no
+// matter what the Host header said, and the header the guard exists to police is
+// unreachable by the time the guard runs:
+//
+//	GET http://127.0.0.1:5741/api/health HTTP/1.1
+//	Host: evil.example.com          <- discarded; r.Host is 127.0.0.1:5741
+//
+// Cross-checking the two against each other is therefore not implementable in an
+// http.Handler, and rejecting is the option that remains. It costs nothing: an
+// absolute-form target is what a client sends to a PROXY, and this is an origin
+// server on loopback. No browser emits one for an origin request, and no
+// legitimate client of this daemon has a reason to.
+func absoluteFormTarget(u *url.URL) bool {
+	return u.IsAbs() || u.Host != ""
+}
+
 // requireLoopbackHost wraps h so every request — API, status, and static alike —
-// is rejected with 403 unless its Host header names this server's loopback address.
+// is rejected with 403 unless it is an ordinary origin-form request whose Host
+// header names this server's loopback address.
 func (s *Server) requireLoopbackHost(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Before hostAllowed, not after: for a proxy-form target r.Host is
+		// attacker-chosen and would sail through the check below.
+		if absoluteFormTarget(r.URL) {
+			http.Error(w, "forbidden: absolute-form request-target", http.StatusForbidden)
+			return
+		}
 		if !hostAllowed(r.Host, s.port) {
 			http.Error(w, "forbidden: invalid Host header", http.StatusForbidden)
 			return

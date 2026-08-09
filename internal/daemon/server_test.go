@@ -3,6 +3,7 @@ package daemon
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
@@ -72,6 +73,113 @@ func TestHostAllowed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := hostAllowed(tc.host, testPort); got != tc.allow {
 				t.Errorf("hostAllowed(%q, %d) = %v, want %v", tc.host, testPort, got, tc.allow)
+			}
+		})
+	}
+}
+
+// targetCases cover absoluteFormTarget, the second half of the guard. The Host
+// header cannot be cross-checked against an absolute-form target — net/http
+// deletes the header once it takes the authority from the target — so a
+// non-origin-form target is rejected outright.
+var targetCases = []struct {
+	name   string
+	rawURL string
+	isAbs  bool
+}{
+	// Origin-form: the only shape a legitimate client sends to this server.
+	{"origin form root", "/", false},
+	{"origin form path", "/api/health", false},
+	{"origin form with query", "/api/search?q=secret", false},
+
+	// Scheme-relative targets are NOT absolute-form on the wire. url.Parse would
+	// read "//evil.example.com/x" as an authority, but a server parses the
+	// request-target with url.ParseRequestURI, which without a scheme leaves
+	// Host empty and treats the whole thing as a path. r.Host therefore still
+	// comes from the Host header and the loopback check still governs them.
+	{"scheme relative path", "//api/health", false},
+	{"scheme relative authority-looking", "//evil.example.com/api/health", false},
+
+	// Absolute-form: proxy shape. The authority here overrides the Host header,
+	// so accepting it would let any Host value through the loopback check.
+	{"absolute loopback authority", "http://127.0.0.1:5741/api/health", true},
+	{"absolute evil authority", "http://evil.example.com/api/health", true},
+	{"absolute https", "https://127.0.0.1:5741/", true},
+	{"absolute no path", "http://127.0.0.1:5741", true},
+}
+
+func TestAbsoluteFormTarget(t *testing.T) {
+	for _, tc := range targetCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// ParseRequestURI, not Parse: this is the function net/http uses on
+			// the request-target, and the two disagree on "//host/path".
+			u, err := url.ParseRequestURI(tc.rawURL)
+			if err != nil {
+				t.Fatalf("parse %q: %v", tc.rawURL, err)
+			}
+			if got := absoluteFormTarget(u); got != tc.isAbs {
+				t.Errorf("absoluteFormTarget(%q) = %v, want %v", tc.rawURL, got, tc.isAbs)
+			}
+		})
+	}
+}
+
+// TestRequireLoopbackHostRejectsAbsoluteForm drives the whole guard: an
+// absolute-form target must be refused even when its authority is the exact
+// loopback address the server listens on, because that authority is what r.Host
+// is built from and is therefore attacker-controlled.
+func TestRequireLoopbackHostRejectsAbsoluteForm(t *testing.T) {
+	s := &Server{port: testPort, mode: "standalone"}
+	h := s.routes()
+
+	for _, tc := range targetCases {
+		if !tc.isAbs {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.rawURL, nil)
+			// The value a legitimate request would carry. It must not rescue
+			// an absolute-form target.
+			req.Host = "127.0.0.1:5741"
+			rec := httptest.NewRecorder()
+
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("target %q with valid Host: got status %d, want 403", tc.rawURL, rec.Code)
+			}
+		})
+	}
+}
+
+// TestSchemeRelativeTargetsStillGovernedByHost pins the other half: targets that
+// merely look like an authority are ordinary paths on the wire, so they must
+// still be judged on their Host header — rejected with a hostile one, admitted
+// with a valid one. If a future net/url ever started filling in Host for these,
+// the first case would fail rather than silently become a bypass.
+func TestSchemeRelativeTargetsStillGovernedByHost(t *testing.T) {
+	s := &Server{port: testPort, mode: "standalone"}
+	h := s.routes()
+
+	for _, tc := range targetCases {
+		if tc.isAbs {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			bad := httptest.NewRequest(http.MethodGet, tc.rawURL, nil)
+			bad.Host = "evil.example.com"
+			recBad := httptest.NewRecorder()
+			h.ServeHTTP(recBad, bad)
+			if recBad.Code != http.StatusForbidden {
+				t.Errorf("target %q with hostile Host: got %d, want 403", tc.rawURL, recBad.Code)
+			}
+
+			good := httptest.NewRequest(http.MethodGet, tc.rawURL, nil)
+			good.Host = "127.0.0.1:5741"
+			recGood := httptest.NewRecorder()
+			h.ServeHTTP(recGood, good)
+			if recGood.Code == http.StatusForbidden {
+				t.Errorf("target %q with valid Host: got 403, want it to reach the mux", tc.rawURL)
 			}
 		})
 	}

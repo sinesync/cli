@@ -418,13 +418,19 @@ jobs:
       # install, so a missing key must fail the release rather than quietly
       # produce an unusable one — the mistake would otherwise only surface on
       # user machines.
+      #
+      # signrelease is handed the PATH of the public key and reads it itself.
+      # Passing the key material via "$(... < file)" meant a missing or renamed
+      # file became an empty argument, which the tool read as "nothing to check
+      # against" — the release got signed by whatever seed was in the
+      # environment and the step still exited 0. No command substitution here.
       - name: Ed25519 sign checksums
         env:
           RELEASE_ED25519_PRIVATE_KEY: ${{ secrets.RELEASE_ED25519_PRIVATE_KEY }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           go run ./tools/signrelease \
-            --expect-pubkey "$(tr -d '\n' < sinesync-release-ed25519.pub)" \
+            --pubkey-file sinesync-release-ed25519.pub \
             "upload/${VERSION}/checksums.txt" \
             > "upload/${VERSION}/checksums.txt.sig"
           echo "Ed25519 signature written:"
