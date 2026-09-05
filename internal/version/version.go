@@ -7,9 +7,9 @@ import (
 )
 
 var (
-	mu      sync.RWMutex
-	ver     = "dev"
-	commit  = "unknown"
+	mu     sync.RWMutex
+	ver    = "dev"
+	commit = "unknown"
 )
 
 // Set stores the version and commit from build-time ldflags.
@@ -32,6 +32,22 @@ func Full() string {
 	mu.RLock()
 	defer mu.RUnlock()
 	return ver + " (" + commit + ")"
+}
+
+// IsPrerelease reports whether v carries a semver prerelease suffix
+// (v1.2.3-rc.1). Compare deliberately ignores that suffix when ordering, which
+// makes a prerelease compare EQUAL to its stable version and therefore newer
+// than anything before it — so a stable client offered v0.3.0-rc.1 would take
+// it. Callers deciding whether to INSTALL must ask this separately from asking
+// which version is newer.
+func IsPrerelease(v string) bool {
+	v = strings.TrimPrefix(v, "v")
+	core, suffix, found := strings.Cut(v, "-")
+	if !found || suffix == "" {
+		return false
+	}
+	_, ok := parseSemver(core)
+	return ok
 }
 
 // Compare compares two semver strings. Returns -1 if a < b, 0 if equal, 1 if a > b.

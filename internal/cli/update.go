@@ -35,6 +35,9 @@ var semverPattern = regexp.MustCompile(`^v?\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$`)
 
 const releaseBucketURL = "https://storage.googleapis.com/sinesync-releases"
 
+// allowPrerelease opts this invocation into installing a prerelease.
+var allowPrerelease bool
+
 var updateCmd = &cobra.Command{
 	Use:   "update",
 	Short: "Update sinesync to the latest version",
@@ -47,6 +50,8 @@ after if it was running.`,
 }
 
 func init() {
+	updateCmd.Flags().BoolVar(&allowPrerelease, "prerelease", false,
+		"install a prerelease if one is published as latest")
 	rootCmd.AddCommand(updateCmd)
 }
 
@@ -62,6 +67,24 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 
 	if !version.IsNewer(latest, current) {
 		fmt.Println("Already up to date.")
+		return nil
+	}
+
+	// Refuse to move a stable install onto a prerelease.
+	//
+	// version.Compare ignores the prerelease suffix, so v0.3.0-rc.1 orders as
+	// NEWER than v0.2.0. Release CI never points `latest` at a prerelease, but
+	// `latest` is an unsigned pointer in the same bucket as the artifacts: an
+	// attacker who can write there cannot forge a binary (the Ed25519 signature
+	// stops that) but CAN repoint `latest` at a real, correctly signed
+	// prerelease and have every stable install take it. Signature verification
+	// succeeds, because the build is genuine — it is simply not one anyone was
+	// meant to run.
+	//
+	// Opting in means already running a prerelease, or asking for one.
+	if version.IsPrerelease(latest) && !allowPrerelease && !version.IsPrerelease(current) {
+		fmt.Printf("Latest published version %s is a prerelease; staying on %s.\n", latest, current)
+		fmt.Println("Use --prerelease to install it deliberately.")
 		return nil
 	}
 
@@ -149,7 +172,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	restartDaemon := func() {
 		if wasRunning {
 			fmt.Println("Restarting daemon...")
-			if err := daemon.Start(daemon.DefaultPort); err != nil {
+			if _, err := daemon.Start(daemon.DefaultPort); err != nil {
 				fmt.Printf("Warning: failed to restart daemon: %v\n", err)
 			}
 		}
