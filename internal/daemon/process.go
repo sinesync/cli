@@ -75,7 +75,7 @@ func ReadPIDInfo() (*PIDInfo, error) {
 
 // WritePIDInfo writes the PID file
 func WritePIDInfo(info *PIDInfo) error {
-	if err := os.MkdirAll(config.DataDir(), 0755); err != nil {
+	if err := os.MkdirAll(config.DataDir(), 0700); err != nil {
 		return err
 	}
 
@@ -148,7 +148,7 @@ func Start(port int) (notices []string, err error) {
 	}
 
 	// Ensure log directory exists
-	if err := os.MkdirAll(LogDir(), 0755); err != nil {
+	if err := os.MkdirAll(LogDir(), 0700); err != nil {
 		return nil, fmt.Errorf("failed to create log directory: %w", err)
 	}
 
@@ -256,7 +256,7 @@ func startupFailure(reason string, tail logTail) error {
 // spawnDaemon launches `daemon run` detached, with stdout and stderr pointed at
 // today's log, and waits for it to answer on the health endpoint.
 func spawnDaemon(exePath string, port int) ([]string, error) {
-	if err := os.MkdirAll(LogDir(), 0755); err != nil {
+	if err := os.MkdirAll(LogDir(), 0700); err != nil {
 		return nil, fmt.Errorf("failed to create log directory: %w", err)
 	}
 	logFile := TodayLogFile()
@@ -265,7 +265,18 @@ func spawnDaemon(exePath string, port int) ([]string, error) {
 	// this attempt.
 	tail := markLogTail(logFile)
 
-	logFd, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	// 0600, not 0644. The daemon log is not diagnostics-only: it records
+	// observation ids, types and project names on every capture, transcript
+	// paths on subagent stops, and the titles of deleted observations. On a
+	// shared machine that is a readable index of what the user works on, which
+	// is the same disclosure the encrypted database exists to prevent.
+	//
+	// MkdirAll and OpenFile only apply their mode when CREATING, so an install
+	// made by an earlier build keeps 0755/0644 forever unless the modes are
+	// forced. tightenLogPermissions does that on every start.
+	tightenLogPermissions(LogDir(), logFile)
+
+	logFd, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open log file: %w", err)
 	}
@@ -446,4 +457,18 @@ func formatUptime(startedAt time.Time) string {
 		return fmt.Sprintf("%dm %ds", minutes, seconds)
 	}
 	return fmt.Sprintf("%ds", seconds)
+}
+
+// tightenLogPermissions forces owner-only modes onto the log directory and
+// today's log file, including ones an earlier build created world-readable.
+// Failures are deliberately ignored: a daemon that will not start because it
+// could not chmod its own log is a worse outcome than a readable log, and the
+// files it goes on to create will carry the right mode regardless.
+func tightenLogPermissions(dir, file string) {
+	if info, err := os.Stat(dir); err == nil && info.Mode().Perm() != 0o700 {
+		_ = os.Chmod(dir, 0o700)
+	}
+	if info, err := os.Stat(file); err == nil && info.Mode().Perm() != 0o600 {
+		_ = os.Chmod(file, 0o600)
+	}
 }

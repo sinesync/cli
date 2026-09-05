@@ -46,9 +46,9 @@ type Backend struct {
 	SecretKey string `json:"secretKey,omitempty"` // reference to keychain, not actual key
 
 	// Azure options
-	Container     string `json:"container,omitempty"`
-	AccountName   string `json:"accountName,omitempty"`
-	AccountKey    string `json:"accountKey,omitempty"` // reference to keychain
+	Container   string `json:"container,omitempty"`
+	AccountName string `json:"accountName,omitempty"`
+	AccountKey  string `json:"accountKey,omitempty"` // reference to keychain
 
 	// Local/self-hosted options
 	Path string `json:"path,omitempty"` // for local file backend
@@ -139,7 +139,10 @@ func DefaultConfig() *Config {
 // Save saves the configuration to disk
 func Save(cfg *Config) error {
 	// Ensure directory exists
-	if err := os.MkdirAll(ConfigDir(), 0755); err != nil {
+	// 0700: this directory holds the daemon logs, the hook secret and the
+	// encrypted database. Nothing in it is meant to be readable by other
+	// accounts on the machine.
+	if err := os.MkdirAll(ConfigDir(), 0700); err != nil {
 		return err
 	}
 
