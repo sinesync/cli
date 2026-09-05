@@ -13,10 +13,10 @@ import (
 
 	toml "github.com/pelletier/go-toml/v2"
 
-	"github.com/miclip/sinesync/internal/adapters"
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/daemon"
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/adapters"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/daemon"
+	"github.com/sinesync/cli/internal/storage"
 	"github.com/spf13/cobra"
 )
 

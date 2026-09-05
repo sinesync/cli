@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/miclip/sinesync/internal/config"
+	"github.com/sinesync/cli/internal/config"
 )
 
 // Checksum calculates SHA256 checksum of data

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/miclip/sinesync/internal/config"
+	"github.com/sinesync/cli/internal/config"
 )
 
 // Custom endpoints are how this backend reaches MinIO, Cloudflare R2 and

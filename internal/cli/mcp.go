@@ -1,7 +1,7 @@
 package cli
 
 import (
-	"github.com/miclip/sinesync/internal/mcp"
+	"github.com/sinesync/cli/internal/mcp"
 	"github.com/spf13/cobra"
 )
 

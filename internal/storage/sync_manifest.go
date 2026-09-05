@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/miclip/sinesync/internal/config"
+	"github.com/sinesync/cli/internal/config"
 )
 
 // LocalUploadState tracks what we've uploaded for an item

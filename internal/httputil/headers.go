@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/miclip/sinesync/internal/version"
+	"github.com/sinesync/cli/internal/version"
 )
 
 // SetClientHeaders adds standard sinesync client headers to an outgoing request.

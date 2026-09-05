@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/miclip/sinesync/internal/doctor"
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/doctor"
+	"github.com/sinesync/cli/internal/storage"
 	_ "github.com/mutecomm/go-sqlcipher/v4"
 )
 

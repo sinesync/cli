@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/miclip/sinesync/internal/adapters"
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/daemon"
-	"github.com/miclip/sinesync/internal/embeddings"
-	"github.com/miclip/sinesync/internal/storage"
-	"github.com/miclip/sinesync/internal/version"
+	"github.com/sinesync/cli/internal/adapters"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/daemon"
+	"github.com/sinesync/cli/internal/embeddings"
+	"github.com/sinesync/cli/internal/storage"
+	"github.com/sinesync/cli/internal/version"
 	"github.com/spf13/cobra"
 )
 

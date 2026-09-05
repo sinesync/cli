@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/daemon"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/daemon"
 	"github.com/spf13/cobra"
 )
 

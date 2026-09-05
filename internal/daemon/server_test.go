@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/storage"
 )
 
 // hostCase is one Host header and whether strict loopback validation accepts it.

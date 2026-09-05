@@ -25,11 +25,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/miclip/sinesync/internal/adapters"
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/embeddings"
-	"github.com/miclip/sinesync/internal/keychain"
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/adapters"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/embeddings"
+	"github.com/sinesync/cli/internal/keychain"
+	"github.com/sinesync/cli/internal/storage"
 )
 
 //go:embed static/*

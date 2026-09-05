@@ -8,8 +8,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/miclip/sinesync/internal/browser"
-	"github.com/miclip/sinesync/internal/daemon"
+	"github.com/sinesync/cli/internal/browser"
+	"github.com/sinesync/cli/internal/daemon"
 	"github.com/spf13/cobra"
 )
 

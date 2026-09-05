@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/miclip/sinesync/internal/crypto"
-	"github.com/miclip/sinesync/internal/keychain"
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/crypto"
+	"github.com/sinesync/cli/internal/keychain"
+	"github.com/sinesync/cli/internal/storage"
 )
 
 const (

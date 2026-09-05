@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/miclip/sinesync/internal/cli"
+	"github.com/sinesync/cli/internal/cli"
 )
 
 // Set via -ldflags at build time

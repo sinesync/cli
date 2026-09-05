@@ -11,11 +11,11 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/miclip/sinesync/internal/adapters"
-	"github.com/miclip/sinesync/internal/embeddings"
-	"github.com/miclip/sinesync/internal/encryption"
-	"github.com/miclip/sinesync/internal/httputil"
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/adapters"
+	"github.com/sinesync/cli/internal/embeddings"
+	"github.com/sinesync/cli/internal/encryption"
+	"github.com/sinesync/cli/internal/httputil"
+	"github.com/sinesync/cli/internal/storage"
 	"github.com/spf13/cobra"
 )
 

@@ -7,8 +7,8 @@ import (
 	"log"
 	"path/filepath"
 
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/keychain"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/keychain"
 )
 
 // ResolveBackend opens the SQLCipher storage backend for CLI use.

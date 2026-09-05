@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	sinesync "github.com/miclip/sinesync"
+	sinesync "github.com/sinesync/cli"
 )
 
 // Release verification is a two-gate chain: an Ed25519 signature over

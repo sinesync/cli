@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/miclip/sinesync/internal/config"
+	"github.com/sinesync/cli/internal/config"
 )
 
 // Metadata represents item metadata stored alongside encrypted content

@@ -3,8 +3,8 @@ package adapters
 import (
 	"context"
 
-	"github.com/miclip/sinesync/internal/doctor"
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/doctor"
+	"github.com/sinesync/cli/internal/storage"
 )
 
 // Adapter defines the interface for memory tool integrations

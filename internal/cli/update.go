@@ -23,10 +23,10 @@ import (
 
 	"regexp"
 
-	sinesync "github.com/miclip/sinesync"
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/daemon"
-	"github.com/miclip/sinesync/internal/version"
+	sinesync "github.com/sinesync/cli"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/daemon"
+	"github.com/sinesync/cli/internal/version"
 	"github.com/spf13/cobra"
 )
 

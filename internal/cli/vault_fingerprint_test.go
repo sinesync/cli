@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/miclip/sinesync/internal/encryption"
+	"github.com/sinesync/cli/internal/encryption"
 )
 
 // The invitee's fingerprint is the only thing anchoring an invite to a key the

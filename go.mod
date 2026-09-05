@@ -1,4 +1,4 @@
-module github.com/miclip/sinesync
+module github.com/sinesync/cli
 
 go 1.25.12
 

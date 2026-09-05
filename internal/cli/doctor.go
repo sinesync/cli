@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/miclip/sinesync/internal/adapters"
-	"github.com/miclip/sinesync/internal/doctor"
+	"github.com/sinesync/cli/internal/adapters"
+	"github.com/sinesync/cli/internal/doctor"
 	"github.com/spf13/cobra"
 )
 

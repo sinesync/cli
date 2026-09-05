@@ -12,7 +12,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/miclip/sinesync/internal/config"
+	"github.com/sinesync/cli/internal/config"
 )
 
 // S3Provider stores data in S3-compatible storage

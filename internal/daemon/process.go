@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/miclip/sinesync/internal/config"
+	"github.com/sinesync/cli/internal/config"
 )
 
 // findProcess wraps os.FindProcess for use by platform-specific code

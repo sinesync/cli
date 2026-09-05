@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/miclip/sinesync/internal/daemon"
+	"github.com/sinesync/cli/internal/daemon"
 	"github.com/spf13/cobra"
 )
 

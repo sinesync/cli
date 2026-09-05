@@ -11,11 +11,12 @@ sine~sync provides secure cloud synchronization with zero-knowledge encryption. 
 | Directory | Description |
 |-----------|-------------|
 | `cmd/` | CLI entrypoint |
-| `internal/` | Go CLI, daemon, and MCP server |
-| `backend/` | GCP Cloud Run API (TypeScript) |
-| `web/` | sinesync.ai website |
-| `shared/` | Common types and utilities |
-| `infra/` | Infrastructure as code (Terraform) |
+| `internal/` | CLI, daemon, and MCP server |
+| `tools/` | Release signing utilities |
+| `docs/` | Design notes and plans |
+
+The hosted sync service and the sinesync.ai site live in separate repositories;
+this repository is the client.
 
 ## Quick Start
 

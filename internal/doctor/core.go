@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/storage"
 )
 
 // CoreChecks returns the built-in checks for sinesync local storage

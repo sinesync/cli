@@ -13,9 +13,9 @@ import (
 
 	toml "github.com/pelletier/go-toml/v2"
 
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/daemon"
-	"github.com/miclip/sinesync/internal/keychain"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/daemon"
+	"github.com/sinesync/cli/internal/keychain"
 	"github.com/spf13/cobra"
 )
 

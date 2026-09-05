@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/miclip/sinesync/internal/adapters"
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/daemon"
+	"github.com/sinesync/cli/internal/adapters"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/daemon"
 )
 
 // JSON-RPC structures

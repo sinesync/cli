@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/miclip/sinesync/internal/httputil"
+	"github.com/sinesync/cli/internal/httputil"
 )
 
 // OrgInfo represents the user's organization info from /users/org-info

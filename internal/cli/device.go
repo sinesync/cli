@@ -10,10 +10,10 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/miclip/sinesync/internal/crypto"
-	"github.com/miclip/sinesync/internal/encryption"
-	"github.com/miclip/sinesync/internal/httputil"
-	"github.com/miclip/sinesync/internal/keychain"
+	"github.com/sinesync/cli/internal/crypto"
+	"github.com/sinesync/cli/internal/encryption"
+	"github.com/sinesync/cli/internal/httputil"
+	"github.com/sinesync/cli/internal/keychain"
 	"github.com/spf13/cobra"
 )
 

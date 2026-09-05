@@ -12,10 +12,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/miclip/sinesync/internal/config"
-	"github.com/miclip/sinesync/internal/crypto"
-	"github.com/miclip/sinesync/internal/httputil"
-	"github.com/miclip/sinesync/internal/storage"
+	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/crypto"
+	"github.com/sinesync/cli/internal/httputil"
+	"github.com/sinesync/cli/internal/storage"
 )
 
 const (
