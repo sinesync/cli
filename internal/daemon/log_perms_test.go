@@ -6,84 +6,102 @@ import (
 	"testing"
 )
 
-// The daemon log records observation ids, project names and transcript paths,
-// so its mode is a privacy control rather than housekeeping. MkdirAll and
-// OpenFile apply their mode only when CREATING, which means an install made by
-// an earlier build keeps 0755/0644 forever unless something forces it — so the
-// upgrade case is the one worth testing, not the fresh one.
-func TestTightenLogPermissionsFixesAnOlderInstall(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "logs")
-	if err := os.MkdirAll(dir, 0o755); err != nil { // as an older build left it
-		t.Fatalf("setup: %v", err)
-	}
-	file := filepath.Join(dir, "daemon-2026-01-01.log")
-	if err := os.WriteFile(file, []byte("[capture] Saved: id=x project=secret\n"), 0o644); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-
-	tightenLogPermissions(dir, file)
-
-	di, err := os.Stat(dir)
-	if err != nil {
-		t.Fatalf("stat dir: %v", err)
-	}
-	if got := di.Mode().Perm(); got != 0o700 {
-		t.Errorf("log directory mode = %04o, want 0700", got)
-	}
-
-	fi, err := os.Stat(file)
-	if err != nil {
-		t.Fatalf("stat file: %v", err)
-	}
-	if got := fi.Mode().Perm(); got != 0o600 {
-		t.Errorf("log file mode = %04o, want 0600", got)
-	}
-}
-
-// It must not fail when there is nothing to tighten: a first start has no log
-// yet, and a daemon that refused to start because it could not chmod a file
-// that does not exist would be a worse bug than the one being fixed.
-func TestTightenLogPermissionsToleratesMissingPaths(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "absent")
-	tightenLogPermissions(missing, filepath.Join(missing, "daemon.log"))
-}
-
-// The first version of tightenLogPermissions used os.Stat and os.Chmod, which
-// follow symlinks — so a symlinked log directory meant daemon startup chmod'd
-// whatever it pointed at. A privacy fix that rewrites modes elsewhere on the
-// filesystem is worse than the readable log it closes.
-func TestTightenLogPermissionsRefusesSymlinks(t *testing.T) {
+// The previous version of this test used an unrelated linkDir and linkFile, so
+// it never exercised the pairing that actually occurs: a symlinked log
+// DIRECTORY with the real log name inside it. That let a bug through where the
+// directory check refused the link and the very next operation traversed it.
+// This version uses dir/<name>, the way the daemon does.
+func TestOpenDaemonLogRefusesSymlinkedDirectory(t *testing.T) {
 	root := t.TempDir()
-
-	// A directory the daemon does not own, at a mode it must not change.
-	victimDir := filepath.Join(root, "someone-elses-dir")
-	if err := os.MkdirAll(victimDir, 0o755); err != nil {
+	victim := filepath.Join(root, "not-ours")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	victimFile := filepath.Join(root, "someone-elses-file")
-	if err := os.WriteFile(victimFile, []byte("not ours\n"), 0o644); err != nil {
+	inside := filepath.Join(victim, "daemon.log")
+	if err := os.WriteFile(inside, []byte("someone else's file\n"), 0o644); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 
 	linkDir := filepath.Join(root, "logs")
-	linkFile := filepath.Join(root, "daemon.log")
-	if err := os.Symlink(victimDir, linkDir); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-	if err := os.Symlink(victimFile, linkFile); err != nil {
+	if err := os.Symlink(victim, linkDir); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	tightenLogPermissions(linkDir, linkFile)
-
-	if di, err := os.Stat(victimDir); err != nil {
-		t.Fatalf("stat victim dir: %v", err)
-	} else if got := di.Mode().Perm(); got != 0o755 {
-		t.Errorf("followed the symlink and changed an unrelated directory to %04o", got)
+	if f, err := openDaemonLog(linkDir, filepath.Join(linkDir, "daemon.log")); err == nil {
+		f.Close()
+		t.Fatal("opened a log through a symlinked directory")
 	}
-	if fi, err := os.Stat(victimFile); err != nil {
-		t.Fatalf("stat victim file: %v", err)
-	} else if got := fi.Mode().Perm(); got != 0o644 {
-		t.Errorf("followed the symlink and changed an unrelated file to %04o", got)
+
+	if di, _ := os.Stat(victim); di.Mode().Perm() != 0o755 {
+		t.Errorf("changed the mode of a directory it does not own: %04o", di.Mode().Perm())
+	}
+	if fi, _ := os.Stat(inside); fi.Mode().Perm() != 0o644 {
+		t.Errorf("changed the mode of a file it does not own: %04o", fi.Mode().Perm())
+	}
+	if b, _ := os.ReadFile(inside); string(b) != "someone else's file\n" {
+		t.Error("wrote daemon output into a file it does not own")
+	}
+}
+
+// O_NOFOLLOW must refuse a symlink at the log file itself — the case where the
+// old code logged a refusal and then appended through the link anyway.
+func TestOpenDaemonLogRefusesSymlinkedFile(t *testing.T) {
+	root := t.TempDir()
+	victim := filepath.Join(root, "victim.txt")
+	if err := os.WriteFile(victim, []byte("original\n"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	dir := filepath.Join(root, "logs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	link := filepath.Join(dir, "daemon.log")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if f, err := openDaemonLog(dir, link); err == nil {
+		f.Close()
+		t.Fatal("opened the log through a symlink")
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "original\n" {
+		t.Error("wrote through the symlink into an unrelated file")
+	}
+}
+
+// A FIFO survives O_NOFOLLOW and would block the daemon forever on write, so
+// the type is checked on the descriptor that was actually opened.
+func TestOpenDaemonLogRefusesNonRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "daemon.log")
+	if err := mkfifoForTest(fifo); err != nil {
+		t.Skipf("cannot create a FIFO here: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if f, err := openDaemonLog(dir, fifo); err == nil {
+			f.Close()
+			t.Error("accepted a FIFO as the daemon log")
+		}
+	}()
+	<-done
+}
+
+// The ordinary case still works and lands at 0600 in a 0700 directory.
+func TestOpenDaemonLogCreatesOwnerOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+	path := filepath.Join(dir, "daemon.log")
+	f, err := openDaemonLog(dir, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	if di, err := os.Stat(dir); err != nil || di.Mode().Perm() != 0o700 {
+		t.Errorf("log directory mode = %v (err %v), want 0700", di.Mode().Perm(), err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("log file mode = %v (err %v), want 0600", fi.Mode().Perm(), err)
 	}
 }

@@ -312,10 +312,15 @@ func TestStep7ClearsEverythingWhenNoDatabaseWasKept(t *testing.T) {
 	}
 }
 
-// If the clear itself fails, the tokens are not deleted on top of it: the user
-// is told, and the state is whatever ClearExcept managed rather than that plus
-// three more deletions.
-func TestStep7StopsIfClearingFails(t *testing.T) {
+// A failed clear is REPORTED but must not abandon the live sync credentials.
+//
+// This test previously asserted the opposite — that nothing was deleted after a
+// clear failure — which encoded a real defect as a requirement: one stuck entry
+// meant token, refreshToken and deviceToken were never attempted, and every
+// retry stopped in the same place, so the user could not complete a teardown at
+// all. Those three are the credentials that still authenticate to the service,
+// so they are exactly the ones that must not be hostage to an unrelated failure.
+func TestStep7ReportsAFailedClearButStillRemovesLiveCredentials(t *testing.T) {
 	path := tdDatabase(t, tdKey(0xD1))
 	fake := &fakeTeardownKeychain{
 		candidates: tdCandidates(tdKey(0xD1), tdKey(0x10)),
@@ -326,7 +331,17 @@ func TestStep7StopsIfClearingFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("a failed clear was reported as success")
 	}
-	if len(fake.deleted) != 0 {
-		t.Errorf("deleted %v after the clear failed", fake.deleted)
+
+	for _, want := range []string{"token", "refreshToken", "deviceToken"} {
+		found := false
+		for _, got := range fake.deleted {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("%s was never attempted after the clear failed; it is a live credential", want)
+		}
 	}
 }

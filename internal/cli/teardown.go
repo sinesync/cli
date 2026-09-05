@@ -211,17 +211,23 @@ func clearKeychainCredentials(dbPath string, keptDatabase bool, kc teardownKeych
 		return teardownKeyError(dbPath, err)
 	}
 
-	if err := kc.clearExcept(keysToKeep); err != nil {
-		// Partly cleared, possibly. Say so and stop rather than carry on
-		// deleting tokens on top of it.
-		return fmt.Errorf("clearing keychain credentials: %w", err)
-	}
+	// Record a clear failure, but do NOT return on it. Returning here skipped the
+	// three live sync credentials below, so a single stuck entry meant the
+	// bearer and refresh tokens were never attempted — and every retry stopped
+	// at the same place, leaving the user no way to finish a teardown at all.
+	// The entries that failed are worth reporting; they are not worth abandoning
+	// the credentials that would have succeeded.
+	clearErr := kc.clearExcept(keysToKeep)
 
-	// After the protected clear, never before: these are unconditional
-	// deletions, and running them first would mean a refusal above still cost
-	// the user something.
+	// Attempted last, and unconditionally: these are the credentials that still
+	// authenticate to the service, so they matter most and must not be hostage
+	// to a failure above.
 	for _, entry := range []string{"token", "refreshToken", "deviceToken"} {
 		_ = kc.deleteEntry(entry) // best effort: an entry that was never set is not an error
+	}
+
+	if clearErr != nil {
+		return fmt.Errorf("clearing keychain credentials: %w", clearErr)
 	}
 
 	fmt.Println("   ✓ Keychain credentials cleared")
