@@ -86,11 +86,29 @@ type pendingSubagent struct {
 	StartedAt time.Time
 }
 
-// NewServer creates a new daemon server
-func NewServer(port int) *Server {
+// NewServer creates a new daemon server.
+//
+// It fails closed. If the database key cannot be resolved, or the encrypted
+// database cannot be opened, this returns an error and the daemon does not
+// start. It used to fall back to unencrypted JSON files at this point, which
+// silently reversed the product's central claim and, when a memory.db already
+// existed, hid every observation in it behind an empty-looking store.
+// storage.ResolveBackend has always refused that fallback for CLI commands;
+// this is the daemon side of the same rule.
+func NewServer(port int) (*Server, error) {
 	if port == 0 {
 		port = DefaultPort
 	}
+
+	// Storage first, before anything expensive. Building the embedder can
+	// download a model; there is no reason to spend that on a daemon that is
+	// about to refuse to start, and in a fresh HOME it is the difference
+	// between a fast refusal and a long one.
+	sqlBackend, err := initSQLCipherBackend()
+	if err != nil {
+		return nil, err
+	}
+	var backend storage.StorageBackend = sqlBackend
 
 	cfg, _ := config.Load()
 
@@ -106,36 +124,10 @@ func NewServer(port int) *Server {
 
 	embedder, _ := embeddings.NewProvider()
 
-	// Try SQLCipher backend first, fall back to LocalStorage
-	var backend storage.StorageBackend
-	sqlBackend := initSQLCipherBackend()
-	if sqlBackend != nil {
-		backend = sqlBackend
-
-		// Auto-migrate legacy JSON observations if they exist
-		if storage.HasLegacyObservations(config.DataDir()) {
-			localSource := storage.NewLocalStorage()
-			migrated, err := storage.MigrateLocalToSQLCipher(localSource, sqlBackend)
-			if err != nil {
-				log.Printf("[daemon] Migration error: %v", err)
-			} else if migrated > 0 {
-				log.Printf("[daemon] Migrated %d observations from JSON to SQLCipher", migrated)
-				if err := storage.RenameLegacyDir(config.DataDir()); err != nil {
-					log.Printf("[daemon] Failed to rename legacy dir: %v", err)
-				}
-			}
-		}
-
-		// Backfill embeddings for any observations missing them on startup
-		// (e.g. embedder was unavailable when they were captured)
-		if embedder != nil {
-			go backfillEmbeddings(sqlBackend, embedder)
-		}
-	} else {
-		// initSQLCipherBackend has already explained why, at length. This line
-		// only records what was chosen as a result.
-		log.Printf("[daemon] Falling back to UNENCRYPTED JSON file storage")
-		backend = storage.NewLocalStorage()
+	// Backfill embeddings for any observations missing them on startup
+	// (e.g. embedder was unavailable when they were captured)
+	if embedder != nil {
+		go backfillEmbeddings(sqlBackend, embedder)
 	}
 
 	return &Server{
@@ -146,72 +138,147 @@ func NewServer(port int) *Server {
 		mode:        mode,
 		syncManager: NewSyncManager(backend, mode),
 		obsCacheTTL: 30 * time.Second, // Cache for 30 seconds
-	}
+	}, nil
 }
 
-// initSQLCipherBackend attempts to create a SQLCipher storage backend.
-// Returns nil if the key is unavailable or the database cannot be opened.
+// refusalError builds the startup failure the daemon reports when encrypted
+// storage cannot be opened.
 //
-// Every failure here is loud, and deliberately so: the caller's fallback writes
-// observations as PLAINTEXT JSON. That is a silent reversal of the product's
-// central claim, and a one-line log is not enough warning for it. Worse, if an
-// encrypted memory.db already exists, falling back does not just lose
-// encryption — it hides everything already in that database, which reads to the
-// user as data loss.
-func initSQLCipherBackend() *storage.SQLCipherStorage {
-	dbPath := filepath.Join(config.DataDir(), "memory.db")
-	_, dbExists := func() (os.FileInfo, bool) {
-		fi, err := os.Stat(dbPath)
-		return fi, err == nil
-	}()
-
-	warnPlaintext := func(reason, remedy string) {
-		log.Printf("[daemon] ================ ENCRYPTION UNAVAILABLE ================")
-		log.Printf("[daemon] %s", reason)
-		log.Printf("[daemon] Observations will be written as PLAINTEXT JSON under %s.", config.DataDir())
-		if dbExists {
-			log.Printf("[daemon] An encrypted database exists at %s and will NOT be readable", dbPath)
-			log.Printf("[daemon] in this session. Its contents are intact but hidden — this is not data loss.")
-		}
-		log.Printf("[daemon] %s", remedy)
-		log.Printf("[daemon] ========================================================")
+// The wording carries the whole message on purpose. Someone reading this in a
+// log file needs four facts before they can act — what failed, that the daemon
+// stopped rather than degraded, that nothing was written in plaintext, and that
+// their existing database is intact — and then the steps that fix it. A bare
+// "failed to open storage" leaves a user who has just lost their daemon unable
+// to tell a configuration mistake from data loss.
+func refusalError(cause string, steps []string) error {
+	var b strings.Builder
+	b.WriteString("encrypted storage is unavailable, so the daemon refused to start.\n\n")
+	b.WriteString("Cause: " + cause + "\n\n")
+	// Wrapped by hand, and each claim kept on one line, because this is read in
+	// a log file and a sentence split across a break is a sentence people skim.
+	b.WriteString("No plaintext was written.\n")
+	b.WriteString("Nothing was lost. Anything removed from disk had a verified encrypted copy\n")
+	b.WriteString("first, and anything that could not be verified is still on disk, unchanged.\n")
+	b.WriteString(filepath.Join(config.DataDir(), "memory.db") + "\n")
+	b.WriteString("holds everything it held before; nothing in it was replaced.\n\n")
+	b.WriteString("Two things on disk may have changed: plaintext observation files left by an\n")
+	b.WriteString("older version were tightened to owner-only permissions, and ones that verified\n")
+	b.WriteString("may have been copied into the encrypted database.\n")
+	b.WriteString("Their contents are untouched.\n\n")
+	b.WriteString("To start the daemon:\n")
+	for i, step := range steps {
+		fmt.Fprintf(&b, "  %d. %s\n", i+1, step)
 	}
+	return errors.New(strings.TrimRight(b.String(), "\n"))
+}
+
+// initSQLCipherBackend opens the encrypted storage backend, or explains why it
+// could not. There is no fallback: every path out of here is either an open
+// encrypted database or a refusal to run. The caller used to answer a nil
+// return by writing observations as plaintext JSON, which is exactly the
+// outcome this function now exists to prevent.
+func initSQLCipherBackend() (*storage.SQLCipherStorage, error) {
+	dbPath := filepath.Join(config.DataDir(), "memory.db")
+
+	const retryStep = "Retry: sinesync daemon start"
+
+	// Before the keychain lookup. Everything below this can refuse to start,
+	// and a refusal must not leave an older build's plaintext observations
+	// readable by every other account on the machine. Modes only — nothing here
+	// reads, moves, or rewrites a file.
+	if err := storage.HardenLegacyPlaintext(config.DataDir()); err != nil {
+		steps := []string{retryStep}
+		var lp *storage.LegacyPlaintextError
+		if errors.As(err, &lp) {
+			steps = []string{lp.Remedy(), retryStep}
+		}
+		return nil, refusalError(err.Error(), steps)
+	}
+	const unsetCheck = "Check that SINESYNC_NO_KEYCHAIN is unset — it disables keychain access wherever it is set."
 
 	key, err := keychain.GetOrCreateDBKey()
 	if err != nil {
-		if errors.Is(err, keychain.ErrNoKeychainSession) {
+		switch {
+		case keychain.DisabledByEnv():
+			// A deliberate opt-out, checked before ErrNoKeychainSession because
+			// it produces that same error and there is nothing wrong with the
+			// machine. The only useful instruction is to stop opting out.
+			return nil, refusalError(
+				"SINESYNC_NO_KEYCHAIN is set, which disables all keychain access, so the database key could not be resolved.",
+				[]string{
+					"Unset SINESYNC_NO_KEYCHAIN in the environment the daemon is started from.",
+					"Start the daemon from a desktop session and unlock the login keychain, so the key can be read.",
+					retryStep,
+				},
+			)
+		case errors.Is(err, keychain.ErrNoKeychainSession):
 			// Expected whenever the daemon is started outside a desktop session:
 			// nohup, SSH, CI, or spawned by another tool. No keychain call was
 			// made, so nothing prompted and no key was replaced.
-			warnPlaintext(
+			return nil, refusalError(
 				"No OS keychain is reachable from this process, so the database key could not be resolved.",
-				"Start the daemon from a desktop session, or set SINESYNC_NO_KEYCHAIN=1 to acknowledge this deliberately.",
+				[]string{
+					"Start the daemon from a desktop session and unlock the login keychain — not over SSH, nohup, or CI.",
+					unsetCheck,
+					retryStep,
+				},
 			)
-		} else {
+		default:
 			// Off darwin this is the only branch a missing keychain can reach:
 			// there is no availability probe outside macOS, so an unreachable
 			// Secret Service arrives here as its own D-Bus error rather than as
 			// ErrNoKeychainSession. The remedy has to cover that case too.
-			warnPlaintext(
+			return nil, refusalError(
 				fmt.Sprintf("The database key could not be resolved: %v", err),
-				"In a desktop session this is unexpected — check the keychain entry for 'sinesync'. "+
-					"On a machine with no keyring service at all, set SINESYNC_NO_KEYCHAIN=1 to acknowledge this deliberately.",
+				[]string{
+					"Check the keychain entry for 'sinesync', and unlock the login keychain in this desktop session.",
+					unsetCheck,
+					retryStep,
+				},
 			)
 		}
-		return nil
 	}
 
 	db, err := storage.NewSQLCipherStorage(dbPath, key)
 	if err != nil {
-		warnPlaintext(
+		return nil, refusalError(
 			fmt.Sprintf("The encrypted database could not be opened: %v", err),
-			"If the keychain entry was replaced, the existing database cannot be decrypted with the current key.",
+			[]string{
+				"If the keychain entry was replaced, the current key cannot decrypt the existing database — restore the original entry rather than deleting the database.",
+				fmt.Sprintf("Check that %s is readable and not held open by another process.", dbPath),
+				retryStep,
+			},
 		)
-		return nil
+	}
+
+	// Migrate the legacy plaintext store into this database and delete it. The
+	// daemon no longer reads plaintext at all, so a directory left behind is
+	// data the user can no longer see through sinesync while still being
+	// readable by anything else on the machine. Either it all verifies inside
+	// SQLCipher and goes away, or the daemon says so and refuses to start.
+	// Entries that cannot be migrated are quarantined, not fatal: one stray
+	// file in a legacy directory is not the user's fault and must not leave
+	// them with a daemon that will not start. Each quarantined entry is logged
+	// with storage.QuarantineLogMarker, which is how `sinesync daemon start`
+	// finds them in a child process's log and puts them in front of the user.
+	// An error here means the filesystem would not cooperate at all, which is
+	// worth stopping for, because the state of the data is then unknown.
+	quarantined, err := storage.CleanupLegacyPlaintext(db, config.DataDir())
+	if err != nil {
+		db.Close()
+		steps := []string{retryStep}
+		var lc *storage.LegacyCleanupError
+		if errors.As(err, &lc) {
+			steps = []string{lc.Remedy(), retryStep}
+		}
+		return nil, refusalError(err.Error(), steps)
+	}
+	if len(quarantined) > 0 {
+		log.Printf("[daemon] %d legacy file(s) could not be migrated and were set aside; they are NOT in the encrypted database", len(quarantined))
 	}
 
 	log.Printf("[daemon] Using SQLCipher encrypted storage")
-	return db
+	return db, nil
 }
 
 // backfillEmbeddings generates embeddings for observations that lack them.

@@ -34,6 +34,19 @@ const securityBinary = "/usr/bin/security"
 // replacement key would orphan a database encrypted with the real one.
 var ErrNoKeychainSession = errors.New("no keychain session available in this context")
 
+// noKeychainEnv disables all keychain access when set to anything but "0".
+const noKeychainEnv = "SINESYNC_NO_KEYCHAIN"
+
+// DisabledByEnv reports whether the user has explicitly opted out of the
+// keychain. Callers need this to tell a deliberate opt-out apart from a machine
+// with no reachable keyring: both surface as ErrNoKeychainSession, but only one
+// of them is fixed by changing the environment, and telling a user to unset a
+// variable they never set is how a real fault gets mistaken for a typo.
+func DisabledByEnv() bool {
+	v := os.Getenv(noKeychainEnv)
+	return v != "" && v != "0"
+}
+
 // usable reports whether the OS keychain can be reached without raising UI.
 //
 // This exists because of a specific, destructive failure. When a process with no
@@ -59,7 +72,7 @@ func detectUsable() bool {
 // library it was standing in front of.
 func detectUsableFor(goos string) bool {
 	// Explicit override, for containers and anywhere the heuristics are wrong.
-	if v := os.Getenv("SINESYNC_NO_KEYCHAIN"); v != "" && v != "0" {
+	if DisabledByEnv() {
 		return false
 	}
 
@@ -82,8 +95,9 @@ func detectUsableFor(goos string) bool {
 		// or one whose leading empty element makes Go refuse the match as a
 		// relative path — would make this guard answer "no keychain" while the
 		// library it stands in front of would have succeeded. That disagreement
-		// is not a safe default: it drops the daemon to plaintext JSON and hides
-		// the existing encrypted database. Fixing the path also means the probe
+		// is not a safe default: the daemon now refuses to start when the key
+		// cannot be resolved, so a false negative here takes down a daemon whose
+		// keychain was reachable all along. Fixing the path also means the probe
 		// can never execute a `security` someone left in the working directory.
 		out, err := exec.Command(securityBinary, "default-keychain").CombinedOutput()
 		if err != nil {
@@ -132,8 +146,9 @@ func detectUsableFor(goos string) bool {
 		// and can succeed. A probe cannot mirror that — replicating it means
 		// spawning a daemon to answer a question, which is not something a probe
 		// gets to do. So the check was permanently a subset of the library, and
-		// a subset here means false negatives: the daemon silently drops to
-		// plaintext JSON and an existing encrypted database becomes invisible.
+		// a subset here means false negatives, and since the daemon refuses to
+		// start without a key, a false negative is a daemon that will not run on
+		// a machine whose keyring works.
 		// (godbus is also more forgiving on stat: conn_other.go:89 accepts any
 		// error that is not IsNotExist, where the guard demanded err == nil.)
 		//

@@ -80,8 +80,28 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Starting sine~sync daemon...")
 
-	if err := daemon.Start(port); err != nil {
-		return fmt.Errorf("failed to start daemon: %w", err)
+	notices, err := daemon.Start(port)
+	if err != nil {
+		// Returned unwrapped. Every error out of Start already names what
+		// failed, and when the daemon refused to start over encryption the
+		// message is a multi-line explanation with recovery steps — prefixing
+		// that with "failed to start daemon:" only pushes the first real line
+		// of it off to the right.
+		return err
+	}
+
+	// Printed before the success lines, not after: this is the part the user
+	// has to act on, and it is about their data. The daemon started, so nothing
+	// here is an error — but the files named are NOT in the encrypted database
+	// and nothing else will tell them so.
+	if len(notices) > 0 {
+		fmt.Printf("\n%d legacy file(s) could not be migrated and were set aside:\n", len(notices))
+		for _, n := range notices {
+			fmt.Printf("  %s\n", n)
+		}
+		fmt.Println("They were not deleted and are readable only by you.")
+		fmt.Println("They are NOT in the encrypted database — sinesync will not show their contents.")
+		fmt.Println()
 	}
 
 	_, info := daemon.IsRunning()
@@ -140,7 +160,14 @@ func runDaemonForeground(cmd *cobra.Command, args []string) error {
 	// may write to the original fd 2. Redirect at the process level.
 	daemon.RedirectStderrToLog()
 
-	server := daemon.NewServer(port)
+	server, err := daemon.NewServer(port)
+	if err != nil {
+		// Fail closed: the daemon does not run without encrypted storage. This
+		// error carries the whole explanation and the remedy — cobra prints it
+		// to stderr, which the parent has pointed at today's daemon log, so
+		// `sinesync daemon logs` is where the user reads it.
+		return err
+	}
 	return server.Run()
 }
 

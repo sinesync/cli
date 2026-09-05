@@ -96,7 +96,11 @@ func (m *SyncManifest) Save() error {
 		return err
 	}
 
-	return os.WriteFile(syncManifestPath(), data, 0644)
+	// 0600, and forced: the manifest is a plaintext index of every observation
+	// ID the user has and when each was synced. It reveals less than the
+	// observations themselves and more than nothing, and it long predates the
+	// hardening, so existing installs have one sitting at 0644.
+	return writeFilePrivate(syncManifestPath(), data, fileMode)
 }
 
 // IsSynced checks if an observation is synced with matching checksum

@@ -12,6 +12,74 @@ import (
 	"github.com/sinesync/cli/internal/config"
 )
 
+// Modes for everything LocalStorage writes. Observations are the user's
+// transcripts in plaintext — the whole reason the encrypted backend exists — so
+// on a shared or multi-user machine the difference between 0644 and 0600 is the
+// difference between private notes and readable ones. 0700 on the directory
+// matters as much: it is what stops another user listing the observation IDs
+// even when they cannot open the files.
+const (
+	dirMode  os.FileMode = 0o700
+	fileMode os.FileMode = 0o600
+)
+
+// writeFilePrivate writes data to path at mode, whether or not path exists,
+// without ever putting the existing contents of path at risk.
+//
+// os.WriteFile is not enough on its own: its mode argument applies only when it
+// creates the file, and is masked by the umask even then, so an observation
+// rewritten into a file an older build created at 0644 would keep 0644 forever.
+//
+// Getting the mode right by opening the target and chmod'ing it is not enough
+// either, and that is the harder mistake. Any sequence that truncates the
+// target first has a window where a later failure — the chmod, the write, the
+// process dying — leaves the user with an empty file where an observation used
+// to be. Correct permissions are not worth losing data for.
+//
+// So the new content is built in a temporary file beside the target, brought to
+// the right mode there, flushed, and moved into place with a rename. The target
+// holds either its old contents or its new ones and never anything in between,
+// and rename replaces the destination's mode with the temporary file's, which
+// is what forces 0600 onto a permissive file that already exists.
+func writeFilePrivate(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".sinesync-tmp-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+
+	// Every failure from here removes the temporary file and leaves the target
+	// untouched.
+	abort := func(err error) error {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+
+	// CreateTemp already creates at 0600, but only the umask stands between
+	// that and something looser if it ever changes. Say it explicitly.
+	if err := tmp.Chmod(mode); err != nil {
+		return abort(err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return abort(err)
+	}
+	// Flush before the rename, so a crash cannot leave the target pointing at a
+	// file whose contents never reached the disk.
+	if err := tmp.Sync(); err != nil {
+		return abort(err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
 // Checksum calculates SHA256 checksum of data
 func Checksum(data []byte) string {
 	hash := sha256.Sum256(data)
@@ -39,10 +107,19 @@ func NewLocalStorage() *LocalStorage {
 	}
 }
 
-// ensureDir ensures a directory exists
+// ensureDir ensures a directory exists, and that it is private.
+//
+// The Chmod is not redundant with MkdirAll. MkdirAll masks its mode with the
+// umask on the directories it creates, and leaves the mode of one that already
+// exists completely alone — so a data dir made by an older build at 0755 would
+// stay world-readable no matter how many times this ran. Chmod is idempotent,
+// which makes every call a repair.
 func (s *LocalStorage) ensureDir(itemType string) (string, error) {
 	dir := filepath.Join(s.baseDir, itemType)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, dirMode); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(dir, dirMode); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -69,7 +146,7 @@ func (s *LocalStorage) Save(itemType string, id string, data interface{}) error 
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(dir, id+".json"), bytes, 0644)
+	return writeFilePrivate(filepath.Join(dir, id+".json"), bytes, fileMode)
 }
 
 // Get retrieves an item by ID

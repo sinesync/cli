@@ -95,13 +95,23 @@ func checkJSONIntegrity(ctx context.Context, fix bool) CheckResult {
 
 	if fix {
 		quarantine := filepath.Join(config.ConfigDir(), "quarantine")
-		if err := os.MkdirAll(quarantine, 0755); err != nil {
+		if err := os.MkdirAll(quarantine, 0o700); err != nil {
 			result.Status = StatusFail
 			result.Message = fmt.Sprintf("Cannot create quarantine directory: %v", err)
 			return result
 		}
+		// MkdirAll leaves an existing directory's mode alone, so a quarantine
+		// left by an older build is still 0755. Refuse to move anything into a
+		// directory that cannot be made private: what goes in is the user's
+		// observations in plaintext.
+		if err := os.Chmod(quarantine, 0o700); err != nil {
+			result.Status = StatusFail
+			result.Message = fmt.Sprintf("Cannot secure quarantine directory %s: %v", quarantine, err)
+			return result
+		}
 
 		fixed := 0
+		var unresolved []string
 		for _, detail := range corrupted {
 			name := strings.SplitN(detail, ":", 2)[0]
 			src := filepath.Join(obsDir, name)
@@ -110,14 +120,40 @@ func checkJSONIntegrity(ctx context.Context, fix bool) CheckResult {
 				// Avoid collision with existing quarantined file
 				dst = filepath.Join(quarantine, fmt.Sprintf("%s.%d", name, time.Now().UnixNano()))
 			}
-			if err := os.Rename(src, dst); err == nil {
-				fixed++
+			// Secure the file where it is, before it moves. os.Rename carries
+			// the source's mode to the destination, so a file that starts at
+			// 0644 stays 0644 in an archive nothing will ever rewrite — and
+			// doing it first means a file we cannot secure is simply left
+			// alone, rather than moved somewhere we have already promised is
+			// private.
+			if err := os.Chmod(src, 0o600); err != nil {
+				unresolved = append(unresolved, fmt.Sprintf("%s: cannot secure before quarantine: %v", name, err))
+				continue
 			}
+			if err := os.Rename(src, dst); err != nil {
+				unresolved = append(unresolved, fmt.Sprintf("%s: quarantine move failed: %v", name, err))
+				continue
+			}
+			fixed++
 		}
+
+		result.FixApplied = fixed > 0
+		result.Details = append(append([]string{}, corrupted...), unresolved...)
+
+		// A shortfall is a failure, not a success with a smaller number in it.
+		// Reporting [FIXED] while a corrupted plaintext observation is still
+		// sitting in the live directory tells the user to stop looking.
+		if len(unresolved) > 0 {
+			result.Status = StatusFail
+			result.Message = fmt.Sprintf(
+				"Quarantined %d/%d corrupted files; %d could not be quarantined with owner-only permissions (of %d total)",
+				fixed, len(corrupted), len(unresolved), total,
+			)
+			return result
+		}
+
 		result.Status = StatusFixed
-		result.FixApplied = true
 		result.Message = fmt.Sprintf("Quarantined %d/%d corrupted files (of %d total)", fixed, len(corrupted), total)
-		result.Details = corrupted
 		return result
 	}
 
