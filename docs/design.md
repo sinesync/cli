@@ -338,7 +338,7 @@ ciphertext = AES-256-GCM(
   key: encryption_key,
   nonce: nonce,
   plaintext: JSON.stringify(data),
-  aad: item_id  // Additional authenticated data
+  aad: "sinesync-observation-v1"  // constant per data type, NOT the item id
 )
 blob = nonce || ciphertext || auth_tag
 ```

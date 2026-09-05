@@ -1572,6 +1572,28 @@ func (m *SyncManager) downloadAndProcess(downloadURL, id, expectedChecksum strin
 		}
 	}
 
+	// Bind the ciphertext to the record we asked for.
+	//
+	// Every observation is encrypted under the same AAD string
+	// (encryption.AADObservation), so authentication proves only "some
+	// observation of this account, under this key" — not WHICH one. Nothing in
+	// the sealed bytes names the id. A malicious or compromised server can
+	// therefore answer a request for one id with a different, older, or
+	// previously deleted ciphertext: GCM verifies, decryption succeeds, and the
+	// client stores content it never asked for. Checksum verification is
+	// deliberately skipped above, so it does not catch this either.
+	//
+	// The decrypted body does carry its own id, and the server cannot forge that
+	// without the key. Comparing it to the id we requested closes the
+	// substitution without changing the format or breaking existing ciphertexts
+	// — which making the id part of the AAD would do, since every record already
+	// stored was sealed under the constant string.
+	if obs.ID != id {
+		return zero, fmt.Errorf(
+			"refusing observation %q returned for request %q: the server answered with a different record",
+			obs.ID, id)
+	}
+
 	// Standardize embedding for local search compatibility
 	standardizeEmbedding(obs)
 
