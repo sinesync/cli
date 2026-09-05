@@ -47,3 +47,43 @@ func TestTightenLogPermissionsToleratesMissingPaths(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent")
 	tightenLogPermissions(missing, filepath.Join(missing, "daemon.log"))
 }
+
+// The first version of tightenLogPermissions used os.Stat and os.Chmod, which
+// follow symlinks — so a symlinked log directory meant daemon startup chmod'd
+// whatever it pointed at. A privacy fix that rewrites modes elsewhere on the
+// filesystem is worse than the readable log it closes.
+func TestTightenLogPermissionsRefusesSymlinks(t *testing.T) {
+	root := t.TempDir()
+
+	// A directory the daemon does not own, at a mode it must not change.
+	victimDir := filepath.Join(root, "someone-elses-dir")
+	if err := os.MkdirAll(victimDir, 0o755); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	victimFile := filepath.Join(root, "someone-elses-file")
+	if err := os.WriteFile(victimFile, []byte("not ours\n"), 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	linkDir := filepath.Join(root, "logs")
+	linkFile := filepath.Join(root, "daemon.log")
+	if err := os.Symlink(victimDir, linkDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(victimFile, linkFile); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	tightenLogPermissions(linkDir, linkFile)
+
+	if di, err := os.Stat(victimDir); err != nil {
+		t.Fatalf("stat victim dir: %v", err)
+	} else if got := di.Mode().Perm(); got != 0o755 {
+		t.Errorf("followed the symlink and changed an unrelated directory to %04o", got)
+	}
+	if fi, err := os.Stat(victimFile); err != nil {
+		t.Fatalf("stat victim file: %v", err)
+	} else if got := fi.Mode().Perm(); got != 0o644 {
+		t.Errorf("followed the symlink and changed an unrelated file to %04o", got)
+	}
+}

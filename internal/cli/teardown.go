@@ -105,8 +105,20 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 	// Step 6: Ask about memory.db deletion (after daemon is stopped)
 	keptDatabase := false
 	memoryPath := filepath.Join(config.DataDir(), "memory.db")
-	_, statErr := os.Stat(memoryPath)
-	if statErr == nil {
+	// Lstat, not Stat. Stat follows a symlink while os.Remove below deletes only
+	// the LINK, so a database kept elsewhere and linked in here would be recorded
+	// as deleted while the real encrypted file survived — and step 7 would then
+	// clear the only key that opens it. Unrecoverable loss, reported as success.
+	linkInfo, statErr := os.Lstat(memoryPath)
+	if statErr == nil && linkInfo.Mode()&os.ModeSymlink != 0 {
+		// Deleting the link would leave the data and destroy the key. Refuse the
+		// choice rather than offer one whose outcome we cannot honour.
+		fmt.Printf("\n6. Memory database is a symlink: %s\n", memoryPath)
+		fmt.Println("   Not deleting it. Removing the link would leave the real database in place")
+		fmt.Println("   while this command cleared the key that opens it, which is not recoverable.")
+		fmt.Println("   Delete the file it points at yourself if you meant to destroy the data.")
+		keptDatabase = true
+	} else if statErr == nil {
 		fmt.Printf("\n6. Delete local memory database?\n")
 		fmt.Printf("   Path: %s\n", memoryPath)
 		fmt.Print("   Delete? [y/N]: ")

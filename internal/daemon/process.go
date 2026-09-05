@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -465,10 +466,47 @@ func formatUptime(startedAt time.Time) string {
 // could not chmod its own log is a worse outcome than a readable log, and the
 // files it goes on to create will carry the right mode regardless.
 func tightenLogPermissions(dir, file string) {
-	if info, err := os.Stat(dir); err == nil && info.Mode().Perm() != 0o700 {
-		_ = os.Chmod(dir, 0o700)
+	tightenIfOwnRegular(dir, 0o700, true)
+	tightenIfOwnRegular(file, 0o600, false)
+}
+
+// tightenIfOwnRegular chmods path to mode, but ONLY if path is really a
+// directory or regular file rather than a symlink to one.
+//
+// The first version of this used os.Stat and os.Chmod, both of which follow
+// symlinks. If the log directory were a link, daemon startup would have chmod'd
+// whatever it pointed at to 0700; if today's log file were a link, startup would
+// have chmod'd an unrelated file to 0600 and then appended daemon output to it.
+// A privacy fix that silently rewrites modes elsewhere on the filesystem is a
+// worse defect than the readable log it was closing.
+//
+// os.Lstat does not follow the link, so a symlink is detected and refused
+// instead of followed. This is deliberately not a full TOCTOU defence: the path
+// can still be swapped between the Lstat and the Chmod by a process already
+// running as this user, which is a strictly narrower position than the
+// other-account reader this protects against. Refusing the non-racing case is
+// what matters; claiming to close the race would be false.
+func tightenIfOwnRegular(path string, mode os.FileMode, wantDir bool) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return // nothing there yet: the create path applies the right mode
 	}
-	if info, err := os.Stat(file); err == nil && info.Mode().Perm() != 0o600 {
-		_ = os.Chmod(file, 0o600)
+	if info.Mode()&os.ModeSymlink != 0 {
+		log.Printf("[daemon] not tightening permissions on %s: it is a symlink, and following it would change a file the daemon does not own", path)
+		return
+	}
+	if info.IsDir() != wantDir {
+		log.Printf("[daemon] not tightening permissions on %s: unexpected file type %v", path, info.Mode().Type())
+		return
+	}
+	if info.Mode().Perm() == mode {
+		return
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		// Reported rather than discarded. Startup still proceeds — a daemon that
+		// refuses to run because it could not chmod its own log is worse than a
+		// readable log — but silence would hide the fact that the promised
+		// tightening did not happen.
+		log.Printf("[daemon] could not tighten permissions on %s to %04o: %v", path, mode, err)
 	}
 }

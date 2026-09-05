@@ -40,12 +40,16 @@ func isProcessAlive(pid int) bool {
 // go to the log file instead of leaking to the parent terminal.
 func redirectStderrToLog() {
 	logDir := LogDir()
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	// 0700/0600 here too. `sinesync daemon run` reaches this directly without
+	// going through Start, so the permission fix applied there did not cover the
+	// path a user takes when running the daemon in the foreground.
+	if err := os.MkdirAll(logDir, 0700); err != nil {
 		fmt.Fprintf(os.Stderr, "sine~sync: failed to create log dir %s: %v\n", logDir, err)
 		return
 	}
 	logFile := filepath.Join(logDir, fmt.Sprintf("daemon-%s.log", time.Now().Format("2006-01-02")))
-	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	tightenLogPermissions(logDir, logFile)
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sine~sync: failed to open log file %s: %v\n", logFile, err)
 		return

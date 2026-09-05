@@ -3,6 +3,7 @@ package keychain
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -331,10 +332,23 @@ func ClearExcept(keep []string) error {
 	// Through the guarded Delete, not keyring.Delete. Teardown and stale-login
 	// cleanup both reach here, and both can run headless — deleting is exactly
 	// as capable of raising the modal as reading.
+	// A key that was never set is not a failure; anything else is. Swallowing
+	// every error made this always return nil, so teardown's caller could not
+	// tell a complete clear from a partial one and printed success either way —
+	// telling the user their credentials were removed when some remained.
+	var failed []string
 	for _, key := range allKeys {
-		if !keepSet[key] {
-			_ = Delete(key) // best effort: a key that was never set is not an error
+		if keepSet[key] {
+			continue
 		}
+		if err := Delete(key); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+			failed = append(failed, fmt.Sprintf("%s: %v", key, err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("could not remove %d keychain entr%s: %s",
+			len(failed), map[bool]string{true: "y", false: "ies"}[len(failed) == 1],
+			strings.Join(failed, "; "))
 	}
 	return nil
 }
