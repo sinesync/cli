@@ -492,6 +492,74 @@ func (s *Server) requireLoopbackHost(h http.Handler) http.Handler {
 	})
 }
 
+// contentSecurityPolicy is served with every dashboard asset.
+//
+// The dashboard needs nothing off-origin: d3 is vendored as static/d3.min.js,
+// index.html has no inline <script>, and style.css contains no url() or
+// @import. So 'self' everywhere costs the page nothing. 'unsafe-inline'
+// survives under style-src alone, for the one style="display:none" attribute
+// in index.html.
+//
+// This is defence in depth, not the defence. app.js builds every node with
+// textContent and DOM properties, so a project named
+//
+//	<img src=x onerror=alert(1)>"'&
+//
+// is text, never markup — see TestDashboardScriptHasNoHTMLSinks. The policy is
+// what narrows the damage if that invariant is ever broken. What each part
+// does, stated no more strongly than it is true:
+//
+//   - script-src 'self' blocks the injected onerror/onload handler and any
+//     remote or data: script it would try to pull in. This is the directive
+//     doing the real work against an injected node.
+//   - object-src 'none' and base-uri 'none' close the plugin and <base>
+//     hijack routes; frame-ancestors 'none' stops the dashboard being framed.
+//   - connect-src 'self' confines Fetch, XMLHttpRequest, WebSocket, EventSource
+//     and sendBeacon to this origin. It is NOT a guarantee that nothing can
+//     leave. Top-level navigation and window.open are not governed by any
+//     directive here (navigate-to was never shipped by browsers), form
+//     submission is unconstrained because we set no form-action, and any
+//     script gadget already running same-origin — including app.js itself —
+//     is by definition allowed to talk to this origin. It also offers nothing
+//     against a compromise of the origin itself, since 'self' is then the
+//     attacker. Read it as removing the easy channel, not as closing the door.
+//   - style-src 'unsafe-inline' permits inline styling only: <style> blocks and
+//     style="" attributes. It does not re-enable event-handler attributes —
+//     those are script and remain blocked by script-src. It is not free
+//     either: injected CSS can overlay or restyle the page, and can leak
+//     coarse information through attribute selectors that trigger resource
+//     loads, which is part of why default-src and img-src stay on 'self'.
+const contentSecurityPolicy = "default-src 'self'; " +
+	"script-src 'self'; " +
+	"style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data:; " +
+	"connect-src 'self'; " +
+	"object-src 'none'; " +
+	"base-uri 'none'; " +
+	// The dashboard contains no <form> element, so submission to any origin is
+	// pure attack surface: an injected form is one of the few exfiltration
+	// channels script-src 'self' leaves open, since navigation is not fetch and
+	// connect-src does not constrain it.
+	"form-action 'none'; " +
+	"frame-ancestors 'none'"
+
+// withDashboardCSP attaches contentSecurityPolicy to static responses. It wraps
+// only the file server: the API returns application/json, which a browser never
+// renders as a document, so the policy that matters is the one delivered with
+// index.html and inherited by everything it loads.
+func withDashboardCSP(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
+		// CSP governs what a document may load; it does not decide what the
+		// browser treats a response AS. Without nosniff, a response whose bytes
+		// look like HTML can be sniffed into a document regardless of its
+		// declared type, which sidesteps the policy above rather than violating
+		// it.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		h.ServeHTTP(w, r)
+	})
+}
+
 // routes builds the full request handler: the mux wrapped in Host validation.
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
@@ -550,7 +618,7 @@ func (s *Server) routes() http.Handler {
 
 	// Static files for dashboard
 	staticFS, _ := fs.Sub(staticFiles, "static")
-	mux.Handle("/", http.FileServer(http.FS(staticFS)))
+	mux.Handle("/", withDashboardCSP(http.FileServer(http.FS(staticFS))))
 
 	return s.requireLoopbackHost(mux)
 }
