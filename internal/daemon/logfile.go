@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"syscall"
 )
 
 // openDaemonLog opens the daemon log for appending, refusing to follow a symlink
@@ -30,15 +29,10 @@ func openDaemonLog(dir, path string) (*os.File, error) {
 		return nil, err
 	}
 
-	// O_NOFOLLOW makes the kernel refuse a symlink at the final component, so a
-	// planted link fails the open instead of redirecting the write.
-	//
-	// O_NONBLOCK is what stops a FIFO hanging the daemon. Opening a FIFO
-	// write-only BLOCKS until a reader appears, so checking the type after the
-	// open never runs — the process is already stuck. With O_NONBLOCK the open
-	// fails immediately (ENXIO) and the type check below catches anything else
-	// exotic. On a regular file the flag has no effect.
-	fd, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	// The open itself must refuse a symlink — checking the path and then opening
+	// the path is not a check. How that is expressed differs by platform, so it
+	// lives in openLogFileNoFollow.
+	fd, err := openLogFileNoFollow(path)
 	if err != nil {
 		return nil, fmt.Errorf("opening daemon log %s: %w", path, err)
 	}
