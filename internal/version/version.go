@@ -97,6 +97,71 @@ func Compare(a, b string) int {
 			return 1
 		}
 	}
+
+	// Cores are equal, so the prerelease suffix decides. Semver orders
+	// 1.0.0-rc.1 BELOW 1.0.0, and ignoring that stranded prerelease users:
+	// v0.2.1-rc.3 compared equal to v0.2.1, so `sinesync update` answered
+	// "Already up to date" and never offered the finished release. A user who
+	// helped test a release candidate would have stayed on it indefinitely.
+	return comparePrerelease(prereleaseOf(a), prereleaseOf(b))
+}
+
+// prereleaseOf returns the suffix after the first "-", or "" for a release.
+func prereleaseOf(v string) string {
+	_, suffix, found := strings.Cut(v, "-")
+	if !found {
+		return ""
+	}
+	return suffix
+}
+
+// comparePrerelease orders two prerelease suffixes by semver precedence: a
+// release (empty suffix) outranks any prerelease, numeric identifiers compare
+// numerically, numeric ranks below alphanumeric, and a shorter run of
+// identifiers ranks below a longer one that matches on the shared prefix.
+func comparePrerelease(a, b string) int {
+	if a == b {
+		return 0
+	}
+	if a == "" {
+		return 1 // a is the release, b is a prerelease of it
+	}
+	if b == "" {
+		return -1
+	}
+
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) || i < len(bs); i++ {
+		if i >= len(as) {
+			return -1
+		}
+		if i >= len(bs) {
+			return 1
+		}
+		x, y := as[i], bs[i]
+		xn, xNum := strconv.Atoi(x)
+		yn, yNum := strconv.Atoi(y)
+		switch {
+		case xNum == nil && yNum == nil:
+			if xn != yn {
+				if xn < yn {
+					return -1
+				}
+				return 1
+			}
+		case xNum == nil:
+			return -1 // numeric identifiers rank below alphanumeric ones
+		case yNum == nil:
+			return 1
+		default:
+			if x != y {
+				if x < y {
+					return -1
+				}
+				return 1
+			}
+		}
+	}
 	return 0
 }
 

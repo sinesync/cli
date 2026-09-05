@@ -49,3 +49,11 @@ web-old/
 
 # Claude Code context files
 CLAUDE.md
+
+# Agent tooling state. These are working directories, not source: .conclave
+# holds session event logs containing recorded prompt and output text. None is
+# tracked today, but nothing was stopping `git add -A` from publishing them —
+# which in a public repository is a one-command mistake with no undo.
+.claude/
+.codex/
+.conclave/

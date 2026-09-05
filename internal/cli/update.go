@@ -72,8 +72,11 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 
 	// Refuse to move a stable install onto a prerelease.
 	//
-	// version.Compare ignores the prerelease suffix, so v0.3.0-rc.1 orders as
-	// NEWER than v0.2.0. Release CI never points `latest` at a prerelease, but
+	// Compare now orders a prerelease below its own release, so an RC user is
+	// correctly offered the finished version. It does NOT stop a prerelease of a
+	// LATER version outranking an earlier release: v0.3.0-rc.1 still beats
+	// v0.2.0, and should, since the core is genuinely newer. That is the case
+	// this gate exists for. Release CI never points `latest` at a prerelease, but
 	// `latest` is an unsigned pointer in the same bucket as the artifacts: an
 	// attacker who can write there cannot forge a binary (the Ed25519 signature
 	// stops that) but CAN repoint `latest` at a real, correctly signed
