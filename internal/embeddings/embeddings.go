@@ -580,6 +580,7 @@ var onnxArchiveDigests = map[string]string{
 	"onnxruntime-linux-x64-1.23.2.tgz":     "1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b",
 	"onnxruntime-linux-x64-gpu-1.23.2.tgz": "2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53",
 	"onnxruntime-osx-arm64-1.23.2.tgz":     "b4d513ab2b26f088c66891dbbc1408166708773d7cc4163de7bdca0e9bbb7856",
+	"onnxruntime-osx-x86_64-1.23.2.tgz":    "d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6",
 	"onnxruntime-win-x64-1.23.2.zip":       "0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd",
 	"onnxruntime-win-arm64-1.23.2.zip":     "1cfe88b6435df3b5fb0e9f6bd7d6f5df1e887b6174de7f6e2a47bab956f3f168",
 }

@@ -1,7 +1,7 @@
 package embeddings
 
 import (
-	"fmt"
+	"os"
 	"regexp"
 	"runtime"
 	"strings"
@@ -30,19 +30,34 @@ func TestEveryPinnedDigestIsWellFormed(t *testing.T) {
 // which is refused at runtime, so the failure is safe, but it is far better
 // found here than by a user whose daemon cannot start.
 func TestEveryPlatformArchiveIsPinned(t *testing.T) {
-	const version = "1.23.2" // must track onnxVersion in embeddings.go
-	for _, name := range []string{
-		fmt.Sprintf("onnxruntime-linux-aarch64-%s.tgz", version),
-		fmt.Sprintf("onnxruntime-linux-x64-%s.tgz", version),
-		fmt.Sprintf("onnxruntime-linux-x64-gpu-%s.tgz", version),
-		fmt.Sprintf("onnxruntime-osx-arm64-%s.tgz", version),
-		fmt.Sprintf("onnxruntime-win-x64-%s.zip", version),
-		fmt.Sprintf("onnxruntime-win-arm64-%s.zip", version),
-	} {
+	// Read the archive names out of the SOURCE rather than restating them here.
+	// The previous version listed six names by hand, called itself exhaustive,
+	// and silently omitted onnxruntime-osx-x86_64 — so an Intel Mac built a URL
+	// with no pin, the download was refused, and ONNX embeddings were lost on
+	// that platform with this test still green. A list maintained beside the
+	// thing it checks drifts from it; deriving it cannot.
+	src, err := os.ReadFile("embeddings.go")
+	if err != nil {
+		t.Fatalf("reading source: %v", err)
+	}
+	names := regexp.MustCompile(`onnxruntime-[a-z0-9_-]+-%s\.(?:tgz|zip)`).FindAllString(string(src), -1)
+	if len(names) == 0 {
+		t.Fatal("found no archive names in embeddings.go; this test is not checking anything")
+	}
+
+	const version = "1.23.2" // must track onnxVersion
+	seen := map[string]bool{}
+	for _, pattern := range names {
+		name := strings.Replace(pattern, "%s", version, 1)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
 		if _, ok := onnxArchiveDigests[name]; !ok {
-			t.Errorf("%s has no pinned digest, so this platform cannot install the runtime", name)
+			t.Errorf("%s can be constructed by the download code but has no pinned digest, so that platform cannot install the runtime", name)
 		}
 	}
+	t.Logf("checked %d distinct archive names derived from the source", len(seen))
 }
 
 // A pin for THIS platform must exist, or the daemon cannot embed anything here.
