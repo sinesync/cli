@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -63,5 +64,28 @@ func TestThisPlatformHasAPin(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no pinned digest covers %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+}
+
+// The model and vocabulary are pinned the same way as the runtime, and for a
+// sharper reason: the URLs previously used /resolve/main/, a mutable branch
+// pointer, so upstream could change what the daemon loads with no compromise
+// involved at all. A digest is only meaningful against a fixed revision.
+func TestModelIsPinnedToARevisionNotABranch(t *testing.T) {
+	for name, url := range map[string]string{"model": modelURL, "vocab": vocabURL} {
+		if strings.Contains(url, "/resolve/main/") {
+			t.Errorf("%s URL resolves a branch, so the pinned digest cannot hold: %s", name, url)
+		}
+		if !strings.Contains(url, modelRevision) {
+			t.Errorf("%s URL does not name the pinned revision: %s", name, url)
+		}
+	}
+	if len(modelRevision) != 40 {
+		t.Errorf("modelRevision %q is not a full commit sha", modelRevision)
+	}
+	for name, sum := range map[string]string{"modelSHA256": modelSHA256, "vocabSHA256": vocabSHA256} {
+		if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(sum) {
+			t.Errorf("%s is not a lowercase 64-character SHA-256: %q", name, sum)
+		}
 	}
 }

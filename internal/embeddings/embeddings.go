@@ -30,8 +30,27 @@ const (
 	MaxTokens     = 256
 
 	// Hugging Face URLs
-	modelURL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
-	vocabURL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt"
+	// Pinned to a REVISION, not to /resolve/main/. A branch pointer means the
+	// upstream repository can change these files at any time with no compromise
+	// involved, and model.onnx is parsed and executed by the ONNX runtime. The
+	// digests below only mean something because the revision is fixed too:
+	// pinning a hash against a moving target would just break on the next
+	// upstream push.
+	modelRevision = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+
+	modelURL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/" + modelRevision + "/onnx/model.onnx"
+	vocabURL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/" + modelRevision + "/vocab.txt"
+
+	// SHA-256 of the two files at that revision, each cross-checked against
+	// Hugging Face's own metadata rather than trusted from a single download:
+	//   model.onnx is LFS-stored, and this matches the lfs.oid the tree API
+	//     publishes for it (which IS the SHA-256).
+	//   vocab.txt is a plain git blob, so the API gives only a SHA-1 oid —
+	//     recomputing sha1("blob <size>\0" + content) over the download
+	//     reproduces fb140275c155a9c7c5a3b3e0e77a9e839594a938, confirming the
+	//     bytes these hashes were taken from are the ones upstream records.
+	modelSHA256 = "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452"
+	vocabSHA256 = "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
 
 	// Special token IDs (BERT vocab)
 	clsTokenID = 101 // [CLS]
@@ -426,71 +445,41 @@ func newProviderInternal() (*Provider, error) {
 
 // downloadModel downloads the ONNX model from Hugging Face
 func downloadModel() error {
-	// Create model directory
+	return downloadVerified(modelURL, modelFilePath(), modelSHA256, "embedding model")
+}
+
+// downloadVerified fetches url, checks it against want, and only then puts it
+// at dest. The file is hashed while streaming to a temporary path and renamed
+// into place after it verifies, so a failed or substituted download never
+// exists at the name the daemon loads from — an interrupted download that left
+// a truncated model behind would otherwise be indistinguishable from a real one.
+func downloadVerified(url, dest, want, what string) error {
 	dir := modelDir()
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 
-	// Download model file
-	resp, err := http.Get(modelURL)
+	tmp, sum, err := downloadToTemp(url)
 	if err != nil {
-		return fmt.Errorf("download: %w", err)
+		return fmt.Errorf("downloading %s: %w", what, err)
 	}
-	defer resp.Body.Close()
+	defer os.Remove(tmp)
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	if sum != want {
+		return fmt.Errorf("refusing to install the %s: SHA-256 %s does not match the pinned %s", what, sum, want)
 	}
-
-	// Create output file
-	out, err := os.Create(modelFilePath())
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		return fmt.Errorf("securing %s: %w", what, err)
 	}
-	defer out.Close()
-
-	// Copy with progress indication
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		return fmt.Errorf("save file: %w", err)
+	if err := os.Rename(tmp, dest); err != nil {
+		return fmt.Errorf("installing %s: %w", what, err)
 	}
-
 	return nil
 }
 
 // downloadVocab downloads the vocab.txt from Hugging Face
 func downloadVocab() error {
-	// Create model directory
-	dir := modelDir()
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create dir: %w", err)
-	}
-
-	// Download vocab file
-	resp, err := http.Get(vocabURL)
-	if err != nil {
-		return fmt.Errorf("download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
-	}
-
-	// Create output file
-	out, err := os.Create(vocabFilePath())
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		return fmt.Errorf("save file: %w", err)
-	}
-
-	return nil
+	return downloadVerified(vocabURL, vocabFilePath(), vocabSHA256, "tokenizer vocabulary")
 }
 
 // downloadONNXRuntime downloads and extracts the ONNX runtime library
