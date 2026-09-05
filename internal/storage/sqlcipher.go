@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -248,8 +249,19 @@ func (s *SQLCipherStorage) SaveObservation(obs *Observation) error {
 		return fmt.Errorf("marshal extensions: %w", err)
 	}
 
-	createdAt := obs.Core.CreatedAt.Format(time.RFC3339)
-	updatedAt := obs.Core.UpdatedAt.Format(time.RFC3339)
+	// RFC3339Nano, not RFC3339. RFC3339 has no fractional part, so every
+	// timestamp written through it was silently truncated to the second — which
+	// meant a plaintext observation could never be proved to have round-tripped
+	// intact, and the legacy migration could not honestly delete anything.
+	//
+	// Backward compatible in both directions: time.Parse with the RFC3339
+	// layout accepts a fractional seconds field even though the layout does not
+	// contain one, so an old reader handles a new value, and rows already
+	// stored without a fraction keep parsing exactly as before. Existing rows
+	// are deliberately NOT rewritten — migrating data at rest is a separate
+	// change with its own risks.
+	createdAt := obs.Core.CreatedAt.Format(time.RFC3339Nano)
+	updatedAt := obs.Core.UpdatedAt.Format(time.RFC3339Nano)
 	createdAtEpoch := obs.Core.CreatedAt.Unix()
 
 	starred := 0
@@ -690,6 +702,40 @@ func nilIfEmpty(s string) interface{} {
 }
 
 // serializeFloat32 converts a float32 slice to little-endian bytes for sqlite-vec.
+// GetObservationVector returns the embedding actually stored in the sqlite-vec
+// table for an observation, or nil when there is no vector row for it.
+//
+// It exists because SaveObservation treats a failed vector insert as non-fatal:
+// the observation is persisted and search silently degrades to FTS-only. That
+// is a reasonable trade for a live capture, and an unacceptable one for
+// deciding whether a plaintext file is safe to delete — "the vector probably
+// made it" is not a basis for removing the only other copy.
+func (s *SQLCipherStorage) GetObservationVector(id string) ([]float32, error) {
+	var rowid int64
+	if err := s.db.QueryRow("SELECT rowid FROM observations WHERE id = ?", id).Scan(&rowid); err != nil {
+		return nil, err
+	}
+
+	var blob []byte
+	err := s.db.QueryRow("SELECT embedding FROM observations_vec WHERE rowid = ?", rowid).Scan(&blob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return deserializeFloat32(blob), nil
+}
+
+// deserializeFloat32 is the inverse of serializeFloat32.
+func deserializeFloat32(buf []byte) []float32 {
+	vec := make([]float32, len(buf)/4)
+	for i := range vec {
+		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[i*4:]))
+	}
+	return vec
+}
+
 func serializeFloat32(vec []float32) []byte {
 	buf := make([]byte, len(vec)*4)
 	for i, v := range vec {
