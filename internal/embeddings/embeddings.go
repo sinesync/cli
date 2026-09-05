@@ -5,12 +5,15 @@ import (
 	"archive/zip"
 	"bufio"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -31,16 +34,15 @@ const (
 	vocabURL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt"
 
 	// Special token IDs (BERT vocab)
-	clsTokenID = 101  // [CLS]
-	sepTokenID = 102  // [SEP]
-	unkTokenID = 100  // [UNK]
-	padTokenID = 0    // [PAD]
+	clsTokenID = 101 // [CLS]
+	sepTokenID = 102 // [SEP]
+	unkTokenID = 100 // [UNK]
+	padTokenID = 0   // [PAD]
 
 	// ONNX Runtime library URL (Linux x64)
 	onnxRuntimeVersion = "1.16.3"
 	onnxRuntimeURL     = "https://github.com/microsoft/onnxruntime/releases/download/v1.16.3/onnxruntime-linux-x64-1.16.3.tgz"
 )
-
 
 // Accelerator type for embeddings
 type Accelerator string
@@ -532,27 +534,95 @@ func downloadONNXRuntime(useGPU bool, accel Accelerator) error {
 		return fmt.Errorf("unsupported architecture: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
-	// Download the archive
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("download: %w", err)
+	// This archive is a NATIVE LIBRARY that gets loaded into this process, so a
+	// substituted download is code execution as the user — with access to the
+	// decrypted observations in memory and every credential the daemon can
+	// reach. HTTPS stops an on-path attacker; it says nothing about whether the
+	// bytes GitHub served are the bytes we expect. Verify before extracting.
+	name := path.Base(url)
+	want, pinned := onnxArchiveDigests[name]
+	if !pinned {
+		return fmt.Errorf("refusing to download %s: no pinned SHA-256 for it. "+
+			"Add one to onnxArchiveDigests after verifying the archive, rather than "+
+			"loading an unverified native library", name)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	archive, sum, err := downloadToTemp(url)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(archive)
+
+	if sum != want {
+		// Deleted, not left on disk: a mismatched archive is either a corrupt
+		// download or a substituted one, and neither should be retrievable by
+		// something else later.
+		return fmt.Errorf("refusing to install %s: SHA-256 %s does not match the pinned %s", name, sum, want)
 	}
 
 	// Create lib directory
 	libDir := filepath.Join(modelDir(), "lib")
-	if err := os.MkdirAll(libDir, 0755); err != nil {
+	if err := os.MkdirAll(libDir, 0700); err != nil {
 		return fmt.Errorf("create lib dir: %w", err)
 	}
 
-	if runtime.GOOS == "windows" {
-		return extractONNXZip(resp.Body, libDir)
+	f, err := os.Open(archive)
+	if err != nil {
+		return fmt.Errorf("reopening verified archive: %w", err)
 	}
-	return extractONNXTarGz(resp.Body, libDir)
+	defer f.Close()
+
+	if runtime.GOOS == "windows" {
+		return extractONNXZip(f, libDir)
+	}
+	return extractONNXTarGz(f, libDir)
+}
+
+// onnxArchiveDigests pins the SHA-256 of every ONNX Runtime archive this build
+// will accept, keyed by the release asset's filename.
+//
+// Computed by downloading each asset from
+// github.com/microsoft/onnxruntime/releases/tag/v1.23.2 and hashing it. Bumping
+// onnxVersion REQUIRES recomputing every entry: an unpinned name is refused
+// rather than downloaded, so a forgotten update fails loudly instead of
+// silently dropping the check.
+var onnxArchiveDigests = map[string]string{
+	"onnxruntime-linux-aarch64-1.23.2.tgz": "7c63c73560ed76b1fac6cff8204ffe34fe180e70d6582b5332ec094810241e5c",
+	"onnxruntime-linux-x64-1.23.2.tgz":     "1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b",
+	"onnxruntime-linux-x64-gpu-1.23.2.tgz": "2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53",
+	"onnxruntime-osx-arm64-1.23.2.tgz":     "b4d513ab2b26f088c66891dbbc1408166708773d7cc4163de7bdca0e9bbb7856",
+	"onnxruntime-win-x64-1.23.2.zip":       "0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd",
+	"onnxruntime-win-arm64-1.23.2.zip":     "1cfe88b6435df3b5fb0e9f6bd7d6f5df1e887b6174de7f6e2a47bab956f3f168",
+}
+
+// downloadToTemp streams url to a temporary file, returning its path and the
+// SHA-256 of what was written.
+//
+// To a file rather than memory because these archives reach 240 MB, and hashed
+// while streaming so the bytes verified are the bytes stored — hashing a
+// separate read would leave a window where the two differ.
+func downloadToTemp(url string) (path string, sum string, err error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", "", fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	}
+
+	tmp, err := os.CreateTemp("", "sinesync-onnx-*")
+	if err != nil {
+		return "", "", fmt.Errorf("creating temporary file: %w", err)
+	}
+	defer tmp.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, h), resp.Body); err != nil {
+		os.Remove(tmp.Name())
+		return "", "", fmt.Errorf("downloading %s: %w", url, err)
+	}
+	return tmp.Name(), hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // extractONNXTarGz extracts the ONNX runtime shared library from a .tgz archive (Linux/macOS)
@@ -785,7 +855,6 @@ func (p *Provider) Embed(text string) ([]float32, error) {
 	copy(embedding, data[:Dimensions])
 	return embedding, nil
 }
-
 
 // Close cleans up resources
 func (p *Provider) Close() error {
