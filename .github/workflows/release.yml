@@ -123,7 +123,7 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
             export CC=gcc
-            SQLCIPHER_DIR="$(go env GOMODCACHE)/github.com/miclip/go-sqlcipher/v4@v4.4.3-0.20260209183651-988da792235a"
+            SQLCIPHER_DIR="$(go env GOMODCACHE)/github.com/sinesync/go-sqlcipher/v4@v4.4.3-0.20260209183651-988da792235a"
             export CGO_CFLAGS="-I${SQLCIPHER_DIR}"
             export CGO_LDFLAGS="-static -L${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/lib -lws2_32 -lgdi32 -lcrypt32"
           fi

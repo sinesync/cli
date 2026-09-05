@@ -73,7 +73,7 @@ Both SQLCipher and sqlite-vec require CGO. This is the biggest build system chan
 
 | Library | Purpose | Package |
 |---------|---------|---------|
-| SQLCipher | Encrypted SQLite | `github.com/miclip/go-sqlcipher/v4` ([fork](https://github.com/miclip/go-sqlcipher) of mutecomm/go-sqlcipher with SQLCipher v4.13.0 / SQLite 3.51.2) |
+| SQLCipher | Encrypted SQLite | `github.com/sinesync/go-sqlcipher/v4` ([fork](https://github.com/sinesync/go-sqlcipher) of mutecomm/go-sqlcipher with SQLCipher v4.13.0 / SQLite 3.51.2) |
 | sqlite-vec | Vector search | `github.com/asg017/sqlite-vec-go-bindings/cgo` |
 
 - `CGO_ENABLED=1` required for all builds
@@ -95,7 +95,7 @@ Both SQLCipher and sqlite-vec require CGO. This is the biggest build system chan
 
 **Status: Confirmed working.** All three components (SQLCipher, sqlite-vec, FTS5) operate together in a single encrypted database.
 
-The upstream `mutecomm/go-sqlcipher/v4` bundles SQLite 3.33.0, which lacks the `sqlite3_vtab_in` APIs (added in SQLite 3.38.0) required by sqlite-vec. Our [fork](https://github.com/miclip/go-sqlcipher) updates the amalgamation to SQLCipher v4.13.0 (SQLite 3.51.2), resolving this. Key fork changes:
+The upstream `mutecomm/go-sqlcipher/v4` bundles SQLite 3.33.0, which lacks the `sqlite3_vtab_in` APIs (added in SQLite 3.38.0) required by sqlite-vec. Our [fork](https://github.com/sinesync/go-sqlcipher) updates the amalgamation to SQLCipher v4.13.0 (SQLite 3.51.2), resolving this. Key fork changes:
 
 - SQLCipher v4.13.0 amalgamation (sqlite3.c/sqlite3.h/sqlite3ext.h)
 - Platform-native crypto: CommonCrypto on macOS, OpenSSL on Linux/Windows (libtomcrypt removed in SQLCipher v4.6+)
@@ -293,7 +293,7 @@ On daemon startup, detect `~/.sinesync/data/observation/` directory:
 | `internal/cli/setup.go` | Add `UserPromptSubmit` hook config for standalone mode |
 | `internal/cli/hooks.go` | Add `runPrompt` command |
 | `internal/adapters/claudemem.go` | Change import from `modernc.org/sqlite` to `go-sqlcipher/v4` (opens unencrypted claude-mem DB without `PRAGMA key`) |
-| `go.mod` | Add `miclip/go-sqlcipher/v4` (with replace for `mutecomm/go-sqlcipher/v4`), `sqlite-vec-go-bindings/cgo`; remove `modernc.org/sqlite` |
+| `go.mod` | Add `sinesync/go-sqlcipher/v4` (with replace for `mutecomm/go-sqlcipher/v4`), `sqlite-vec-go-bindings/cgo`; remove `modernc.org/sqlite` |
 | `.goreleaser.yaml` | Add `CGO_ENABLED=1`, cross-compile config |
 | `.github/workflows/release.yml` | Change `CGO_ENABLED=0` to `CGO_ENABLED=1`, add build dependencies |
 
