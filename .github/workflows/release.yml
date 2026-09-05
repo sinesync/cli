@@ -10,6 +10,10 @@ on:
         description: 'Version to release (e.g., v1.0.0)'
         required: true
 
+# Least privilege by default; jobs that need more raise it themselves.
+permissions:
+  contents: read
+
 env:
   GO_VERSION: '1.25'
   BINARY_NAME: sinesync
