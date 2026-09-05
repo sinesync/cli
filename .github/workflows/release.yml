@@ -448,9 +448,22 @@ jobs:
             gsutil cp upload/sinesync-release.pub "gs://${BUCKET}/sinesync-release.pub"
           fi
 
-          # Write latest version pointer (always overwrite, short cache)
-          echo -n "${VERSION}" > latest
-          gsutil -h "Cache-Control:public, max-age=300" cp latest "gs://${BUCKET}/latest"
+          # Write the latest version pointer — but NEVER for a prerelease.
+          #
+          # `latest` is what `sinesync update` reads to decide whether a newer
+          # build exists, and it is served with max-age=300. Moving it to a
+          # release candidate therefore offers that candidate to every existing
+          # install within five minutes. A semver prerelease is identified by a
+          # hyphen (v1.2.3-rc.1); stable versions have none.
+          case "${VERSION}" in
+            *-*)
+              echo "Prerelease ${VERSION}: leaving gs://${BUCKET}/latest untouched"
+              ;;
+            *)
+              echo -n "${VERSION}" > latest
+              gsutil -h "Cache-Control:public, max-age=300" cp latest "gs://${BUCKET}/latest"
+              ;;
+          esac
 
           echo "Published ${VERSION} to gs://${BUCKET}/"
           gsutil ls "gs://${BUCKET}/${VERSION}/"
