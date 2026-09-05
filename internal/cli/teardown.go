@@ -16,6 +16,7 @@ import (
 	"github.com/sinesync/cli/internal/config"
 	"github.com/sinesync/cli/internal/daemon"
 	"github.com/sinesync/cli/internal/keychain"
+	"github.com/sinesync/cli/internal/storage"
 	"github.com/spf13/cobra"
 )
 
@@ -102,7 +103,7 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 6: Ask about memory.db deletion (after daemon is stopped)
-	deletedDB := false
+	keptDatabase := false
 	memoryPath := filepath.Join(config.DataDir(), "memory.db")
 	_, statErr := os.Stat(memoryPath)
 	if statErr == nil {
@@ -117,34 +118,30 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 			os.Remove(memoryPath + "-shm")
 			if err := os.Remove(memoryPath); err != nil {
 				fmt.Printf("   ⚠ Failed to delete: %v\n", err)
+				// Still there, so still needs its key.
+				keptDatabase = true
 			} else {
 				fmt.Println("   ✓ Memory database deleted")
-				deletedDB = true
 			}
 		} else {
 			fmt.Println("   Kept (you can re-sync later with 'sinesync setup')")
+			keptDatabase = true
 		}
 	} else if os.IsNotExist(statErr) {
 		fmt.Println("\n6. No local memory database found")
-		deletedDB = true // no DB means nothing to preserve keys for
 	} else {
+		// Not "there is no database" — this is "I could not look". Treated as a
+		// kept database, which makes step 7 work out which key opens it, fail to
+		// stat it a second time, and stop before deleting anything.
 		fmt.Printf("\n6. ⚠ Could not check memory database: %v\n", statErr)
-		fmt.Println("   Proceeding as if database were deleted; related keychain entries will be cleared.")
-		deletedDB = true
+		keptDatabase = true
 	}
 
 	// Step 7: Clear keychain credentials (encryption keys, tokens, etc.)
-	// Preserve local-db-key if the user kept the database, so it remains accessible.
 	fmt.Println("\n7. Clearing keychain credentials...")
-	var keysToKeep []string
-	if !deletedDB {
-		keysToKeep = append(keysToKeep, "local-db-key")
+	if err := clearKeychainCredentials(memoryPath, keptDatabase, liveTeardownKeychain()); err != nil {
+		return err
 	}
-	keychain.ClearExcept(keysToKeep)
-	_ = keychain.Delete("token")
-	_ = keychain.Delete("refreshToken")
-	_ = keychain.Delete("deviceToken")
-	fmt.Println("   ✓ Keychain credentials cleared")
 
 	// Summary
 	fmt.Println("\n─────────────────────────────────────────")
@@ -157,6 +154,131 @@ func runTeardown(cmd *cobra.Command, args []string) error {
 	fmt.Println("To set up again: sinesync setup")
 
 	return nil
+}
+
+// teardownKeychain is the seam step 7 is tested through. Three functions, named
+// rather than reached for directly, because the property that matters is not
+// what this decides but what it does: a test has to be able to see that nothing
+// was cleared, and a keychain that really deletes things cannot show that.
+type teardownKeychain struct {
+	candidates  func() ([]keychain.DBKeyCandidate, error)
+	clearExcept func(keep []string) error
+	deleteEntry func(name string) error
+}
+
+func liveTeardownKeychain() teardownKeychain {
+	return teardownKeychain{
+		candidates:  keychain.DBKeyCandidates,
+		clearExcept: keychain.ClearExcept,
+		deleteEntry: keychain.Delete,
+	}
+}
+
+// clearKeychainCredentials is step 7 whole: work out which entry must survive,
+// and only then clear.
+//
+// The order is the point. Every failure path returns before clearExcept is
+// called even once, because there is no partial version of this that is better
+// than not starting — a user whose teardown stopped can run it again, and a
+// user whose derived key was deleted cannot get it back.
+func clearKeychainCredentials(dbPath string, keptDatabase bool, kc teardownKeychain) error {
+	// Only when there is a database to protect. A teardown that deleted the
+	// database, or never had one, has nothing to work out and must not be
+	// stopped by a keychain that cannot be read — clearing has always been best
+	// effort in that case, and there is nothing left to lose the key to.
+	var candidates []keychain.DBKeyCandidate
+	if keptDatabase {
+		var err error
+		if candidates, err = kc.candidates(); err != nil {
+			return teardownKeyError(dbPath, fmt.Errorf("the keychain could not be read: %w", err))
+		}
+	}
+
+	keysToKeep, err := preservedKeychainEntries(dbPath, keptDatabase, candidates)
+	if err != nil {
+		return teardownKeyError(dbPath, err)
+	}
+
+	if err := kc.clearExcept(keysToKeep); err != nil {
+		// Partly cleared, possibly. Say so and stop rather than carry on
+		// deleting tokens on top of it.
+		return fmt.Errorf("clearing keychain credentials: %w", err)
+	}
+
+	// After the protected clear, never before: these are unconditional
+	// deletions, and running them first would mean a refusal above still cost
+	// the user something.
+	for _, entry := range []string{"token", "refreshToken", "deviceToken"} {
+		_ = kc.deleteEntry(entry) // best effort: an entry that was never set is not an error
+	}
+
+	fmt.Println("   ✓ Keychain credentials cleared")
+	for _, entry := range keysToKeep {
+		fmt.Printf("   ✓ Kept '%s' — it is the key to the database you kept\n", entry)
+	}
+	return nil
+}
+
+// preservedKeychainEntries returns the keychain entries that must survive
+// teardown, which is the one that still opens a database the user kept.
+//
+// The old answer was "local-db-key, always". That is right only for someone who
+// never logged in: a database created after login is encrypted with the derived
+// key, and clearing that entry while keeping the database left the user with a
+// file nothing on the machine could open, reported as a successful teardown.
+//
+// So the database is asked, through the same resolver the daemon and the CLI
+// open it with. The keychain is not guessed at: if which key opens the database
+// cannot be established, the caller must clear nothing at all. Deleting the
+// wrong entry is unrecoverable, and a teardown that stops halfway can be run
+// again once whatever went wrong is fixed.
+func preservedKeychainEntries(dbPath string, keptDatabase bool, candidates []keychain.DBKeyCandidate) ([]string, error) {
+	if !keptDatabase {
+		// Deleted or never there. Nothing to keep a key for, which is the
+		// behaviour this has always had.
+		return nil, nil
+	}
+
+	exists, err := storage.DatabaseExists(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		// Kept, but there is nothing in it — an empty file left by a crashed
+		// create holds no memories to lock away.
+		return nil, nil
+	}
+
+	_, source, err := storage.ResolveDBKeyFrom(dbPath, candidates)
+	if err != nil {
+		return nil, err
+	}
+	entry := source.Entry()
+	if entry == "" {
+		return nil, fmt.Errorf("the database opens with the %s, which is not stored in a keychain entry this can preserve", source)
+	}
+	return []string{entry}, nil
+}
+
+// teardownKeyError stops teardown before any credential is cleared, and says so
+// in those words: the state a user is left in matters more here than the
+// failure that caused it.
+func teardownKeyError(dbPath string, cause error) error {
+	fmt.Println("   ✗ Nothing was cleared")
+	return fmt.Errorf(`could not work out which keychain entry opens the memory database, so no keychain credentials were deleted.
+
+%v
+
+Your memory database at
+%s
+was kept and is unchanged, and every keychain entry is still there, so nothing
+has been lost. Teardown stopped here rather than delete the key to a database
+you asked to keep — clearing credentials without knowing which key opens it is
+how a kept database becomes unopenable.
+
+Everything before this step is done. Run 'sinesync teardown' again once the
+database can be read, or delete it when asked and run teardown again to clear
+the keychain as well.`, cause, dbPath)
 }
 
 // waitForSyncComplete polls the daemon's sync status endpoint until syncing is

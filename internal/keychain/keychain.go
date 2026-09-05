@@ -1,10 +1,8 @@
 package keychain
 
 import (
-	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -154,8 +152,9 @@ func detectUsableFor(goos string) bool {
 		//
 		// The two properties the guard was carrying are not lost:
 		//
-		//   - Nothing invents a replacement key. GetOrCreateDBKey only generates
-		//     one on keyring.ErrNotFound, and go-keyring's Linux backend
+		//   - Nothing invents a replacement key. CreateLocalDBKey is only
+		//     reached when DBKeyCandidates came back empty, which on Linux
+		//     means keyring.ErrNotFound, and go-keyring's Linux backend
 		//     produces that solely from an empty search result
 		//     (keyring_unix.go:73). A bus that cannot be reached surfaces the
 		//     dbus error verbatim (keyring_unix.go:104-108), which is not
@@ -237,7 +236,7 @@ func SetSecretKey(key string) error {
 
 // Derived key
 func GetDerivedKey() ([]byte, error) {
-	encoded, err := Get("derived-key")
+	encoded, err := Get(EntryDerivedKey)
 	if err != nil {
 		return nil, err
 	}
@@ -246,11 +245,11 @@ func GetDerivedKey() ([]byte, error) {
 
 func SetDerivedKey(key []byte) error {
 	encoded := base64.StdEncoding.EncodeToString(key)
-	return Set("derived-key", encoded)
+	return Set(EntryDerivedKey, encoded)
 }
 
 func ClearDerivedKey() error {
-	return Delete("derived-key")
+	return Delete(EntryDerivedKey)
 }
 
 // Last auth timestamp
@@ -281,7 +280,7 @@ func NeedsReauth() bool {
 
 // Local DB key (for SQLCipher encryption before login)
 func GetLocalDBKey() ([]byte, error) {
-	encoded, err := Get("local-db-key")
+	encoded, err := Get(EntryLocalDBKey)
 	if err != nil {
 		return nil, err
 	}
@@ -290,50 +289,7 @@ func GetLocalDBKey() ([]byte, error) {
 
 func SetLocalDBKey(key []byte) error {
 	encoded := base64.StdEncoding.EncodeToString(key)
-	return Set("local-db-key", encoded)
-}
-
-// GetOrCreateDBKey resolves the encryption key for SQLCipher.
-// Priority: derived key (authenticated) → local DB key → generate new local DB key.
-// Only generates a new key when both are genuinely missing (ErrNotFound),
-// not on other errors like decode failures, to avoid making an existing DB inaccessible.
-func GetOrCreateDBKey() ([]byte, error) {
-	// Guard the whole function, not just the reads. The create path below
-	// responds to "not found" by generating a replacement key — correct when the
-	// keychain is genuinely empty, catastrophic when it merely could not be
-	// reached, because the existing database would no longer decrypt. In a
-	// context with no keychain session, "not found" carries no information.
-	if !usable() {
-		return nil, ErrNoKeychainSession
-	}
-
-	// Try derived key first (authenticated user)
-	key, err := GetDerivedKey()
-	if err == nil && len(key) > 0 {
-		return key, nil
-	}
-	if err != nil && err != keyring.ErrNotFound {
-		return nil, fmt.Errorf("derived key unreadable: %w", err)
-	}
-
-	// Try local DB key (unauthenticated user)
-	key, err = GetLocalDBKey()
-	if err == nil && len(key) > 0 {
-		return key, nil
-	}
-	if err != nil && err != keyring.ErrNotFound {
-		return nil, fmt.Errorf("local DB key unreadable: %w", err)
-	}
-
-	// Both keys genuinely missing — generate a new local DB key
-	key = make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("generate key: %w", err)
-	}
-	if err := SetLocalDBKey(key); err != nil {
-		return nil, fmt.Errorf("store key: %w", err)
-	}
-	return key, nil
+	return Set(EntryLocalDBKey, encoded)
 }
 
 // Device key (for SSO credential bundle encryption)
@@ -367,7 +323,7 @@ func Clear() error {
 
 // ClearExcept removes all stored credentials except those in the keep list.
 func ClearExcept(keep []string) error {
-	allKeys := []string{"session-token", "user-salt", "secret-key", "derived-key", "last-auth", "local-db-key", "device-key"}
+	allKeys := []string{"session-token", "user-salt", "secret-key", EntryDerivedKey, "last-auth", EntryLocalDBKey, "device-key"}
 	keepSet := make(map[string]bool, len(keep))
 	for _, k := range keep {
 		keepSet[k] = true

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 
 	"github.com/sinesync/cli/internal/config"
-	"github.com/sinesync/cli/internal/keychain"
 )
 
 // ResolveBackend opens the SQLCipher storage backend for CLI use.
@@ -31,15 +30,26 @@ func ResolveBackend() (StorageBackend, error) {
 		return nil, err
 	}
 
-	key, err := keychain.GetOrCreateDBKey()
+	// Through the shared resolver, the same one the daemon uses. A CLI command
+	// and the daemon disagreeing about which key opens the database is how a
+	// user ends up with one of them working and the other reporting that their
+	// memories cannot be decrypted.
+	dbPath := filepath.Join(config.DataDir(), "memory.db")
+	key, source, err := ResolveDBKey(dbPath)
 	if err != nil {
+		var mm *DBKeyMismatchError
+		if errors.As(err, &mm) {
+			return nil, fmt.Errorf("%w\n\n%s", err, mm.Remedy())
+		}
 		return nil, fmt.Errorf("failed to resolve DB key: %w", err)
 	}
 
-	dbPath := filepath.Join(config.DataDir(), "memory.db")
 	db, err := NewSQLCipherStorage(dbPath, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open SQLCipher storage: %w", err)
+		// ResolveDBKey verified this key against this file moments ago, so a
+		// failure here is not a wrong key — say so, rather than sending the
+		// user after their keychain.
+		return nil, fmt.Errorf("failed to open SQLCipher storage with the %s (the key was verified against %s first, so this is not a key mismatch): %w", source, dbPath, err)
 	}
 
 	// Migrate the legacy plaintext store into the encrypted one and delete it.

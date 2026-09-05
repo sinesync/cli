@@ -44,17 +44,33 @@ func TestDetectUsableHonoursOptOut(t *testing.T) {
 // The important one. A read failure must never be read as "no key exists",
 // because responding by generating one leaves an existing encrypted database
 // undecryptable — the user's memories become unreachable.
-func TestGetOrCreateDBKeyRefusesWithoutASession(t *testing.T) {
+//
+// Both halves of what GetOrCreateDBKey used to do are checked here: listing the
+// candidates and creating a replacement. Selection moved to internal/storage,
+// but the guard has to stay on this side, because this is the side that can
+// write a new key into the keychain.
+func TestDBKeyFunctionsRefuseWithoutASession(t *testing.T) {
 	original := usable
 	t.Cleanup(func() { usable = original })
 	usable = func() bool { return false }
 
-	key, err := GetOrCreateDBKey()
+	candidates, err := DBKeyCandidates()
 	if err == nil {
-		t.Fatal("GetOrCreateDBKey succeeded with no keychain session; it must not invent a key")
+		t.Fatal("DBKeyCandidates succeeded with no keychain session; an empty list would be read as 'no key exists'")
 	}
 	if !errors.Is(err, ErrNoKeychainSession) {
 		t.Errorf("got %v, want ErrNoKeychainSession so callers can distinguish it from a real failure", err)
+	}
+	if candidates != nil {
+		t.Errorf("got %d candidates back alongside the error", len(candidates))
+	}
+
+	key, err := CreateLocalDBKey()
+	if err == nil {
+		t.Fatal("CreateLocalDBKey succeeded with no keychain session; it must not invent a key")
+	}
+	if !errors.Is(err, ErrNoKeychainSession) {
+		t.Errorf("got %v, want ErrNoKeychainSession", err)
 	}
 	if key != nil {
 		t.Errorf("got a key back (%d bytes) alongside the error", len(key))

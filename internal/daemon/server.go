@@ -196,9 +196,26 @@ func initSQLCipherBackend() (*storage.SQLCipherStorage, error) {
 	}
 	const unsetCheck = "Check that SINESYNC_NO_KEYCHAIN is unset — it disables keychain access wherever it is set."
 
-	key, err := keychain.GetOrCreateDBKey()
+	// Through the shared resolver in internal/storage, not a keychain-only
+	// lookup. Which key opens an existing database is a fact about that file:
+	// a user who ran sinesync before logging in has a database encrypted with
+	// the local key, and preferring the derived key because one now exists
+	// refuses to start against a database that is completely intact.
+	key, source, err := storage.ResolveDBKey(dbPath)
 	if err != nil {
+		var mismatch *storage.DBKeyMismatchError
 		switch {
+		case errors.As(err, &mismatch):
+			// Every stored key was tested against the file and none opened it.
+			// Nothing was changed on the way to finding that out, and the one
+			// thing the user must not do now is delete the database.
+			return nil, refusalError(
+				mismatch.Error()+".",
+				[]string{
+					mismatch.Remedy(),
+					retryStep,
+				},
+			)
 		case keychain.DisabledByEnv():
 			// A deliberate opt-out, checked before ErrNoKeychainSession because
 			// it produces that same error and there is nothing wrong with the
@@ -239,12 +256,14 @@ func initSQLCipherBackend() (*storage.SQLCipherStorage, error) {
 		}
 	}
 
+	log.Printf("[storage] opening %s with the %s", dbPath, source)
+
 	db, err := storage.NewSQLCipherStorage(dbPath, key)
 	if err != nil {
 		return nil, refusalError(
-			fmt.Sprintf("The encrypted database could not be opened: %v", err),
+			fmt.Sprintf("The encrypted database could not be opened with the %s: %v", source, err),
 			[]string{
-				"If the keychain entry was replaced, the current key cannot decrypt the existing database — restore the original entry rather than deleting the database.",
+				"The key was tested against this database before it was used, so this is not a wrong key — check the file itself.",
 				fmt.Sprintf("Check that %s is readable and not held open by another process.", dbPath),
 				retryStep,
 			},
