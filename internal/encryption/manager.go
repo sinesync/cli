@@ -135,13 +135,28 @@ func (m *Manager) SetupExistingDevice(password string) error {
 	return nil
 }
 
-// SetKeyDirect sets the derived key directly (for SSO — account key IS the key)
-func (m *Manager) SetKeyDirect(key []byte) error {
+// SetKeyInMemory sets the derived key for this process only, without storing it
+// in the OS keychain.
+//
+// Split out of SetKeyDirect so that holding a key and persisting it are separate
+// decisions. A test needs a manager that can decrypt, and it must not reach the
+// developer's real keychain to get one: the stored derived key is the only thing
+// that opens their existing database, so a test that overwrites it destroys data
+// that nothing in this repo can regenerate.
+func (m *Manager) SetKeyInMemory(key []byte) error {
 	if len(key) != 32 {
 		return fmt.Errorf("key must be 32 bytes, got %d", len(key))
 	}
 	m.derivedKey = make([]byte, 32)
 	copy(m.derivedKey, key)
+	return nil
+}
+
+// SetKeyDirect sets the derived key directly (for SSO — account key IS the key)
+func (m *Manager) SetKeyDirect(key []byte) error {
+	if err := m.SetKeyInMemory(key); err != nil {
+		return err
+	}
 	return keychain.SetDerivedKey(m.derivedKey)
 }
 

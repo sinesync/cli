@@ -282,41 +282,6 @@ func fetchOrgVaultKey(token, orgID, vaultID string) (string, error) {
 	return *result.EncryptedVaultKey, nil
 }
 
-// fetchMyPublicKey fetches the current user's X25519 public key from the server
-func fetchMyPublicKey(token string) (string, error) {
-	apiBase := getAPIBase()
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	req, err := http.NewRequest("GET", apiBase+"/users/keypair", nil)
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := doVaultRequest(client, req, &token)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch keypair: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("keypair fetch failed %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		PublicKey string `json:"publicKey"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-
-	if result.PublicKey == "" {
-		return "", fmt.Errorf("user has no public key — run 'sinesync login' to set up keypair")
-	}
-
-	return result.PublicKey, nil
-}
-
 // AdminPendingHolder represents an admin who needs a key holder record
 type AdminPendingHolder struct {
 	UserID    string `json:"userId"`

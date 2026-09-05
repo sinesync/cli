@@ -975,6 +975,42 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 	return uploaded, errors, nil
 }
 
+// reportPendingAdminKeyHolders tells the operator that other admins are waiting
+// for the org private key, and stops there.
+//
+// Sync used to seal the org private key to those admins itself, in the
+// background, to whatever public key /org-key/admins-pending returned. That key
+// is the org's entire escrow — it opens every vault key in the organization —
+// and a server that listed a key of its own got a copy of it with nobody
+// watching. The check that would catch such a substitution is a human comparing
+// a fingerprint out of band with the admin it belongs to, and sync has no human:
+// it runs from 'sinesync sync', from the daemon, from a shell script. There is
+// no version of this that is both automatic and safe, so the distribution moved
+// to 'sinesync admin provision', which prompts per recipient and seals nothing
+// it cannot confirm.
+//
+// What is left here is a detection: the listing is a plain read, it names who is
+// waiting, and it costs the operator nothing. Deliberately no private key is
+// fetched or decrypted on this path and no holders record is submitted, so there
+// is nothing here for a substituted key to be sealed to.
+//
+// Returns how many admins are waiting, for tests.
+func reportPendingAdminKeyHolders(w io.Writer, token, orgID string) int {
+	pendingAdmins, err := fetchAdminsPendingKeyHolders(token, orgID)
+	if err != nil {
+		fmt.Fprintf(w, "  Warning: failed to check pending admin holders: %v\n", err)
+		return 0
+	}
+	if len(pendingAdmins) == 0 {
+		return 0
+	}
+
+	fmt.Fprintf(w, "  ⚠ %d admin(s) are waiting for the org key and were NOT given it here.\n", len(pendingAdmins))
+	fmt.Fprintln(w, "    Run 'sinesync admin provision' to distribute it. It will ask you to confirm")
+	fmt.Fprintln(w, "    each admin's key fingerprint with them directly, which sync cannot do.")
+	return len(pendingAdmins)
+}
+
 func runVaultSync(cmd *cobra.Command, args []string) error {
 	token, err := getAuthTokenForVault()
 	if err != nil {
@@ -1124,43 +1160,10 @@ func runVaultSync(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Auto-distribute key holder status to other admins during sync
+		// Admins missing a key holder record are reported, never provisioned
+		// from here. See reportPendingAdminKeyHolders.
 		if isAdmin && orgInfo.OrgPublicKey != "" {
-			pendingAdmins, err := fetchAdminsPendingKeyHolders(token, orgInfo.OrgID)
-			if err != nil {
-				fmt.Printf("  Warning: failed to check pending admin holders: %v\n", err)
-			} else if len(pendingAdmins) > 0 {
-				// Current user must be a key holder to distribute
-				orgKey, err := fetchOrgKey(token, orgInfo.OrgID)
-				if err == nil && orgKey != nil && orgKey.KeyHolder != nil {
-					adminPrivKey, err := fetchAndDecryptPrivateKey(token)
-					if err == nil {
-						orgPrivKeyBytes, err := crypto.X25519Open(orgKey.KeyHolder.EncryptedOrgPrivateKey, adminPrivKey)
-						if err == nil {
-							var holders []map[string]string
-							for _, admin := range pendingAdmins {
-								sealed, err := crypto.X25519Seal(orgPrivKeyBytes, admin.PublicKey)
-								if err != nil {
-									continue
-								}
-								holders = append(holders, map[string]string{
-									"userId":                 admin.UserID,
-									"encryptedOrgPrivateKey": sealed,
-								})
-							}
-							zeroBytes(orgPrivKeyBytes)
-
-							if len(holders) > 0 {
-								if err := submitKeyHolders(token, orgInfo.OrgID, holders); err != nil {
-									fmt.Printf("  Warning: failed to distribute key holder status: %v\n", err)
-								} else {
-									fmt.Printf("  ✓ Distributed key holder status to %d admin(s)\n", len(holders))
-								}
-							}
-						}
-					}
-				}
-			}
+			reportPendingAdminKeyHolders(os.Stdout, token, orgInfo.OrgID)
 		}
 
 		// Fetch org vaults and get user's own vault keys (no admin provisioning here)
@@ -2223,13 +2226,17 @@ var (
 	errKeyMaterialUnusable = errors.New("your key material is not usable")
 )
 
-// ownKeyFingerprint derives this user's fingerprint from their own private key.
+// ownPublicKey derives this user's X25519 public key from the private key they
+// hold, rather than reading it back from the server.
 //
-// Derived, never fetched: a malicious server would report a substituted key's
-// fingerprint to both sides and the comparison would agree. The private key
-// arrives encrypted to our own master key, so a substituted one simply would
-// not decrypt.
-func ownKeyFingerprint(token string) (string, error) {
+// The server's copy of a public key is not evidence of anything. A malicious one
+// can return an attacker's key for /users/keypair, and anything sealed to what it
+// returned is readable by whoever holds the matching private key — the user would
+// be encrypting to a stranger while believing they were encrypting to themselves.
+// The private key arrives encrypted to this user's master key, so a substituted
+// one simply does not decrypt, which makes the locally derived public key the only
+// one worth sealing to.
+func ownPublicKey(token string) (string, error) {
 	priv, err := fetchAndDecryptPrivateKey(token)
 	if err != nil {
 		return "", err
@@ -2237,6 +2244,20 @@ func ownKeyFingerprint(token string) (string, error) {
 	pub, err := crypto.PublicKeyFromPrivate(priv)
 	if err != nil {
 		return "", fmt.Errorf("%w: %w", errKeyMaterialUnusable, err)
+	}
+	return pub, nil
+}
+
+// ownKeyFingerprint derives this user's fingerprint from their own private key.
+//
+// Derived, never fetched: a malicious server would report a substituted key's
+// fingerprint to both sides and the comparison would agree. The private key
+// arrives encrypted to our own master key, so a substituted one simply would
+// not decrypt.
+func ownKeyFingerprint(token string) (string, error) {
+	pub, err := ownPublicKey(token)
+	if err != nil {
+		return "", err
 	}
 	fp, err := crypto.KeyFingerprint(pub)
 	if err != nil {
