@@ -23,6 +23,8 @@ import (
 
 	"regexp"
 
+	"golang.org/x/term"
+
 	sinesync "github.com/sinesync/cli"
 	"github.com/sinesync/cli/internal/config"
 	"github.com/sinesync/cli/internal/daemon"
@@ -505,6 +507,16 @@ func replaceBinary(newBinaryPath string) error {
 		return os.Chmod(currentPath, 0755)
 	}
 
+	// The install lives somewhere this user cannot write, so this update needs
+	// root — and root needs a terminal, which means updates here can never be
+	// automated, scheduled or run from a hook. Offer to move the install
+	// somewhere writable so this is the last time (#160).
+	if moved, err := offerRelocation(newBinaryPath, currentPath); err != nil {
+		return err
+	} else if moved {
+		return nil
+	}
+
 	// Need elevated permissions
 	fmt.Println("Root permissions required to update. You may be prompted for your password.")
 	mvCmd := exec.Command("sudo", "mv", newBinaryPath, currentPath)
@@ -601,4 +613,111 @@ func checkForUpdate() {
 		LastCheck time.Time `json:"lastCheck"`
 	}{LastCheck: time.Now()})
 	os.WriteFile(checkFile, state, 0600)
+}
+
+// userBinDir is the conventional per-user binary directory.
+func userBinDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "bin")
+}
+
+// pathPrecedes reports whether `first` is found before `second` on PATH.
+//
+// It decides whether relocating is safe to do at all. Installing into a
+// directory that PATH consults AFTER the current one would leave the old
+// binary winning every lookup, so the update would appear to do nothing —
+// worse than needing sudo, because it would be silent.
+func pathPrecedes(first, second string) bool {
+	firstAt, secondAt := -1, -1
+	for i, entry := range filepath.SplitList(os.Getenv("PATH")) {
+		clean := filepath.Clean(entry)
+		if firstAt == -1 && clean == filepath.Clean(first) {
+			firstAt = i
+		}
+		if secondAt == -1 && clean == filepath.Clean(second) {
+			secondAt = i
+		}
+	}
+	return firstAt != -1 && (secondAt == -1 || firstAt < secondAt)
+}
+
+// offerRelocation asks whether to move the install to a writable directory,
+// and does it if the answer is yes. Reports whether the update is complete.
+//
+// Declines silently in every case where it cannot be sure the result would be
+// an improvement — no home directory, the target not on PATH ahead of the
+// current location, or no terminal to ask at. Falling back to sudo is a worse
+// experience but a known one; a relocation that leaves the old binary shadowing
+// the new one would be a silent failure.
+func offerRelocation(newBinaryPath, currentPath string) (bool, error) {
+	dest := userBinDir()
+	if dest == "" {
+		return false, nil
+	}
+
+	currentDir := filepath.Dir(currentPath)
+	if filepath.Clean(dest) == filepath.Clean(currentDir) {
+		return false, nil
+	}
+
+	if !pathPrecedes(dest, currentDir) {
+		fmt.Printf("\nTip: installing to %s would let future updates run without sudo,\n"+
+			"     but it is not on your PATH ahead of %s.\n"+
+			"     Add it to PATH first, then run update again.\n\n", dest, currentDir)
+		return false, nil
+	}
+
+	// Never block waiting for an answer nobody can give.
+	if !isInteractive() {
+		fmt.Printf("\nTip: run this from a terminal and %s can be moved to %s,\n"+
+			"     after which updates will not need sudo.\n\n", filepath.Base(currentPath), dest)
+		return false, nil
+	}
+
+	fmt.Printf("\n%s is not writable, so this update needs sudo.\n", currentDir)
+	fmt.Printf("Move the install to %s so future updates do not? [y/N]: ", dest)
+
+	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+		return false, nil
+	}
+
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return false, fmt.Errorf("cannot create %s: %w", dest, err)
+	}
+
+	destPath := filepath.Join(dest, filepath.Base(currentPath))
+	if err := copyFile(newBinaryPath, destPath); err != nil {
+		return false, fmt.Errorf("cannot install to %s: %w", dest, err)
+	}
+	if err := os.Chmod(destPath, 0o755); err != nil {
+		return false, fmt.Errorf("cannot make %s executable: %w", destPath, err)
+	}
+
+	fmt.Printf("Installed to %s\n", destPath)
+
+	// Remove the old one, which needs sudo this once. If it fails, the new
+	// binary still wins on PATH, so say exactly that rather than reporting a
+	// failure the user cannot act on.
+	fmt.Printf("Removing the old install at %s (sudo, this once)...\n", currentPath)
+	rm := exec.Command("sudo", "rm", "-f", currentPath)
+	rm.Stdin, rm.Stdout, rm.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := rm.Run(); err != nil {
+		fmt.Printf("\nCould not remove %s: %v\n", currentPath, err)
+		fmt.Printf("The new install at %s comes first on PATH, so it is what runs.\n", destPath)
+		fmt.Printf("Remove the old one when convenient: sudo rm %s\n\n", currentPath)
+	}
+
+	return true, nil
+}
+
+// isInteractive reports whether there is a terminal to prompt at.
+//
+// Without one, sudo cannot ask for a password either, which is the whole
+// reason an unattended update fails here.
+func isInteractive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
 }
