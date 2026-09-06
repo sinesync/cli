@@ -64,18 +64,60 @@ func TestFallsBackToTheDirectoryOutsideARepository(t *testing.T) {
 	}
 }
 
-// A worktree's .git is a file, not a directory. Treating it as a root keeps a
-// worktree filed under its own name, which is how they are used here.
-func TestAWorktreeIsItsOwnProject(t *testing.T) {
-	base := repo(t, filepath.Join(t.TempDir(), "main-repo"))
-	tree := filepath.Join(base, "worktrees", "wt-feature")
-	mkdirs(t, tree)
-	if err := os.WriteFile(filepath.Join(tree, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+// worktree makes `dir` look like a git worktree of `main`, the way git lays one
+// out: a .git FILE pointing at the main repo's worktrees directory, with a
+// commondir inside it pointing back at the main .git.
+func worktree(t *testing.T, main, dir string) string {
+	t.Helper()
+
+	gitDir := filepath.Join(main, ".git", "worktrees", filepath.Base(dir))
+	mkdirs(t, gitDir, dir)
+
+	if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte("../..\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// Tools that drive work in worktrees create one per task, so filing each under
+// its own name minted a project nothing had assigned to a vault. conclave alone
+// had left twenty-odd of them.
+func TestAWorktreeIsFiledUnderItsRepository(t *testing.T) {
+	main := repo(t, filepath.Join(t.TempDir(), "conclave"))
+	tree := worktree(t, main, filepath.Join(t.TempDir(), "conclave-149"))
+
+	if got := ForDir(tree); got != "conclave" {
+		t.Errorf("ForDir(worktree) = %q, want %q", got, "conclave")
+	}
+}
+
+func TestADirectoryInsideAWorktreeResolvesTheSameWay(t *testing.T) {
+	main := repo(t, filepath.Join(t.TempDir(), "conclave"))
+	tree := worktree(t, main, filepath.Join(t.TempDir(), "conclave-36"))
+	nested := filepath.Join(tree, "internal", "session")
+	mkdirs(t, nested)
+
+	if got := ForDir(nested); got != "conclave" {
+		t.Errorf("ForDir(nested worktree dir) = %q, want %q", got, "conclave")
+	}
+}
+
+// A .git file that cannot be followed must not send the walk up into an
+// unrelated parent directory, which would file the work under whatever
+// happened to be above it.
+func TestAnUnfollowableGitFileStaysPut(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "outer")
+	dir := filepath.Join(base, "orphan-tree")
+	mkdirs(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: /nowhere/at/all\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	if got := ForDir(tree); got != "wt-feature" {
-		t.Errorf("ForDir(worktree) = %q, want %q", got, "wt-feature")
+	if got := ForDir(dir); got != "orphan-tree" {
+		t.Errorf("ForDir(unfollowable) = %q, want %q", got, "orphan-tree")
 	}
 }
 
