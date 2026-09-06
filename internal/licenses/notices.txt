@@ -1,0 +1,53 @@
+----------------------------------------------------------------------------
+Components that are not Go modules
+----------------------------------------------------------------------------
+
+These ship with sine~sync, or are fetched by it at runtime, but carry no
+licence file inside any Go module and so cannot be reproduced verbatim by the
+generator. Each is named here with the terms its upstream project states and
+where those terms are published.
+
+SQLCipher and SQLite
+  The encrypted database engine is compiled into the binary through
+  github.com/mutecomm/go-sqlcipher, served here from the sinesync fork. Its
+  licence file above reproduces, in full and in order: the MIT licence of
+  mattn/go-sqlite3, the BSD licence of SQLCipher (Copyright (c) 2008 ZETETIC
+  LLC), SQLite's public-domain notice, and the LibTom licence.
+
+  SQLCipher's BSD terms ask that its notice appear in a user-accessible
+  location. `sinesync licenses` is that location, and this notice is why the
+  command exists.
+
+  https://www.zetetic.net/sqlcipher/license/
+
+sqlite-vec
+  Vector search inside SQLite, compiled in through
+  github.com/asg017/sqlite-vec-go-bindings. That module distributes the C
+  source without a licence file of any kind — not as a file, and not as a
+  header comment in sqlite-vec.c — so there is no text to reproduce here.
+
+  The upstream project states its terms as Apache-2.0 OR MIT.
+
+  https://github.com/asg017/sqlite-vec
+
+ONNX Runtime
+  Downloaded at first use to run the embedding model locally, rather than
+  vendored, so no licence file arrives with it.
+
+  Published by Microsoft under the MIT licence.
+
+  https://github.com/microsoft/onnxruntime/blob/main/LICENSE
+
+all-MiniLM-L6-v2
+  The sentence-embedding model, downloaded from Hugging Face at first use and
+  pinned by revision. Weights only; no licence file is included in the
+  download.
+
+  Published by the Sentence-Transformers project under Apache-2.0.
+
+  https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+
+----------------------------------------------------------------------------
+
+sine~sync itself is Apache-2.0. See the LICENSE file in the repository:
+https://github.com/sinesync/cli
