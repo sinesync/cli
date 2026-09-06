@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	projectpkg "github.com/sinesync/cli/internal/project"
 	"io"
 	"io/fs"
 	"log"
@@ -991,7 +992,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 
 // processCapture does the actual observation extraction, embedding, and save.
 func (s *Server) processCapture(sessionID, toolName string, toolInput, toolResponse json.RawMessage, cwd string) {
-	project := filepath.Base(cwd)
+	project := projectpkg.ForDir(cwd)
 	log.Printf("[capture] Processing: tool=%s session=%s project=%s", toolName, sessionID, project)
 
 	var toolInputData map[string]interface{}
@@ -1082,7 +1083,7 @@ func (s *Server) handleSubagentStart(w http.ResponseWriter, r *http.Request) {
 			AgentID:   hookInput.AgentID,
 			AgentType: hookInput.AgentType,
 			SessionID: hookInput.SessionID,
-			Project:   filepath.Base(hookInput.CWD),
+			Project:   projectpkg.ForDir(hookInput.CWD),
 			StartedAt: time.Now(),
 		}
 		s.pendingSubagentsMu.Unlock()
@@ -1125,7 +1126,7 @@ func (s *Server) handleSubagentStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) processSubagentStop(sessionID, agentID, transcriptPath, cwd string) {
-	project := filepath.Base(cwd)
+	project := projectpkg.ForDir(cwd)
 
 	// Look up and remove pending subagent info
 	var agentType string
@@ -1503,7 +1504,7 @@ func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"status": "accepted"})
 
 	sessionID := hookInput.SessionID
-	project := filepath.Base(hookInput.CWD)
+	project := projectpkg.ForDir(hookInput.CWD)
 
 	s.enqueueHook(func() {
 		s.processSummarize(sessionID, project)
@@ -1637,7 +1638,7 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
 
 	sessionID := hookInput.SessionID
 	prompt := hookInput.Prompt
-	project := filepath.Base(hookInput.CWD)
+	project := projectpkg.ForDir(hookInput.CWD)
 
 	s.enqueueHook(func() {
 		if sessionID == "" {
@@ -1713,7 +1714,7 @@ func (s *Server) handleCodexCapture(w http.ResponseWriter, r *http.Request) {
 func (s *Server) processCodexCapture(threadID, turnID, cwd string, inputMessages []string, lastAssistantMessage string) {
 	project := ""
 	if cwd != "" && cwd != string(os.PathSeparator) {
-		project = filepath.Base(cwd)
+		project = projectpkg.ForDir(cwd)
 		if project == "." {
 			project = ""
 		}

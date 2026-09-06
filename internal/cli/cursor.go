@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/sinesync/cli/internal/project"
 	"github.com/spf13/cobra"
 )
 
@@ -140,7 +141,7 @@ func runCursorContext(cmd *cobra.Command, args []string) error {
 	}
 
 	root := cursorWorkspaceRoot(input.WorkspaceRoots)
-	project := filepath.Base(root)
+	project := project.ForDir(root)
 
 	// Check auth status
 	authStatus := checkAuthStatus()
@@ -333,4 +334,3 @@ func runCursorSummarize(cmd *cobra.Command, args []string) error {
 	drainClose(resp)
 	return nil
 }
-

@@ -13,6 +13,7 @@ import (
 
 	"github.com/sinesync/cli/internal/config"
 	"github.com/sinesync/cli/internal/daemon"
+	"github.com/sinesync/cli/internal/project"
 	"github.com/spf13/cobra"
 )
 
@@ -190,7 +191,7 @@ func runContext(cmd *cobra.Command, args []string) error {
 		input.CWD, _ = os.Getwd()
 	}
 
-	project := filepath.Base(input.CWD)
+	project := project.ForDir(input.CWD)
 
 	// Check auth status
 	authStatus := checkAuthStatus()
