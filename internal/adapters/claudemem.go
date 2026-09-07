@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/mutecomm/go-sqlcipher/v4"
 	"github.com/sinesync/cli/internal/doctor"
 	"github.com/sinesync/cli/internal/storage"
-	_ "github.com/mutecomm/go-sqlcipher/v4"
 )
 
 const ClaudeMemAdapterName = "claude-mem"
@@ -167,14 +167,14 @@ func (a *ClaudeMemAdapter) Import(ctx context.Context, sinceEpoch int64) ([]stor
 
 	for rows.Next() {
 		var (
-			id                                               int64
-			sdkSessionID                                     sql.NullString
-			project, obsType                                 sql.NullString
-			title, subtitle, narrative                       sql.NullString
-			factsJSON, conceptsJSON                          sql.NullString
-			filesReadJSON, filesModifiedJSON                 sql.NullString
-			createdAt                                        string
-			createdAtEpoch                                   int64
+			id                               int64
+			sdkSessionID                     sql.NullString
+			project, obsType                 sql.NullString
+			title, subtitle, narrative       sql.NullString
+			factsJSON, conceptsJSON          sql.NullString
+			filesReadJSON, filesModifiedJSON sql.NullString
+			createdAt                        string
+			createdAtEpoch                   int64
 		)
 
 		err := rows.Scan(
@@ -867,14 +867,14 @@ func (a *ClaudeMemAdapter) BackfillEmbeddings(limit int) (int, error) {
 	defer rows.Close()
 
 	type obsData struct {
-		ID               int64
-		Project          string
-		Type             string
-		Title            string
-		Subtitle         string
-		Narrative        string
-		Epoch            int64
-		MemorySessionID  string
+		ID              int64
+		Project         string
+		Type            string
+		Title           string
+		Subtitle        string
+		Narrative       string
+		Epoch           int64
+		MemorySessionID string
 	}
 
 	var toProcess []obsData

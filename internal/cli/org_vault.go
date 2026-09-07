@@ -21,8 +21,8 @@ type OrgInfo struct {
 
 // OrgKeyResponse represents the response from /organizations/:id/org-key
 type OrgKeyResponse struct {
-	OrgPublicKey string      `json:"orgPublicKey"`
-	KeyHolder    *KeyHolder  `json:"keyHolder"`
+	OrgPublicKey string     `json:"orgPublicKey"`
+	KeyHolder    *KeyHolder `json:"keyHolder"`
 }
 
 // KeyHolder represents an org key holder record

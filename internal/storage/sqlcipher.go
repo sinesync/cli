@@ -536,16 +536,16 @@ func (s *SQLCipherStorage) IncrementSessionObservationCount(sessionID string) er
 func (s *SQLCipherStorage) scanObservation(row *sql.Row) (*Observation, error) {
 	var obs Observation
 	var (
-		sessionID                                                  sql.NullString
-		createdAt, updatedAt                                       string
-		factsJSON, conceptsJSON, filesReadJSON, filesModifiedJSON  sql.NullString
-		codeRefsJSON, tagsJSON, extensionsJSON                     sql.NullString
-		notes, classification, vaultID                             sql.NullString
-		sourceAdapter, sourceID, sourceMachine, sourceChecksum     sql.NullString
-		embeddingModel, embeddingTokenizer                         sql.NullString
-		starred, archived                                          int
-		sourceEpoch                                                sql.NullInt64
-		embeddingDims                                              sql.NullInt64
+		sessionID                                                 sql.NullString
+		createdAt, updatedAt                                      string
+		factsJSON, conceptsJSON, filesReadJSON, filesModifiedJSON sql.NullString
+		codeRefsJSON, tagsJSON, extensionsJSON                    sql.NullString
+		notes, classification, vaultID                            sql.NullString
+		sourceAdapter, sourceID, sourceMachine, sourceChecksum    sql.NullString
+		embeddingModel, embeddingTokenizer                        sql.NullString
+		starred, archived                                         int
+		sourceEpoch                                               sql.NullInt64
+		embeddingDims                                             sql.NullInt64
 	)
 
 	err := row.Scan(
@@ -577,16 +577,16 @@ func (s *SQLCipherStorage) scanObservation(row *sql.Row) (*Observation, error) {
 func (s *SQLCipherStorage) scanObservationRow(rows *sql.Rows) (*Observation, error) {
 	var obs Observation
 	var (
-		sessionID                                                  sql.NullString
-		createdAt, updatedAt                                       string
-		factsJSON, conceptsJSON, filesReadJSON, filesModifiedJSON  sql.NullString
-		codeRefsJSON, tagsJSON, extensionsJSON                     sql.NullString
-		notes, classification, vaultID                             sql.NullString
-		sourceAdapter, sourceID, sourceMachine, sourceChecksum     sql.NullString
-		embeddingModel, embeddingTokenizer                         sql.NullString
-		starred, archived                                          int
-		sourceEpoch                                                sql.NullInt64
-		embeddingDims                                              sql.NullInt64
+		sessionID                                                 sql.NullString
+		createdAt, updatedAt                                      string
+		factsJSON, conceptsJSON, filesReadJSON, filesModifiedJSON sql.NullString
+		codeRefsJSON, tagsJSON, extensionsJSON                    sql.NullString
+		notes, classification, vaultID                            sql.NullString
+		sourceAdapter, sourceID, sourceMachine, sourceChecksum    sql.NullString
+		embeddingModel, embeddingTokenizer                        sql.NullString
+		starred, archived                                         int
+		sourceEpoch                                               sql.NullInt64
+		embeddingDims                                             sql.NullInt64
 	)
 
 	err := rows.Scan(
