@@ -123,6 +123,40 @@
 
     var bannerShown = false;
 
+    // Banners are built as nodes, not markup.
+    //
+    // These assignments were safe because every caller passed a literal, but
+    // nothing enforced that: the dashboard CSP test had to exclude this file by
+    // name, so a future banner interpolating a server-supplied string would have
+    // been caught by nothing. Text nodes make the property hold by construction.
+    //
+    // A part is a string, or {text, bold} / {text, code}.
+    function appendBannerParts(el, parts) {
+        parts.forEach(function (part) {
+            if (typeof part !== 'object' || part === null) {
+                el.appendChild(document.createTextNode(String(part)));
+                return;
+            }
+            var text = document.createTextNode(String(part.text));
+            if (part.bold) {
+                var strong = document.createElement('strong');
+                strong.appendChild(text);
+                el.appendChild(strong);
+                return;
+            }
+            if (part.code) {
+                var code = document.createElement('code');
+                code.style.background = 'rgba(255,255,255,.18)';
+                code.style.padding = '2px 6px';
+                code.style.borderRadius = '4px';
+                code.appendChild(text);
+                el.appendChild(code);
+                return;
+            }
+            el.appendChild(text);
+        });
+    }
+
     function showAuthBanner(message) {
         if (bannerShown) {
             return;
@@ -139,9 +173,12 @@
                 'font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
                 'text-align:center', 'box-shadow:0 2px 8px rgba(0,0,0,.4)'
             ].join(';');
-            el.innerHTML = '<strong>Dashboard not authorized.</strong> ' + message +
-                ' Open it with <code style="background:rgba(255,255,255,.18);padding:2px 6px;border-radius:4px">sinesync dashboard</code>' +
-                ' so the access token is supplied.';
+            appendBannerParts(el, [
+                { text: 'Dashboard not authorized.', bold: true },
+                ' ' + message + ' Open it with ',
+                { text: 'sinesync dashboard', code: true },
+                ' so the access token is supplied.'
+            ]);
             document.body.appendChild(el);
         }
 
@@ -169,9 +206,14 @@
             'font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
             'box-shadow:0 4px 16px rgba(0,0,0,.4)'
         ].join(';');
-        el.innerHTML = '<strong>Not permitted from the dashboard.</strong> ' +
-            'Deleting propagates to every synced device, so it needs the CLI: ' +
-            '<code style="background:rgba(255,255,255,.18);padding:2px 6px;border-radius:4px">sinesync forget &lt;id&gt;</code>.';
+        appendBannerParts(el, [
+            { text: 'Not permitted from the dashboard.', bold: true },
+            ' Deleting propagates to every synced device, so it needs the CLI: ',
+            // Written plainly: it is a text node, so the angle brackets need no
+            // entity encoding and cannot start a tag.
+            { text: 'sinesync forget <id>', code: true },
+            '.'
+        ]);
         (document.body || document.documentElement).appendChild(el);
         setTimeout(function () {
             if (el.parentNode) {
