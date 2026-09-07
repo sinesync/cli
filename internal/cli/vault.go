@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -674,11 +675,12 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 	client := &http.Client{Timeout: 300 * time.Second}
 
 	// Re-encrypt and upload observations
-	var uploaded, errors int
+	var uploaded, failed int
+	var reasons map[string]int
 	if len(projectObs) > 0 {
 		fmt.Println("Re-encrypting with vault key and uploading...")
 
-		uploaded, errors, err = reencryptAndUploadObservations(projectObs, vaultKey, toVaultID, token, apiBase, client, encMgr)
+		uploaded, failed, reasons, err = reencryptAndUploadObservations(projectObs, vaultKey, toVaultID, token, apiBase, client, encMgr)
 		if err != nil {
 			return fmt.Errorf("re-encryption failed: %w", err)
 		}
@@ -705,11 +707,10 @@ func runVaultMigrateProject(cmd *cobra.Command, args []string) error {
 		fmt.Printf("✓ Re-encrypted observations for project '%s' in vault '%s'\n", projectName, targetVaultName)
 	}
 	if len(projectObs) > 0 {
-		fmt.Printf("  %d observations uploaded", uploaded)
-		if errors > 0 {
-			fmt.Printf(", %d errors", errors)
-		}
-		fmt.Println()
+		// Reported after the assignment is updated, not before: the routing
+		// change is worth keeping even when some observations were refused,
+		// and the caller still learns that they were.
+		return reportMigrationOutcome(os.Stdout, uploaded, failed, reasons)
 	}
 
 	return nil
@@ -804,23 +805,24 @@ func runVaultReencrypt(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Re-encrypting with vault key and uploading...")
 
-	uploaded, errors, err := reencryptAndUploadObservations(vaultObs, vaultKey, vaultID, token, apiBase, client, encMgr)
+	uploaded, failed, reasons, err := reencryptAndUploadObservations(vaultObs, vaultKey, vaultID, token, apiBase, client, encMgr)
 	if err != nil {
 		return fmt.Errorf("re-encryption failed: %w", err)
 	}
 
-	fmt.Printf("✓ Re-encrypted %d observations", uploaded)
-	if errors > 0 {
-		fmt.Printf(", %d errors", errors)
+	if err := reportMigrationOutcome(os.Stdout, uploaded, failed, reasons); err != nil {
+		return err
 	}
-	fmt.Println()
 	fmt.Println("\nVault observations are now encrypted with the vault key and can be shared.")
 
 	return nil
 }
 
 // reencryptAndUploadObservations re-encrypts observations with a vault key and uploads them
-func reencryptAndUploadObservations(observations []storage.Observation, vaultKey []byte, vaultID, token, apiBase string, client *http.Client, encMgr *encryption.Manager) (uploaded, errors int, err error) {
+func reencryptAndUploadObservations(observations []storage.Observation, vaultKey []byte, vaultID, token, apiBase string, client *http.Client, encMgr *encryption.Manager) (uploaded, errors int, reasons map[string]int, err error) {
+	// Distinct refusal reasons and how often each occurred, so the caller can
+	// say why rather than only how many.
+	reasons = map[string]int{}
 	batchSize := 50
 
 	for i := 0; i < len(observations); i += batchSize {
@@ -877,13 +879,13 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return uploaded, errors, fmt.Errorf("get upload URLs: %w", err)
+			return uploaded, errors, reasons, fmt.Errorf("get upload URLs: %w", err)
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return uploaded, errors, fmt.Errorf("get upload URLs failed %d: %s", resp.StatusCode, string(respBody))
+			return uploaded, errors, reasons, fmt.Errorf("get upload URLs failed %d: %s", resp.StatusCode, string(respBody))
 		}
 
 		var urlResp struct {
@@ -894,7 +896,7 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&urlResp); err != nil {
 			resp.Body.Close()
-			return uploaded, errors, fmt.Errorf("decode upload URLs: %w", err)
+			return uploaded, errors, reasons, fmt.Errorf("decode upload URLs: %w", err)
 		}
 		resp.Body.Close()
 
@@ -944,35 +946,52 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 
 		confirmResp, err := client.Do(confirmReq)
 		if err != nil {
-			return uploaded, errors, fmt.Errorf("confirm uploads: %w", err)
+			return uploaded, errors, reasons, fmt.Errorf("confirm uploads: %w", err)
 		}
 
 		if confirmResp.StatusCode != http.StatusOK {
 			respBody, _ := io.ReadAll(confirmResp.Body)
 			confirmResp.Body.Close()
-			return uploaded, errors, fmt.Errorf("confirm failed: %d - %s", confirmResp.StatusCode, string(respBody))
+			return uploaded, errors, reasons, fmt.Errorf("confirm failed: %d - %s", confirmResp.StatusCode, string(respBody))
 		}
 
+		// The server reports per-item outcomes inside a 200, so a batch where
+		// every item was refused still arrives as a success. Decoding `error`
+		// as well as `success` is what makes those refusals visible: without
+		// it a migration could reject 98% of its items and say nothing.
 		var confirmResult struct {
 			Items []struct {
-				Success bool `json:"success"`
+				Success bool   `json:"success"`
+				Error   string `json:"error"`
 			} `json:"items"`
 		}
 		json.NewDecoder(confirmResp.Body).Decode(&confirmResult)
 		confirmResp.Body.Close()
 
+		batchUploaded := 0
 		for _, result := range confirmResult.Items {
 			if result.Success {
 				uploaded++
+				batchUploaded++
+				continue
+			}
+			errors++
+			if result.Error != "" {
+				reasons[result.Error]++
 			} else {
-				errors++
+				reasons["refused without a reason"]++
 			}
 		}
 
-		fmt.Printf("  Batch %d/%d: %d uploaded\n", (i/batchSize)+1, (len(observations)+batchSize-1)/batchSize, len(confirmBodies))
+		// What actually landed, not what was sent. Reporting the size of the
+		// request made a batch that failed entirely read as a batch that
+		// succeeded entirely.
+		fmt.Printf("  Batch %d/%d: %d/%d uploaded\n",
+			(i/batchSize)+1, (len(observations)+batchSize-1)/batchSize,
+			batchUploaded, len(confirmBodies))
 	}
 
-	return uploaded, errors, nil
+	return uploaded, errors, reasons, nil
 }
 
 // reportPendingAdminKeyHolders tells the operator that other admins are waiting
@@ -1565,18 +1584,12 @@ func migrateProjectObservations(projectName, toVaultID, token string) error {
 
 	fmt.Println("Re-encrypting with vault key and uploading...")
 
-	uploaded, errors, err := reencryptAndUploadObservations(projectObs, vaultKey, toVaultID, token, apiBase, client, encMgr)
+	uploaded, failed, reasons, err := reencryptAndUploadObservations(projectObs, vaultKey, toVaultID, token, apiBase, client, encMgr)
 	if err != nil {
 		return fmt.Errorf("re-encryption failed: %w", err)
 	}
 
-	fmt.Printf("✓ %d observations uploaded", uploaded)
-	if errors > 0 {
-		fmt.Printf(", %d errors", errors)
-	}
-	fmt.Println()
-
-	return nil
+	return reportMigrationOutcome(os.Stdout, uploaded, failed, reasons)
 }
 
 // GetVaultForProject returns the vault ID for a given project
@@ -2404,4 +2417,41 @@ func fetchAndDecryptPrivateKey(token string) (string, error) {
 
 	encMgr := encryption.GetManager()
 	return encMgr.DecryptUserPrivateKey(result.EncryptedPrivateKey)
+}
+
+// reportMigrationOutcome prints what happened to a migration and returns an
+// error when anything was refused, so the exit code says so too.
+//
+// A tick and a zero exit over a 98% failure rate is exactly how a vault
+// migration that moved 25 of 2,134 observations read as a success, for as long
+// as it did. The per-item reasons come back inside a 200 response, so the only
+// thing standing between a silent failure and a legible one is printing them.
+func reportMigrationOutcome(w io.Writer, uploaded, failed int, reasons map[string]int) error {
+	if failed == 0 {
+		fmt.Fprintf(w, "  %d observations uploaded\n", uploaded)
+		return nil
+	}
+
+	fmt.Fprintf(w, "  %d uploaded, %d refused\n", uploaded, failed)
+
+	type reason struct {
+		text string
+		n    int
+	}
+	ordered := make([]reason, 0, len(reasons))
+	for text, n := range reasons {
+		ordered = append(ordered, reason{text, n})
+	}
+	// Commonest first, then alphabetically, so the output is stable run to run.
+	sort.Slice(ordered, func(a, b int) bool {
+		if ordered[a].n != ordered[b].n {
+			return ordered[a].n > ordered[b].n
+		}
+		return ordered[a].text < ordered[b].text
+	})
+	for _, r := range ordered {
+		fmt.Fprintf(w, "    %d x %s\n", r.n, r.text)
+	}
+
+	return fmt.Errorf("%d of %d observations were not migrated", failed, uploaded+failed)
 }
