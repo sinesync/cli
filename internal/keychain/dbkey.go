@@ -4,9 +4,8 @@ package keychain
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
-
-	"github.com/zalando/go-keyring"
 )
 
 // DBKeyLen is the key size SQLCipher is opened with.
@@ -86,7 +85,7 @@ func DBKeyCandidates() ([]DBKeyCandidate, error) {
 	add := func(source DBKeySource, read func() ([]byte, error)) error {
 		key, err := read()
 		if err != nil {
-			if err == keyring.ErrNotFound {
+			if errors.Is(err, ErrNotFound) {
 				return nil
 			}
 			return fmt.Errorf("%s unreadable: %w", source, err)

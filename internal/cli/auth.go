@@ -1399,8 +1399,19 @@ type deviceResponse struct {
 	ExpiresAt    string `json:"expiresAt"`
 }
 
-// SRP login flow
-func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
+// srpChallenge is the client half of an SRP exchange: the ephemeral public A
+// and the proof M1 that a server holding the verifier can check. The srp.Client
+// is kept because only the instance that computed M1 can verify the server's M2.
+type srpChallenge struct {
+	client       *srp.Client
+	clientPublic string
+	clientProof  string
+}
+
+// requestSRPChallenge runs /auth/login/init for email and turns the salt and
+// server ephemeral B it returns into a proof of password. Login is one caller;
+// anything that has to prove knowledge of the current password is another.
+func requestSRPChallenge(apiBase, email, password string) (*srpChallenge, error) {
 	// Create SRP client (SHA256 + RFC5054 Group4096, compatible with js-srp6a)
 	srpClient := srp.NewClient(email, password)
 
@@ -1440,11 +1451,26 @@ func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
 		return nil, fmt.Errorf("failed to compute proof: %w", err)
 	}
 
+	return &srpChallenge{
+		client:       srpClient,
+		clientPublic: clientPublic,
+		clientProof:  clientProof,
+	}, nil
+}
+
+// SRP login flow
+func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
+	// Steps 1 and 2: init and the client proof of the password
+	challenge, err := requestSRPChallenge(apiBase, email, password)
+	if err != nil {
+		return nil, err
+	}
+
 	// Step 3: Verify - send client public A and proof M1
 	verifyBody, _ := json.Marshal(map[string]string{
 		"email":        email,
-		"clientPublic": clientPublic,
-		"clientProof":  clientProof,
+		"clientPublic": challenge.clientPublic,
+		"clientProof":  challenge.clientProof,
 	})
 	verifyReq, err := http.NewRequest("POST", apiBase+"/auth/login/verify", bytes.NewReader(verifyBody))
 	if err != nil {
@@ -1478,7 +1504,7 @@ func doSRPLogin(apiBase, email, password string) (*authResponse, error) {
 	}
 
 	// Verify server's proof
-	if !srpClient.VerifyServer(result.ServerProof) {
+	if !challenge.client.VerifyServer(result.ServerProof) {
 		return nil, fmt.Errorf("server proof verification failed")
 	}
 

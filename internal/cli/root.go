@@ -60,6 +60,7 @@ func init() {
 	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(deviceCmd)
 	rootCmd.AddCommand(licensesCmd)
+	rootCmd.AddCommand(accountCmd)
 }
 
 // Reembed command - regenerate embeddings with ONNX

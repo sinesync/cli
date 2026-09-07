@@ -2418,9 +2418,14 @@ func normalizeVaultKey(encryptedKey string, token string) (string, error) {
 	return normalized, nil
 }
 
-// fetchAndDecryptPrivateKey retrieves the user's encrypted X25519 private key
-// from the server and decrypts it with the local derived key.
-func fetchAndDecryptPrivateKey(token string) (string, error) {
+// fetchEncryptedPrivateKey retrieves the user's X25519 private key from the
+// server, still wrapped under the derived key.
+//
+// Split out of fetchAndDecryptPrivateKey because a password change needs the
+// wrapped form: it re-wraps that key under the new derived key, and decrypting
+// it here only to hand back a plaintext the caller must re-encrypt would put the
+// private key in one more place for no reason.
+func fetchEncryptedPrivateKey(token string) (string, error) {
 	apiBase := getAPIBase()
 	client := &http.Client{Timeout: 10 * time.Second}
 
@@ -2452,8 +2457,19 @@ func fetchAndDecryptPrivateKey(token string) (string, error) {
 		return "", fmt.Errorf("%w: keypair response did not parse: %w", errKeypairUnavailable, err)
 	}
 
+	return result.EncryptedPrivateKey, nil
+}
+
+// fetchAndDecryptPrivateKey retrieves the user's encrypted X25519 private key
+// from the server and decrypts it with the local derived key.
+func fetchAndDecryptPrivateKey(token string) (string, error) {
+	encryptedPrivateKey, err := fetchEncryptedPrivateKey(token)
+	if err != nil {
+		return "", err
+	}
+
 	encMgr := encryption.GetManager()
-	return encMgr.DecryptUserPrivateKey(result.EncryptedPrivateKey)
+	return encMgr.DecryptUserPrivateKey(encryptedPrivateKey)
 }
 
 // reportMigrationOutcome prints what happened to a migration and returns an

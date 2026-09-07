@@ -33,6 +33,18 @@ const securityBinary = "/usr/bin/security"
 // replacement key would orphan a database encrypted with the real one.
 var ErrNoKeychainSession = errors.New("no keychain session available in this context")
 
+// ErrNotFound means the keychain was reachable and simply holds no entry under
+// that name.
+//
+// It is the ONLY read result a caller may treat as "absent". Every other error —
+// ErrNoKeychainSession, a locked keyring, a backend fault, a value that will not
+// decode — means "unknown", and a caller that reads it as "absent" and reacts by
+// clearing or replacing the entry destroys the real one. That is why not-found
+// is translated here rather than left as the backend's error: the distinction
+// has to survive at the package boundary, and go-keyring's own sentinel stops at
+// it.
+var ErrNotFound = errors.New("no such keychain entry")
+
 // noKeychainEnv disables all keychain access when set to anything but "0".
 const noKeychainEnv = "SINESYNC_NO_KEYCHAIN"
 
@@ -186,7 +198,11 @@ func Get(key string) (string, error) {
 	if !usable() {
 		return "", ErrNoKeychainSession
 	}
-	return keyring.Get(serviceName, key)
+	value, err := keyring.Get(serviceName, key)
+	if err != nil {
+		return "", translateKeyringError(key, err)
+	}
+	return value, nil
 }
 
 func Set(key, value string) error {
@@ -200,7 +216,24 @@ func Delete(key string) error {
 	if !usable() {
 		return ErrNoKeychainSession
 	}
-	return keyring.Delete(serviceName, key)
+	if err := keyring.Delete(serviceName, key); err != nil {
+		return translateKeyringError(key, err)
+	}
+	return nil
+}
+
+// translateKeyringError maps the backend's "no such secret" to ErrNotFound and
+// leaves every other error alone.
+//
+// The mapping is the package boundary: go-keyring's sentinel stops here, and
+// callers outside can still tell absent from unknown — a distinction they need,
+// because reacting to "unknown" as if it were "absent" is how a stored key gets
+// deleted or replaced.
+func translateKeyringError(key string, err error) error {
+	if errors.Is(err, keyring.ErrNotFound) {
+		return fmt.Errorf("%s: %w", key, ErrNotFound)
+	}
+	return err
 }
 
 // Session token
@@ -341,7 +374,7 @@ func ClearExcept(keep []string) error {
 		if keepSet[key] {
 			continue
 		}
-		if err := Delete(key); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		if err := Delete(key); err != nil && !errors.Is(err, ErrNotFound) {
 			failed = append(failed, fmt.Sprintf("%s: %v", key, err))
 		}
 	}

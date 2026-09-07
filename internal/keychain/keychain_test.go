@@ -3,7 +3,10 @@ package keychain
 import (
 	"errors"
 	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/zalando/go-keyring"
 )
 
 // The guard exists to stop a headless process raising a modal "Keychain Not
@@ -83,5 +86,50 @@ func TestAvailableDoesNotPanicOrPrompt(t *testing.T) {
 	t.Setenv("SINESYNC_NO_KEYCHAIN", "1")
 	if detectUsable() {
 		t.Error("detectUsable() = true with the opt-out set")
+	}
+}
+
+// Absent and unknown must stay distinguishable at this package's boundary. A
+// caller that reads "unknown" as "absent" and reacts by clearing or replacing
+// the entry destroys key material that nothing can regenerate.
+func TestNotFoundIsTranslatedAndNothingElseIs(t *testing.T) {
+	notFound := translateKeyringError("token", keyring.ErrNotFound)
+	if !errors.Is(notFound, ErrNotFound) {
+		t.Errorf("a missing secret came back as %v, which is not ErrNotFound", notFound)
+	}
+	if !strings.Contains(notFound.Error(), "token") {
+		t.Errorf("error %q does not name the entry", notFound)
+	}
+
+	// Anything else is unknown and must survive unchanged: an availability
+	// failure, a locked keyring, a backend fault.
+	for _, err := range []error{
+		ErrNoKeychainSession,
+		errors.New("The specified item could not be found in the keyring"),
+		keyring.ErrSetDataTooBig,
+	} {
+		got := translateKeyringError("token", err)
+		if errors.Is(got, ErrNotFound) {
+			t.Errorf("%v was translated to ErrNotFound", err)
+		}
+		if got != err {
+			t.Errorf("%v was rewritten as %v", err, got)
+		}
+	}
+}
+
+func TestAnUnreachableKeychainReadsAsUnknownNotAbsent(t *testing.T) {
+	original := usable
+	t.Cleanup(func() { usable = original })
+	usable = func() bool { return false }
+
+	if _, err := Get("token"); !errors.Is(err, ErrNoKeychainSession) || errors.Is(err, ErrNotFound) {
+		t.Errorf("Get returned %v; want ErrNoKeychainSession and not ErrNotFound", err)
+	}
+	if err := Delete("token"); !errors.Is(err, ErrNoKeychainSession) || errors.Is(err, ErrNotFound) {
+		t.Errorf("Delete returned %v; want ErrNoKeychainSession and not ErrNotFound", err)
+	}
+	if _, err := GetDerivedKey(); !errors.Is(err, ErrNoKeychainSession) || errors.Is(err, ErrNotFound) {
+		t.Errorf("GetDerivedKey returned %v; want ErrNoKeychainSession and not ErrNotFound", err)
 	}
 }
