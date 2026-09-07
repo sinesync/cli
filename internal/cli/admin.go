@@ -74,6 +74,7 @@ func init() {
 	adminCmd.AddCommand(adminProvisionCmd)
 	adminCmd.AddCommand(adminResetKeysCmd)
 	adminCmd.AddCommand(adminResetMemberCmd)
+	adminCmd.AddCommand(newOrgExportKeyCmd())
 }
 
 func runAdminResetKeys(cmd *cobra.Command, args []string) error {
