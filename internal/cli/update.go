@@ -173,8 +173,13 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checksum verification failed: %w", err)
 	}
 
-	// Stop daemon if running
-	wasRunning, _ := daemon.IsRunning()
+	// Stop the daemon if its PROCESS is alive, not merely if it is healthy.
+	//
+	// daemon.IsRunning reports false for a daemon that is alive but not
+	// answering its health check, which is exactly the state a struggling
+	// daemon is in — and skipping the stop then leaves it running from the
+	// binary about to be replaced.
+	wasRunning := daemon.IsProcessRunning()
 	if wasRunning {
 		fmt.Println("Stopping daemon...")
 		if err := daemon.Stop(); err != nil {
@@ -554,6 +559,19 @@ func isWritable(path string) bool {
 	return true
 }
 
+// copyFile replaces dst with src atomically: write a temporary file beside it,
+// then rename over the top.
+//
+// It used to open dst with O_TRUNC and copy into it, which destroys the
+// existing file BEFORE knowing the new contents can be written. Replacing a
+// running executable fails on macOS, so the truncate landed, the write did not,
+// and the install was left as a zero-byte binary — with the tool that would
+// have repaired it being the one just destroyed.
+//
+// Rename cannot half-happen. Either the destination is the old file or it is
+// the complete new one, and a failure anywhere before that leaves the old one
+// untouched. It also replaces a running binary safely on Unix: the directory
+// entry changes while the running process keeps the inode it started from.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -561,14 +579,29 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	// Beside the destination, so the rename stays within one filesystem.
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".sinesync-update-*")
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	tmpName := tmp.Name()
+	// Removes the temporary file on every path that does not rename it away.
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName)
+	}()
 
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := io.Copy(tmp, in); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpName, dst)
 }
 
 // checkForUpdate is a non-blocking check that prints a notice if a newer version exists.

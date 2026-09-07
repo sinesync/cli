@@ -127,6 +127,25 @@ func IsRunning() (bool, *PIDInfo) {
 	return true, info
 }
 
+// IsProcessRunning reports whether a daemon process is alive, regardless of
+// whether it is answering.
+//
+// IsRunning folds liveness and health into one boolean, which is the right
+// question for "can I talk to it" and the wrong one for "is something holding
+// this binary open". An unhealthy daemon is still a running process, and
+// treating it as absent is how a binary got replaced underneath one.
+func IsProcessRunning() bool {
+	info, err := ReadPIDInfo()
+	if err != nil {
+		return false
+	}
+	if !IsProcessAlive(info.PID) {
+		RemovePIDFile()
+		return false
+	}
+	return true
+}
+
 // Start starts the daemon in the background.
 //
 // The notices it returns are things the child process reported that the user
