@@ -25,6 +25,7 @@ import (
 	"github.com/sinesync/cli/internal/httputil"
 	"github.com/sinesync/cli/internal/keychain"
 	"github.com/sinesync/cli/internal/storage"
+	"github.com/sinesync/cli/internal/vaultroute"
 )
 
 func init() {
@@ -75,41 +76,21 @@ func loadLocalVaultConfig() (*localVaultConfig, error) {
 }
 
 func getDefaultVaultID() (string, error) {
-	cfg, err := loadLocalVaultConfig()
+	cfg, err := vaultroute.Load()
 	if err != nil {
 		return "", err
 	}
-
-	for _, v := range cfg.Vaults {
-		if v.IsDefault {
-			return v.VaultID, nil
-		}
+	if id := cfg.DefaultVaultID(); id != "" {
+		return id, nil
 	}
-
 	return "", fmt.Errorf("no default vault configured")
 }
 
 // getVaultIDForObservation returns the vault ID for an observation based on its project
 func getVaultIDForObservation(project string, defaultVaultID string) string {
-	if project == "" {
-		return defaultVaultID
-	}
-
-	cfg, err := loadLocalVaultConfig()
-	if err != nil {
-		return defaultVaultID
-	}
-
-	// Find vault that has this project assigned
-	for _, v := range cfg.Vaults {
-		for _, p := range v.Projects {
-			if p == project {
-				return v.VaultID
-			}
-		}
-	}
-
-	return defaultVaultID
+	// One implementation, shared with the CLI. Two copies deciding where a
+	// user's data goes is the sort of agreement that holds until it does not.
+	return vaultroute.ForProject(project, defaultVaultID)
 }
 
 // getVaultName returns the vault name for a given vault ID

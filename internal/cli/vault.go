@@ -22,6 +22,7 @@ import (
 	"github.com/sinesync/cli/internal/httputil"
 	"github.com/sinesync/cli/internal/keychain"
 	"github.com/sinesync/cli/internal/storage"
+	"github.com/sinesync/cli/internal/vaultroute"
 	"github.com/spf13/cobra"
 )
 
@@ -549,10 +550,46 @@ func runVaultAddProject(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("vault not found - run 'sinesync vault sync' first")
 	}
 
+	// A project assigned to two vaults resolves by file order, which is
+	// arbitrary and changes when `vault sync` rewrites the array. Assignment
+	// used to append without checking, so this state was one command away
+	// (#157). Refuse it and name the command that moves an assignment,
+	// which also knows how to bring the observations along.
+	routing, err := vaultroute.Load()
+	if err == nil {
+		for _, claiming := range routing.VaultsForProject(projectName) {
+			if claiming == vaultID {
+				fmt.Printf("Project '%s' is already assigned to vault '%s'.\n", projectName, vaultName)
+				return nil
+			}
+
+			currentName := vaultroute.NameOf(claiming)
+			if currentName == "" {
+				currentName = claiming
+			}
+			return fmt.Errorf("project '%s' is already assigned to vault '%s'\n"+
+				"Assigning it to a second vault would make routing depend on the order they appear in vaults.json.\n"+
+				"To move it, including the observations already recorded:\n"+
+				"  sinesync vault move-project %s %s %s",
+				projectName, currentName, projectName, claiming, vaultID)
+		}
+	}
+
 	// Update local config only (project mappings are client-side)
 	addProjectToLocalVault(vaultID, projectName)
 
 	fmt.Printf("✓ Added project '%s' to vault '%s'\n", projectName, vaultName)
+
+	// Two things that are invisible otherwise, said once at the moment the
+	// assignment is made.
+	if !addProjectMigrate {
+		fmt.Printf("  Observations already recorded under '%s' stay where they are;\n"+
+			"  only new ones go to '%s'. To bring the existing ones across:\n"+
+			"    sinesync vault migrate-project %s %s --force\n",
+			projectName, vaultName, projectName, vaultID)
+	}
+	fmt.Println("  This mapping is stored on this machine only — other devices " +
+		"route this project to their own default vault until assigned there too.")
 
 	// Migrate observations if requested
 	if addProjectMigrate {

@@ -16,6 +16,7 @@ import (
 	"github.com/sinesync/cli/internal/encryption"
 	"github.com/sinesync/cli/internal/httputil"
 	"github.com/sinesync/cli/internal/storage"
+	"github.com/sinesync/cli/internal/vaultroute"
 	"github.com/spf13/cobra"
 )
 
@@ -1047,15 +1048,8 @@ func pullFromCloud(apiBase, token, id string) ([]byte, error) {
 // getVaultIDForObservation returns the vault ID for an observation based on its project
 // Falls back to defaultVaultID if project is not assigned to a vault
 func getVaultIDForObservation(project string, defaultVaultID string) string {
-	if project == "" {
-		return defaultVaultID
-	}
-
-	vaultID, err := GetVaultForProject(project)
-	if err != nil || vaultID == "" {
-		return defaultVaultID
-	}
-	return vaultID
+	// Shared with the daemon; see internal/vaultroute.
+	return vaultroute.ForProject(project, defaultVaultID)
 }
 
 // exportToClaudeMemWithEmbedding exports an observation to claude-mem, re-embedding if needed
