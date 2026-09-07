@@ -1651,12 +1651,7 @@ func getAuthToken() (string, error) {
 
 // refreshAccessToken uses the stored refresh token to obtain a new access token.
 func refreshAccessToken(apiBase string) (string, error) {
-	authCfg, err := loadAuthConfig()
-	if err != nil {
-		return "", fmt.Errorf("cannot load auth config: %w", err)
-	}
-
-	refreshToken := authCfg.RefreshToken
+	refreshToken := storedRefreshToken()
 	if refreshToken == "" {
 		return "", fmt.Errorf("no refresh token available - run 'sinesync login'")
 	}
@@ -1692,19 +1687,89 @@ func refreshAccessToken(apiBase string) (string, error) {
 		return "", err
 	}
 
-	// Save new access token to keyring
-	if err := keychain.Set("token", result.Token); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to store access token in keyring: %v\n", err)
+	persistRefreshedTokens(result.Token, result.RefreshToken)
+
+	return result.Token, nil
+}
+
+// storedRefreshToken returns the refresh token, preferring the keyring.
+//
+// The server ROTATES the refresh token on every use, so which copy is read
+// decides whether refreshing works twice. Reading only auth.json while the
+// rotated token was written only to the keyring meant the second refresh
+// presented a token the server had already retired, and every refresh after
+// the first failed with "Invalid refresh token" — permanently, and silently,
+// because the daemon carried a working access token in memory and sync kept
+// going while every other command was locked out.
+func storedRefreshToken() string {
+	fromKeyring, err := keychain.Get("refreshToken")
+	if err != nil {
+		fromKeyring = ""
 	}
 
-	// Save rotated refresh token if provided
-	if result.RefreshToken != "" {
-		if err := keychain.Set("refreshToken", result.RefreshToken); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to store rotated refresh token in keyring — run 'sinesync login' to re-authenticate\n")
+	fromFile := ""
+	if cfg, cfgErr := loadAuthConfig(); cfgErr == nil {
+		fromFile = cfg.RefreshToken
+	}
+
+	return pickRefreshToken(fromKeyring, fromFile)
+}
+
+// pickRefreshToken chooses between the two stored copies, preferring the
+// keyring.
+//
+// Split out from the lookup so the choice can be tested without touching a real
+// keyring. The choice is the entire fix: the rotated token is written to the
+// keyring, so preferring the file means presenting one the server has already
+// retired.
+func pickRefreshToken(fromKeyring, fromFile string) string {
+	if fromKeyring != "" {
+		return fromKeyring
+	}
+	return fromFile
+}
+
+// persistRefreshedTokens writes a refreshed pair everywhere they are read from.
+//
+// Both destinations, because both are read: the keyring first, auth.json as
+// the fallback for when the keyring is unavailable. Writing one and reading
+// the other is the whole defect this replaces, so leaving them able to
+// disagree would reintroduce it in a different order.
+//
+// A failure to persist is reported rather than swallowed. An access token that
+// lives only in memory works until the process exits and then locks out every
+// command that is not the one holding it, which is a state worth hearing about
+// at the moment it starts rather than months later.
+func persistRefreshedTokens(accessToken, refreshToken string) {
+	keyringOK := true
+	if err := keychain.Set("token", accessToken); err != nil {
+		keyringOK = false
+		fmt.Fprintf(os.Stderr, "Warning: could not store the access token in the keyring: %v\n", err)
+	}
+	if refreshToken != "" {
+		if err := keychain.Set("refreshToken", refreshToken); err != nil {
+			keyringOK = false
+			fmt.Fprintf(os.Stderr, "Warning: could not store the rotated refresh token in the keyring: %v\n", err)
 		}
 	}
 
-	return result.Token, nil
+	cfg, err := loadAuthConfig()
+	if err != nil {
+		if !keyringOK {
+			fmt.Fprintln(os.Stderr, "Warning: the refreshed session could not be saved anywhere. "+
+				"It will be lost when this command exits — run 'sinesync login'.")
+		}
+		return
+	}
+
+	cfg.Token = accessToken
+	if refreshToken != "" {
+		cfg.RefreshToken = refreshToken
+	}
+	if err := saveAuthConfig(cfg); err != nil && !keyringOK {
+		fmt.Fprintln(os.Stderr, "Warning: the refreshed session could not be saved anywhere. "+
+			"It will be lost when this command exits — run 'sinesync login'.")
+	}
 }
 
 // isUnauthorizedError checks if an error indicates an expired or invalid token.

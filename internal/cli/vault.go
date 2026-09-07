@@ -874,10 +874,12 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 
 		req, _ := http.NewRequest("POST", apiBase+"/sync/upload-urls", bytes.NewReader(bodyBytes))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+token)
-		httputil.SetClientHeaders(req)
 
-		resp, err := client.Do(req)
+		// Through doVaultRequest, so an access token that expires part-way
+		// through a long migration is refreshed and the request retried. A
+		// migration of a few thousand observations easily outlives a token,
+		// and failing on the batch where that happens threw away the work.
+		resp, err := doVaultRequest(client, req, &token)
 		if err != nil {
 			return uploaded, errors, reasons, fmt.Errorf("get upload URLs: %w", err)
 		}
@@ -941,10 +943,8 @@ func reencryptAndUploadObservations(observations []storage.Observation, vaultKey
 
 		confirmReq, _ := http.NewRequest("POST", apiBase+"/sync/confirm-uploads", bytes.NewReader(confirmBytes))
 		confirmReq.Header.Set("Content-Type", "application/json")
-		confirmReq.Header.Set("Authorization", "Bearer "+token)
-		httputil.SetClientHeaders(confirmReq)
 
-		confirmResp, err := client.Do(confirmReq)
+		confirmResp, err := doVaultRequest(client, confirmReq, &token)
 		if err != nil {
 			return uploaded, errors, reasons, fmt.Errorf("confirm uploads: %w", err)
 		}
