@@ -17,14 +17,6 @@ const SineCharts = (() => {
         return TYPE_COLORS[type] || DEFAULT_COLOR;
     }
 
-    function esc(value) {
-        if (value === null || value === undefined) return '';
-        return String(value)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;');
-    }
 
     // All known types for consistent stacking order
     const TYPE_ORDER = ['feature', 'change', 'discovery', 'decision', 'refactor', 'bugfix'];
@@ -39,12 +31,75 @@ const SineCharts = (() => {
 
     const tooltip = () => d3.select('#d3-tooltip');
 
-    function showTooltip(event, html) {
+    // Tooltips are built as nodes, not markup.
+    //
+    // d3's markup setter goes straight to the HTML parser, so composing tooltips
+    // as strings made this file a sink and forced the CSP test to exclude it. The
+    // escaping was correct, but nothing enforced that it stayed correct as fields
+    // were added: a project name or summary reaching the tooltip unescaped would
+    // have been caught by no test. Building text nodes means no value can become
+    // markup whatever it contains, and the exclusion goes away with it.
+    //
+    // A line is a string, or an array of segments. A segment is a string or
+    // {text, bold, color}.
+    function tooltipSegment(seg) {
+        if (typeof seg !== 'object' || seg === null) {
+            return document.createTextNode(seg === null || seg === undefined ? '' : String(seg));
+        }
+        const text = document.createTextNode(
+            seg.text === null || seg.text === undefined ? '' : String(seg.text));
+        if (seg.bold) {
+            const strong = document.createElement('strong');
+            strong.appendChild(text);
+            return strong;
+        }
+        if (seg.color) {
+            const span = document.createElement('span');
+            // A style property assignment, not a style attribute built from a
+            // string, so a colour cannot carry anything else in with it.
+            span.style.color = seg.color;
+            span.appendChild(text);
+            return span;
+        }
+        return text;
+    }
+
+    function showTooltip(event, lines) {
         const tt = tooltip();
-        tt.html(html)
-            .style('opacity', 1)
+        const node = tt.node();
+        // An empty selection used to make the old markup setter a harmless
+        // no-op; node() returns null, so without this a missing tooltip element
+        // would throw out of a mouseover handler.
+        if (!node) {
+            return;
+        }
+        while (node.firstChild) {
+            node.removeChild(node.firstChild);
+        }
+
+        const rows = (Array.isArray(lines) ? lines : [lines])
+            .filter(line => line !== null && line !== undefined && line !== '');
+
+        rows.forEach((line, i) => {
+            if (i > 0) {
+                node.appendChild(document.createElement('br'));
+            }
+            (Array.isArray(line) ? line : [line]).forEach(seg => {
+                node.appendChild(tooltipSegment(seg));
+            });
+        });
+
+        tt.style('opacity', 1)
             .style('left', (event.pageX + 12) + 'px')
             .style('top', (event.pageY - 10) + 'px');
+    }
+
+    // byType maps render one coloured line per type, in descending count order.
+    function typeLines(byType) {
+        if (!byType) return [];
+        return Object.entries(byType)
+            .sort((a, b) => b[1] - a[1])
+            .map(([t, c]) => [{ text: t + ': ' + c, color: getTypeColor(t) }]);
     }
 
     function hideTooltip() {
@@ -128,14 +183,10 @@ const SineCharts = (() => {
                 const key = d3.timeFormat('%Y-%m-%d')(d);
                 const entry = dateMap.get(key);
                 const count = entry ? entry.count : 0;
-                let typeBreakdown = '';
-                if (entry && entry.byType) {
-                    typeBreakdown = Object.entries(entry.byType)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([t, c]) => `<span style="color:${getTypeColor(t)}">${esc(t)}: ${c}</span>`)
-                        .join('<br>');
-                }
-                showTooltip(event, `<strong>${esc(key)}</strong><br>${count} observations${typeBreakdown ? '<br>' + typeBreakdown : ''}`);
+                showTooltip(event, [
+                    [{ text: key, bold: true }],
+                    count + ' observations'
+                ].concat(typeLines(entry && entry.byType)));
             })
             .on('mouseout', hideTooltip);
 
@@ -200,14 +251,9 @@ const SineCharts = (() => {
             .on('mouseover', (event, d) => {
                 const hour = d.data.hour;
                 const entry = data.find(h => h.hour === hour);
-                let html = `<strong>${hour}:00</strong> - ${entry.count} total<br>`;
-                if (entry.byType) {
-                    html += Object.entries(entry.byType)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([t, c]) => `<span style="color:${getTypeColor(t)}">${esc(t)}: ${c}</span>`)
-                        .join('<br>');
-                }
-                showTooltip(event, html);
+                showTooltip(event, [
+                    [{ text: hour + ':00', bold: true }, ' - ' + entry.count + ' total']
+                ].concat(typeLines(entry.byType)));
             })
             .on('mouseout', hideTooltip);
 
@@ -411,12 +457,12 @@ const SineCharts = (() => {
             .attr('opacity', 0.8)
             .on('mouseover', (event, d) => {
                 const s = d.session;
-                showTooltip(event, `
-                    <strong>${esc(s.project)}</strong><br>
-                    ${s.observationCount} observations, ${s.promptCount} prompts<br>
-                    Duration: ${Math.round(s.durationMinutes)}min<br>
-                    ${esc(s.summary || '')}
-                `);
+                showTooltip(event, [
+                    [{ text: s.project, bold: true }],
+                    s.observationCount + ' observations, ' + s.promptCount + ' prompts',
+                    'Duration: ' + Math.round(s.durationMinutes) + 'min',
+                    s.summary || ''
+                ]);
             })
             .on('mouseout', hideTooltip);
 
@@ -471,7 +517,7 @@ const SineCharts = (() => {
             .attr('opacity', 0.7)
             .attr('rx', 1)
             .on('mouseover', (event, d) => {
-                showTooltip(event, `${d.x0}-${d.x1} observations: ${d.length} sessions`);
+                showTooltip(event, [d.x0 + '-' + d.x1 + ' observations: ' + d.length + ' sessions']);
             })
             .on('mouseout', hideTooltip);
 
@@ -536,12 +582,12 @@ const SineCharts = (() => {
             .attr('stroke', '#0a0a1a')
             .attr('stroke-width', 1)
             .on('mouseover', (event, d) => {
-                showTooltip(event, `
-                    <strong>${esc(d.project)}</strong><br>
-                    ${d.promptCount} prompts, ${d.observationCount} observations<br>
-                    Efficiency: ${d.promptCount > 0 ? (d.observationCount / d.promptCount).toFixed(1) : '?'} obs/prompt<br>
-                    Duration: ${Math.round(d.durationMinutes)}min
-                `);
+                showTooltip(event, [
+                    [{ text: d.project, bold: true }],
+                    d.promptCount + ' prompts, ' + d.observationCount + ' observations',
+                    'Efficiency: ' + (d.promptCount > 0 ? (d.observationCount / d.promptCount).toFixed(1) : '?') + ' obs/prompt',
+                    'Duration: ' + Math.round(d.durationMinutes) + 'min'
+                ]);
             })
             .on('mouseout', hideTooltip);
 
@@ -610,18 +656,10 @@ const SineCharts = (() => {
             .attr('rx', 2)
             .on('mouseover', (event, d) => {
                 const data = d.data;
-                let typeHtml = '';
-                if (data.byType) {
-                    typeHtml = Object.entries(data.byType)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([t, c]) => `<span style="color:${getTypeColor(t)}">${esc(t)}: ${c}</span>`)
-                        .join('<br>');
-                }
-                showTooltip(event, `
-                    <strong>${esc(data.path)}</strong><br>
-                    Total: ${data.totalCount} (modified: ${data.modifiedCount}, read: ${data.readCount})<br>
-                    ${typeHtml}
-                `);
+                showTooltip(event, [
+                    [{ text: data.path, bold: true }],
+                    'Total: ' + data.totalCount + ' (modified: ' + data.modifiedCount + ', read: ' + data.readCount + ')'
+                ].concat(typeLines(data.byType)));
             })
             .on('mouseout', hideTooltip);
 
@@ -690,7 +728,10 @@ const SineCharts = (() => {
             .attr('fill', d => getTypeColor(d.type))
             .attr('rx', 1)
             .on('mouseover', (event, d) => {
-                showTooltip(event, `<strong>${esc(d.project)}</strong><br><span style="color:${getTypeColor(d.type)}">${esc(d.type)}: ${d.count}</span>`);
+                showTooltip(event, [
+                    [{ text: d.project, bold: true }],
+                    [{ text: d.type + ': ' + d.count, color: getTypeColor(d.type) }]
+                ]);
             })
             .on('mouseout', hideTooltip);
 
@@ -745,18 +786,13 @@ const SineCharts = (() => {
             .attr('stroke-width', 1)
             .on('mouseover', (event, d) => {
                 const data = d.data;
-                let typeHtml = '';
-                if (data.byType) {
-                    typeHtml = Object.entries(data.byType)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([t, c]) => `<span style="color:${getTypeColor(t)}">${esc(t)}: ${c}</span>`)
-                        .join('<br>');
-                }
-                showTooltip(event, `
-                    <strong>${esc(data.name)}</strong> (${data.count})<br>
-                    ${typeHtml}
-                    ${data.projects && data.projects.length > 0 ? '<br>Projects: ' + esc(data.projects.join(', ')) : ''}
-                `);
+                showTooltip(event, [
+                    [{ text: data.name, bold: true }, ' (' + data.count + ')']
+                ].concat(typeLines(data.byType)).concat(
+                    data.projects && data.projects.length > 0
+                        ? ['Projects: ' + data.projects.join(', ')]
+                        : []
+                ));
             })
             .on('mouseout', hideTooltip);
 
@@ -854,12 +890,12 @@ const SineCharts = (() => {
             .attr('r', 4)
             .attr('fill', d => d.bugfixRatio > 0.25 ? '#ff4444' : d.bugfixRatio < 0.10 ? '#00d4ff' : '#00ff88')
             .on('mouseover', (event, d) => {
-                showTooltip(event, `
-                    <strong>${esc(d.period)}</strong><br>
-                    Bugfix ratio: ${(d.bugfixRatio * 100).toFixed(0)}%<br>
-                    ${d.bugfixCount} bugfix / ${d.total} total<br>
-                    Features: ${d.featureCount}
-                `);
+                showTooltip(event, [
+                    [{ text: d.period, bold: true }],
+                    'Bugfix ratio: ' + (d.bugfixRatio * 100).toFixed(0) + '%',
+                    d.bugfixCount + ' bugfix / ' + d.total + ' total',
+                    'Features: ' + d.featureCount
+                ]);
             })
             .on('mouseout', hideTooltip);
 
@@ -928,14 +964,10 @@ const SineCharts = (() => {
             .attr('rx', 1)
             .on('mouseover', (event, d) => {
                 const date = d.data.date;
-                let html = `<strong>${esc(date)}</strong><br>`;
-                devices.forEach(dev => {
-                    const count = d.data[dev] || 0;
-                    if (count > 0) {
-                        html += `<span style="color:${deviceColors(dev)}">${esc(dev)}: ${count}</span><br>`;
-                    }
-                });
-                showTooltip(event, html);
+                const deviceRows = devices
+                    .filter(dev => (d.data[dev] || 0) > 0)
+                    .map(dev => [{ text: dev + ': ' + d.data[dev], color: deviceColors(dev) }]);
+                showTooltip(event, [[{ text: date, bold: true }]].concat(deviceRows));
             })
             .on('mouseout', hideTooltip);
 

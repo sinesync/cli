@@ -200,41 +200,75 @@ func matchedSinks(source string) []htmlSink {
 // It reads the embedded copy, not the working tree, so it asserts against the
 // bytes that actually ship in the binary.
 //
-// Only app.js is scanned, and the other two static scripts are excluded
-// knowingly rather than by omission — both would trip the patterns above:
+// Every served script is scanned. charts.js and auth.js used to be excluded by
+// name: charts.js composed tooltips for d3's markup setter, and auth.js built
+// its two failure banners as markup strings. Neither was exploitable — the
+// tooltip escaped its inputs and the banners were assembled from literals — but
+// an exclusion is a hole in the invariant, and a field added to either file
+// later would have been caught by nothing. Both now build nodes, so the scan
+// covers all three rather than most of them.
 //
-//   - charts.js line 44 does d3's tt.html(html) for the tooltip. Its dynamic
-//     text goes through the local esc() helper and its inline colors come from
-//     fixed palettes, so it is not currently exploitable, but ".html(" is in
-//     htmlSinks and would fail it. It wants its own pass — an escaper is a
-//     weaker guarantee than having no parser to escape for — not to be folded
-//     into an invariant written for a different file.
-//   - auth.js lines 142 and 172 assign innerHTML for the two failure banners.
-//     Both strings are built from literals: the only interpolated value is
-//     showAuthBanner's message parameter, and both call sites (lines 204 and
-//     227) pass a string constant. No API or observation data reaches either.
-//     They are static markup written by us, which is the one case innerHTML is
-//     defensible, so they are left alone.
+// dashboardScripts is what the handler actually serves. Adding a script to the
+// dashboard without adding it here would recreate the exclusion silently, which
+// is why scriptRoutes below is cross-checked against it.
+var dashboardScripts = []string{"static/app.js", "static/charts.js", "static/auth.js"}
+
+// eachScriptMarkers are strings whose absence means the file was not really
+// scanned — empty, renamed, or no longer embedded. A guard that passes because
+// there is nothing to check is worse than no guard.
+var eachScriptMarkers = map[string][]string{
+	"static/app.js":    {"function renderObservations", "function renderBarChart", "textContent"},
+	"static/charts.js": {"function showTooltip", "createTextNode"},
+	"static/auth.js":   {"function appendBannerParts", "createTextNode"},
+}
+
 func TestDashboardScriptHasNoHTMLSinks(t *testing.T) {
-	body, err := staticFiles.ReadFile("static/app.js")
-	if err != nil {
-		t.Fatalf("read embedded static/app.js: %v", err)
-	}
-	source := string(body)
+	for _, name := range dashboardScripts {
+		body, err := staticFiles.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read embedded %s: %v", name, err)
+		}
+		source := string(body)
 
-	for _, sink := range matchedSinks(source) {
-		t.Errorf("static/app.js contains %q — %s.\n\n"+
-			"Every value app.js renders comes from the observation store, and a project may legitimately be named %s.\n"+
-			"Reaching the HTML parser with it is script execution on the dashboard, which holds the user's whole memory store.\n"+
-			"Build the node instead: document.createElement plus textContent, dataset, value, selected, classList or style.",
-			sink.pattern, sink.why, hostileProjectName)
+		for _, sink := range matchedSinks(source) {
+			t.Errorf("%s contains %q — %s.\n\n"+
+				"Every value the dashboard renders comes from the observation store, and a project may legitimately be named %s.\n"+
+				"Reaching the HTML parser with it is script execution on the dashboard, which holds the user's whole memory store.\n"+
+				"Build the node instead: document.createElement plus textContent, dataset, value, selected, classList or style.",
+				name, sink.pattern, sink.why, hostileProjectName)
+		}
+
+		for _, marker := range eachScriptMarkers[name] {
+			if !strings.Contains(source, marker) {
+				t.Errorf("embedded %s is missing %q — this test is no longer scanning it", name, marker)
+			}
+		}
+	}
+}
+
+// TestEveryServedScriptIsScanned keeps the list above honest. A script added to
+// the dashboard but not to dashboardScripts would be unscanned without anyone
+// noticing, which is exactly how the previous exclusion persisted.
+func TestEveryServedScriptIsScanned(t *testing.T) {
+	scanned := map[string]bool{}
+	for _, name := range dashboardScripts {
+		scanned[name] = true
 	}
 
-	// A guard that passes because the file is empty, renamed or no longer
-	// embedded would be worse than no guard.
-	for _, marker := range []string{"function renderObservations", "function renderBarChart", "textContent"} {
-		if !strings.Contains(source, marker) {
-			t.Errorf("embedded static/app.js is missing %q — this test is no longer scanning the dashboard script", marker)
+	for _, asset := range dashboardAssets {
+		if !strings.HasSuffix(asset.path, ".js") {
+			continue
+		}
+		// d3 is vendored, and the markup setter this invariant exists to avoid
+		// is part of its public API, so scanning it would only ever report d3
+		// being d3. What matters is that none of our scripts call it.
+		if asset.path == "/d3.min.js" {
+			continue
+		}
+
+		name := "static" + asset.path
+		if !scanned[name] {
+			t.Errorf("%s is served by the dashboard but is not in dashboardScripts, so nothing scans it for HTML sinks", name)
 		}
 	}
 }
