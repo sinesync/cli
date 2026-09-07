@@ -297,4 +297,3 @@ func buildFilterClauses(filters SearchFilters) (string, []interface{}) {
 	}
 	return where, args
 }
-

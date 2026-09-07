@@ -22,8 +22,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
+
+	"github.com/sinesync/cli/internal/licenses"
 )
 
 // Filenames a module might use, in the order they are preferred.
@@ -61,29 +62,6 @@ func findModuleRoot() string {
 	return filepath.Dir(gomod)
 }
 
-// linkedModules names every module reachable from the binary, not merely
-// required by it.
-func linkedModules() ([]string, error) {
-	out, err := run("go", "list", "-deps",
-		"-f", "{{if .Module}}{{.Module.Path}}{{end}}", "./cmd/...")
-	if err != nil {
-		return nil, err
-	}
-
-	seen := map[string]bool{}
-	var mods []string
-	for _, line := range strings.Split(out, "\n") {
-		path := strings.TrimSpace(line)
-		if path == "" || path == selfModule || seen[path] {
-			continue
-		}
-		seen[path] = true
-		mods = append(mods, path)
-	}
-	sort.Strings(mods)
-	return mods, nil
-}
-
 // moduleInfo resolves where a module's source actually is, which is not where
 // its path says when a replace directive is in force — go-sqlcipher is served
 // from the sinesync fork, and it is the fork's notice that must be reproduced.
@@ -110,7 +88,10 @@ func main() {
 	}
 	extraPath, outPath := os.Args[1], os.Args[2]
 
-	mods, err := linkedModules()
+	// Shared with the test that guards this file, and covering every released
+	// platform rather than the host: the notice was generated on a Mac and so
+	// omitted the Linux and Windows keyring dependencies entirely.
+	mods, err := licenses.LinkedModules(moduleRoot)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "listing modules:", err)
 		os.Exit(1)

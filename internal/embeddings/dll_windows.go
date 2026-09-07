@@ -11,9 +11,9 @@ import (
 )
 
 var (
-	kernel32               = syscall.NewLazyDLL("kernel32.dll")
-	procLoadLibraryExW     = kernel32.NewProc("LoadLibraryExW")
-	procSetDllDirectoryW   = kernel32.NewProc("SetDllDirectoryW")
+	kernel32             = syscall.NewLazyDLL("kernel32.dll")
+	procLoadLibraryExW   = kernel32.NewProc("LoadLibraryExW")
+	procSetDllDirectoryW = kernel32.NewProc("SetDllDirectoryW")
 )
 
 const loadWithAlteredSearchPath = 0x00000008

@@ -1,51 +1,21 @@
 package licenses
 
 import (
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// linkedModules asks the toolchain what actually ships, rather than trusting a
-// list written down here. A notice that has to be maintained by hand is a
-// notice that goes stale the first time someone adds a dependency, and the
-// failure is silent: the build still works and the attribution is simply
-// wrong.
-func linkedModules(t *testing.T) []string {
-	t.Helper()
-
-	root, err := exec.Command("go", "env", "GOMOD").Output()
-	if err != nil {
-		t.Skipf("go toolchain unavailable: %v", err)
-	}
-	dir := filepath.Dir(strings.TrimSpace(string(root)))
-
-	cmd := exec.Command("go", "list", "-deps",
-		"-f", "{{if .Module}}{{.Module.Path}}{{end}}", "./cmd/...")
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("listing linked modules: %v", err)
-	}
-
-	seen := map[string]bool{}
-	var mods []string
-	for _, line := range strings.Split(string(out), "\n") {
-		path := strings.TrimSpace(line)
-		if path == "" || path == "github.com/sinesync/cli" || seen[path] {
-			continue
-		}
-		seen[path] = true
-		mods = append(mods, path)
-	}
-	return mods
-}
-
 func TestEveryLinkedModuleIsAttributed(t *testing.T) {
 	text := Text()
 
-	mods := linkedModules(t)
+	// Shared with the generator, so the notice cannot satisfy this check while
+	// still being wrong for the binaries we ship. It covers every released
+	// platform, not the host: the Linux binaries link D-Bus and a Mac never
+	// sees it.
+	mods, err := LinkedModules("")
+	if err != nil {
+		t.Skipf("go toolchain unavailable: %v", err)
+	}
 	if len(mods) == 0 {
 		t.Fatal("no linked modules found; the check would pass vacuously")
 	}

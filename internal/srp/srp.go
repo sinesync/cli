@@ -30,14 +30,14 @@ const pbkdf2Iterations = 310000
 
 // Client represents an SRP client
 type Client struct {
-	username  string
-	password  string
-	salt      []byte
-	x         *big.Int // private key
-	a         *big.Int // ephemeral secret
-	A         *big.Int // ephemeral public
-	K         []byte   // session key
-	M1        []byte   // client proof
+	username string
+	password string
+	salt     []byte
+	x        *big.Int // private key
+	a        *big.Int // ephemeral secret
+	A        *big.Int // ephemeral public
+	K        []byte   // session key
+	M1       []byte   // client proof
 }
 
 // NewClient creates a new SRP client for login
