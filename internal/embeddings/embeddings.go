@@ -5,12 +5,10 @@ import (
 	"archive/zip"
 	"bufio"
 	"compress/gzip"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"fmt"
 	"io"
 	"math"
-	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -326,7 +324,11 @@ func newProviderInternal() (*Provider, error) {
 	}
 
 	// Check if model exists, download if not
-	if _, err := os.Stat(p.modelPath); os.IsNotExist(err) {
+	// Verified against the pinned digest rather than merely found on disk: a
+	// truncated or substituted model is otherwise indistinguishable from a good
+	// one, and anything installed before this check existed was never verified
+	// at all.
+	if !verifiedAgainst(p.modelPath, modelSHA256) {
 		fmt.Fprintf(os.Stderr, "sine~sync: Downloading embedding model %s...\n", ModelName)
 		if err := downloadModel(); err != nil {
 			fmt.Fprintf(os.Stderr, "sine~sync: Model download failed: %v (using fallback)\n", err)
@@ -336,7 +338,7 @@ func newProviderInternal() (*Provider, error) {
 	}
 
 	// Check if vocab exists, download if not
-	if _, err := os.Stat(p.vocabPath); os.IsNotExist(err) {
+	if !verifiedAgainst(p.vocabPath, vocabSHA256) {
 		fmt.Fprintf(os.Stderr, "sine~sync: Downloading vocab...\n")
 		if err := downloadVocab(); err != nil {
 			fmt.Fprintf(os.Stderr, "sine~sync: Vocab download failed: %v (using fallback)\n", err)
@@ -355,7 +357,11 @@ func newProviderInternal() (*Provider, error) {
 
 	// Check if ONNX runtime library exists, download if not
 	libPath := onnxLibPath()
-	if _, err := os.Stat(libPath); os.IsNotExist(err) {
+	// The library's own digest cannot be pinned at build time - what is pinned
+	// is the archive it comes out of - so it is checked against what was
+	// recorded when it was installed. No record means it predates this check,
+	// or an extraction died part way, and either way it is replaced.
+	if !installedDigestMatches(libPath) {
 		fmt.Fprintf(os.Stderr, "sine~sync: Downloading ONNX runtime")
 		if hasGPU {
 			fmt.Fprintf(os.Stderr, " (with %s support)", accel)
@@ -445,7 +451,7 @@ func newProviderInternal() (*Provider, error) {
 
 // downloadModel downloads the ONNX model from Hugging Face
 func downloadModel() error {
-	return downloadVerified(modelURL, modelFilePath(), modelSHA256, "embedding model")
+	return downloadVerified(modelURL, modelFilePath(), modelSHA256, "embedding model", maxModelBytes)
 }
 
 // downloadVerified fetches url, checks it against want, and only then puts it
@@ -453,13 +459,17 @@ func downloadModel() error {
 // into place after it verifies, so a failed or substituted download never
 // exists at the name the daemon loads from — an interrupted download that left
 // a truncated model behind would otherwise be indistinguishable from a real one.
-func downloadVerified(url, dest, want, what string) error {
+func downloadVerified(url, dest, want, what string, maxBytes int64) error {
 	dir := modelDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 
-	tmp, sum, err := downloadToTemp(url)
+	// Staged in the destination directory so the rename below stays within one
+	// filesystem. Streaming to $TMPDIR and renaming across a mount boundary
+	// fails with EXDEV every time, which is common on Linux where /tmp is
+	// frequently tmpfs.
+	tmp, sum, err := downloadToTempIn(context.Background(), url, filepath.Dir(dest), maxBytes)
 	if err != nil {
 		return fmt.Errorf("downloading %s: %w", what, err)
 	}
@@ -468,18 +478,12 @@ func downloadVerified(url, dest, want, what string) error {
 	if sum != want {
 		return fmt.Errorf("refusing to install the %s: SHA-256 %s does not match the pinned %s", what, sum, want)
 	}
-	if err := os.Chmod(tmp, 0o600); err != nil {
-		return fmt.Errorf("securing %s: %w", what, err)
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		return fmt.Errorf("installing %s: %w", what, err)
-	}
-	return nil
+	return installFile(tmp, dest)
 }
 
 // downloadVocab downloads the vocab.txt from Hugging Face
 func downloadVocab() error {
-	return downloadVerified(vocabURL, vocabFilePath(), vocabSHA256, "tokenizer vocabulary")
+	return downloadVerified(vocabURL, vocabFilePath(), vocabSHA256, "tokenizer vocabulary", maxVocabBytes)
 }
 
 // downloadONNXRuntime downloads and extracts the ONNX runtime library
@@ -536,7 +540,8 @@ func downloadONNXRuntime(useGPU bool, accel Accelerator) error {
 			"loading an unverified native library", name)
 	}
 
-	archive, sum, err := downloadToTemp(url)
+	libDir := filepath.Join(modelDir(), "lib")
+	archive, sum, err := downloadToTempIn(context.Background(), url, libDir, maxArchiveBytes)
 	if err != nil {
 		return err
 	}
@@ -549,22 +554,92 @@ func downloadONNXRuntime(useGPU bool, accel Accelerator) error {
 		return fmt.Errorf("refusing to install %s: SHA-256 %s does not match the pinned %s", name, sum, want)
 	}
 
-	// Create lib directory
-	libDir := filepath.Join(modelDir(), "lib")
-	if err := os.MkdirAll(libDir, 0700); err != nil {
-		return fmt.Errorf("create lib dir: %w", err)
-	}
-
 	f, err := os.Open(archive)
 	if err != nil {
 		return fmt.Errorf("reopening verified archive: %w", err)
 	}
 	defer f.Close()
 
-	if runtime.GOOS == "windows" {
-		return extractONNXZip(f, libDir)
+	// Extract into a staging directory beside the live one, then move the
+	// results across. Extracting straight into libDir leaves partial files
+	// behind when it fails part way, and those are then indistinguishable from
+	// a good install — on Windows an existing onnxruntime.dll used to skip the
+	// download entirely, so a truncated one persisted indefinitely.
+	staging, err := os.MkdirTemp(libDir, ".staging-*")
+	if err != nil {
+		return fmt.Errorf("create staging dir: %w", err)
 	}
-	return extractONNXTarGz(f, libDir)
+	defer os.RemoveAll(staging)
+
+	if runtime.GOOS == "windows" {
+		err = extractONNXZip(f, staging)
+	} else {
+		err = extractONNXTarGz(f, staging)
+	}
+	if err != nil {
+		return err
+	}
+
+	return promoteStagedLibs(staging, libDir)
+}
+
+// promoteStagedLibs moves a completed extraction into the live library
+// directory, recording what each file hashed to.
+//
+// Same filesystem, so each rename is atomic: a reader sees either the previous
+// file or the whole new one. Symlinks are recreated rather than moved, because
+// their target is a name within the directory and is only correct once the file
+// it points at has arrived.
+func promoteStagedLibs(staging, libDir string) error {
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		return fmt.Errorf("reading staged libraries: %w", err)
+	}
+
+	var moved int
+	var links []struct{ name, target string }
+
+	for _, e := range entries {
+		src := filepath.Join(staging, e.Name())
+		dest := filepath.Join(libDir, e.Name())
+
+		if e.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(src)
+			if err != nil {
+				return fmt.Errorf("reading staged link %s: %w", e.Name(), err)
+			}
+			links = append(links, struct{ name, target string }{e.Name(), target})
+			continue
+		}
+		if !e.Type().IsRegular() {
+			continue
+		}
+		if err := installFile(src, dest); err != nil {
+			return err
+		}
+		moved++
+	}
+
+	if moved == 0 {
+		return fmt.Errorf("the archive contained no runtime library")
+	}
+
+	for _, l := range links {
+		linkPath := filepath.Join(libDir, l.name)
+		if err := os.Remove(linkPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("replacing link %s: %w", l.name, err)
+		}
+		if err := os.Symlink(l.target, linkPath); err != nil {
+			return fmt.Errorf("linking %s: %w", l.name, err)
+		}
+		// The loader opens the library through this name, so it is what has to
+		// verify on the next start.
+		if err := recordInstalledDigest(linkPath); err != nil {
+			return fmt.Errorf("recording %s: %w", l.name, err)
+		}
+	}
+
+	return nil
 }
 
 // onnxArchiveDigests pins the SHA-256 of every ONNX Runtime archive this build
@@ -583,36 +658,6 @@ var onnxArchiveDigests = map[string]string{
 	"onnxruntime-osx-x86_64-1.23.2.tgz":    "d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6",
 	"onnxruntime-win-x64-1.23.2.zip":       "0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd",
 	"onnxruntime-win-arm64-1.23.2.zip":     "1cfe88b6435df3b5fb0e9f6bd7d6f5df1e887b6174de7f6e2a47bab956f3f168",
-}
-
-// downloadToTemp streams url to a temporary file, returning its path and the
-// SHA-256 of what was written.
-//
-// To a file rather than memory because these archives reach 240 MB, and hashed
-// while streaming so the bytes verified are the bytes stored — hashing a
-// separate read would leave a window where the two differ.
-func downloadToTemp(url string) (path string, sum string, err error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", "", fmt.Errorf("download: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
-	}
-
-	tmp, err := os.CreateTemp("", "sinesync-onnx-*")
-	if err != nil {
-		return "", "", fmt.Errorf("creating temporary file: %w", err)
-	}
-	defer tmp.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(tmp, h), resp.Body); err != nil {
-		os.Remove(tmp.Name())
-		return "", "", fmt.Errorf("downloading %s: %w", url, err)
-	}
-	return tmp.Name(), hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // extractONNXTarGz extracts the ONNX runtime shared library from a .tgz archive (Linux/macOS)
@@ -637,7 +682,7 @@ func extractONNXTarGz(r io.Reader, libDir string) error {
 		name := filepath.Base(header.Name)
 		if strings.HasPrefix(name, "libonnxruntime.") && header.Typeflag == tar.TypeReg {
 			outPath := filepath.Join(libDir, name)
-			outFile, err := os.Create(outPath)
+			outFile, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 			if err != nil {
 				return fmt.Errorf("create file: %w", err)
 			}
@@ -645,19 +690,31 @@ func extractONNXTarGz(r io.Reader, libDir string) error {
 				outFile.Close()
 				return fmt.Errorf("extract file: %w", err)
 			}
-			outFile.Close()
+			// Checked, not ignored: a close can be where a write actually fails,
+			// and swallowing it leaves a short file that looks complete.
+			if err := outFile.Close(); err != nil {
+				return fmt.Errorf("closing %s: %w", name, err)
+			}
 
 			// Make symlink for versioned libraries
 			// Linux: libonnxruntime.so.1.23.2 -> libonnxruntime.so
 			// macOS: libonnxruntime.1.23.2.dylib -> libonnxruntime.dylib
+			var linkName string
 			if strings.Contains(name, ".so.") {
-				linkPath := filepath.Join(libDir, "libonnxruntime.so")
-				os.Remove(linkPath)
-				os.Symlink(name, linkPath)
+				linkName = "libonnxruntime.so"
 			} else if runtime.GOOS == "darwin" && strings.Contains(name, ".dylib") && name != "libonnxruntime.dylib" {
-				linkPath := filepath.Join(libDir, "libonnxruntime.dylib")
-				os.Remove(linkPath)
-				os.Symlink(name, linkPath)
+				linkName = "libonnxruntime.dylib"
+			}
+			if linkName != "" {
+				linkPath := filepath.Join(libDir, linkName)
+				if err := os.Remove(linkPath); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("replacing link %s: %w", linkName, err)
+				}
+				// This is the name the loader opens, so a failure here means no
+				// usable library at all. It used to be discarded.
+				if err := os.Symlink(name, linkPath); err != nil {
+					return fmt.Errorf("linking %s: %w", linkName, err)
+				}
 			}
 		}
 	}
@@ -668,7 +725,7 @@ func extractONNXTarGz(r io.Reader, libDir string) error {
 // extractONNXZip extracts the ONNX runtime DLL from a .zip archive (Windows)
 func extractONNXZip(r io.Reader, libDir string) error {
 	// archive/zip needs a ReaderAt, so download to a temp file first
-	tmpFile, err := os.CreateTemp("", "onnxruntime-*.zip")
+	tmpFile, err := os.CreateTemp(libDir, ".onnxruntime-*.zip")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
