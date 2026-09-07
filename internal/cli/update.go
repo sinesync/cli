@@ -69,6 +69,15 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 
 	if !version.IsNewer(latest, current) {
 		fmt.Println("Already up to date.")
+
+		// Being current is not a reason to leave the install somewhere that
+		// needs root. Someone whose update asked for a password, who then
+		// fixed their PATH so it would not have to, would otherwise have to
+		// wait for an unrelated release before the fix they prepared for
+		// became reachable (#161). Silent when the location is already fine.
+		if err := offerRelocationWhenCurrent(); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -677,7 +686,7 @@ func offerRelocation(newBinaryPath, currentPath string) (bool, error) {
 		return false, nil
 	}
 
-	fmt.Printf("\n%s is not writable, so this update needs sudo.\n", currentDir)
+	fmt.Printf("\n%s is not writable, so updating there needs sudo.\n", currentDir)
 	fmt.Printf("Move the install to %s so future updates do not? [y/N]: ", dest)
 
 	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -720,4 +729,72 @@ func offerRelocation(newBinaryPath, currentPath string) (bool, error) {
 // reason an unattended update fails here.
 func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// offerRelocationWhenCurrent offers to move an up-to-date install out of a
+// directory that needs root.
+//
+// Being current is not a reason to leave it there. The natural sequence for
+// someone stuck with a sudo-requiring install is: run update, see it ask for a
+// password, fix PATH so it would not have to, run update again to take the
+// offer — and that last step did nothing, because by then there was no update
+// to install and the offer lived only on the install path (#161).
+//
+// Silent when the location is already writable, so the ordinary case is
+// unchanged.
+func offerRelocationWhenCurrent() error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
+	currentPath, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	currentPath, err = filepath.EvalSymlinks(currentPath)
+	if err != nil {
+		return nil
+	}
+
+	return relocateIfInstallNeedsRoot(currentPath)
+}
+
+// relocateIfInstallNeedsRoot does the work of offerRelocationWhenCurrent for a
+// given install path. Split out so the gate can be tested without a real
+// executable: an install that is already writable must return silently, having
+// touched nothing — no prompt, and no stopping the daemon.
+func relocateIfInstallNeedsRoot(currentPath string) error {
+	if isWritable(filepath.Dir(currentPath)) {
+		return nil
+	}
+
+	// The daemon runs from the binary being moved, so it is stopped first and
+	// restarted afterwards from whichever path now wins — the same care the
+	// update path takes, for the same reason. Skipping it would leave a daemon
+	// running from a file that is about to be deleted.
+	wasRunning, _ := daemon.IsRunning()
+	if wasRunning {
+		if err := daemon.Stop(); err != nil {
+			fmt.Printf("Warning: failed to stop daemon: %v\n", err)
+		}
+	}
+	restart := func() {
+		if !wasRunning {
+			return
+		}
+		if _, err := daemon.Start(daemon.DefaultPort); err != nil {
+			fmt.Printf("Warning: failed to restart daemon: %v\n", err)
+		}
+	}
+
+	// The binary to install is the one already running.
+	moved, err := offerRelocation(currentPath, currentPath)
+	restart()
+	if err != nil {
+		return err
+	}
+	if moved {
+		fmt.Println("Updates from here on will not need sudo.")
+	}
+	return nil
 }
