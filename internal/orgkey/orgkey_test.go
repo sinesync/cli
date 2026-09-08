@@ -1,4 +1,4 @@
-package cli
+package orgkey
 
 import (
 	"encoding/base64"
@@ -27,12 +27,12 @@ func newOrgKey(t *testing.T) (pub string, priv []byte) {
 func TestOrgKeyExportRoundTrip(t *testing.T) {
 	pub, priv := newOrgKey(t)
 
-	file, err := buildOrgKeyExport("org-a", pub, priv, "correct horse battery staple")
+	file, err := Build("org-a", pub, priv, "correct horse battery staple")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
 
-	got, err := openOrgKeyExport(file, "correct horse battery staple")
+	got, err := Open(file, "correct horse battery staple")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestOrgKeyExportRoundTrip(t *testing.T) {
 func TestOrgKeyExportNeverHoldsThePlaintextKey(t *testing.T) {
 	pub, priv := newOrgKey(t)
 
-	file, err := buildOrgKeyExport("org-a", pub, priv, "pass")
+	file, err := Build("org-a", pub, priv, "pass")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -64,9 +64,9 @@ func TestOrgKeyExportNeverHoldsThePlaintextKey(t *testing.T) {
 
 func TestOrgKeyExportRejectsWrongPassphrase(t *testing.T) {
 	pub, priv := newOrgKey(t)
-	file, _ := buildOrgKeyExport("org-a", pub, priv, "right")
+	file, _ := Build("org-a", pub, priv, "right")
 
-	if _, err := openOrgKeyExport(file, "wrong"); err == nil {
+	if _, err := Open(file, "wrong"); err == nil {
 		t.Fatal("a wrong passphrase opened the file")
 	}
 }
@@ -75,19 +75,19 @@ func TestOrgKeyExportRejectsFileFromAnotherOrg(t *testing.T) {
 	// The org id is bound into the AEAD, so a ciphertext lifted from one org's
 	// file cannot be presented as another's.
 	pub, priv := newOrgKey(t)
-	fileA, _ := buildOrgKeyExport("org-a", pub, priv, "pass")
+	fileA, _ := Build("org-a", pub, priv, "pass")
 
 	transplanted := *fileA
 	transplanted.OrgID = "org-b"
 
-	if _, err := openOrgKeyExport(&transplanted, "pass"); err == nil {
+	if _, err := Open(&transplanted, "pass"); err == nil {
 		t.Fatal("a file relabelled to another org still opened")
 	}
 }
 
 func TestOrgKeyExportRejectsAlteredCiphertext(t *testing.T) {
 	pub, priv := newOrgKey(t)
-	file, _ := buildOrgKeyExport("org-a", pub, priv, "pass")
+	file, _ := Build("org-a", pub, priv, "pass")
 
 	raw, err := base64.StdEncoding.DecodeString(file.EncryptedOrgPrivateKey)
 	if err != nil {
@@ -96,7 +96,7 @@ func TestOrgKeyExportRejectsAlteredCiphertext(t *testing.T) {
 	raw[len(raw)-1] ^= 0x01
 	file.EncryptedOrgPrivateKey = base64.StdEncoding.EncodeToString(raw)
 
-	if _, err := openOrgKeyExport(file, "pass"); err == nil {
+	if _, err := Open(file, "pass"); err == nil {
 		t.Fatal("an altered file still opened")
 	}
 }
@@ -105,14 +105,14 @@ func TestOrgKeyExportSaysNothingAboutWhichPartWasWrong(t *testing.T) {
 	// A different message for "wrong passphrase" and "tampered" tells an
 	// attacker which one they got right.
 	pub, priv := newOrgKey(t)
-	file, _ := buildOrgKeyExport("org-a", pub, priv, "pass")
+	file, _ := Build("org-a", pub, priv, "pass")
 
-	_, wrongPass := openOrgKeyExport(file, "nope")
+	_, wrongPass := Open(file, "nope")
 
 	raw, _ := base64.StdEncoding.DecodeString(file.EncryptedOrgPrivateKey)
 	raw[0] ^= 0x01
 	file.EncryptedOrgPrivateKey = base64.StdEncoding.EncodeToString(raw)
-	_, tampered := openOrgKeyExport(file, "pass")
+	_, tampered := Open(file, "pass")
 
 	if wrongPass == nil || tampered == nil {
 		t.Fatal("expected both to fail")
@@ -127,10 +127,10 @@ func TestOrgKeyExportRejectsMismatchedPublicKey(t *testing.T) {
 	pub, priv := newOrgKey(t)
 	otherPub, _ := newOrgKey(t)
 
-	file, _ := buildOrgKeyExport("org-a", pub, priv, "pass")
+	file, _ := Build("org-a", pub, priv, "pass")
 	file.OrgPublicKey = otherPub
 
-	_, err := openOrgKeyExport(file, "pass")
+	_, err := Open(file, "pass")
 	if err == nil {
 		t.Fatal("a file naming the wrong public key still opened")
 	}
@@ -141,10 +141,10 @@ func TestOrgKeyExportRejectsMismatchedPublicKey(t *testing.T) {
 
 func TestOrgKeyExportRejectsUnknownVersion(t *testing.T) {
 	pub, priv := newOrgKey(t)
-	file, _ := buildOrgKeyExport("org-a", pub, priv, "pass")
-	file.Version = orgKeyExportVersion + 1
+	file, _ := Build("org-a", pub, priv, "pass")
+	file.Version = Version + 1
 
-	if _, err := openOrgKeyExport(file, "pass"); err == nil {
+	if _, err := Open(file, "pass"); err == nil {
 		t.Fatal("a future version opened instead of being refused")
 	}
 }
@@ -152,13 +152,13 @@ func TestOrgKeyExportRejectsUnknownVersion(t *testing.T) {
 func TestOrgKeyExportRequiresItsInputs(t *testing.T) {
 	pub, priv := newOrgKey(t)
 
-	if _, err := buildOrgKeyExport("", pub, priv, "pass"); err == nil {
+	if _, err := Build("", pub, priv, "pass"); err == nil {
 		t.Error("an export with no org id was allowed")
 	}
-	if _, err := buildOrgKeyExport("org-a", pub, nil, "pass"); err == nil {
+	if _, err := Build("org-a", pub, nil, "pass"); err == nil {
 		t.Error("an export with no key was allowed")
 	}
-	if _, err := buildOrgKeyExport("org-a", pub, priv, ""); err == nil {
+	if _, err := Build("org-a", pub, priv, ""); err == nil {
 		t.Error("an export with no passphrase was allowed")
 	}
 }
@@ -168,9 +168,9 @@ func TestWriteOrgKeyExportIsOwnerOnlyAndRefusesToOverwrite(t *testing.T) {
 	path := filepath.Join(dir, "sinesync-org.key")
 
 	pub, priv := newOrgKey(t)
-	file, _ := buildOrgKeyExport("org-a", pub, priv, "pass")
+	file, _ := Build("org-a", pub, priv, "pass")
 
-	if err := writeOrgKeyExport(path, file); err != nil {
+	if err := Write(path, file); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -185,7 +185,7 @@ func TestWriteOrgKeyExportIsOwnerOnlyAndRefusesToOverwrite(t *testing.T) {
 	}
 
 	// Overwriting would strand a deployed daemon on a key nobody has any more.
-	if err := writeOrgKeyExport(path, file); err == nil {
+	if err := Write(path, file); err == nil {
 		t.Fatal("an existing credentials file was overwritten")
 	}
 }
@@ -195,8 +195,8 @@ func TestOrgKeyExportUsesAFreshSaltEachTime(t *testing.T) {
 	// across exports, so one cracked passphrase opens every file ever made.
 	pub, priv := newOrgKey(t)
 
-	first, _ := buildOrgKeyExport("org-a", pub, priv, "pass")
-	second, _ := buildOrgKeyExport("org-a", pub, priv, "pass")
+	first, _ := Build("org-a", pub, priv, "pass")
+	second, _ := Build("org-a", pub, priv, "pass")
 
 	if first.KDF.Salt == second.KDF.Salt {
 		t.Fatal("two exports share a salt")
