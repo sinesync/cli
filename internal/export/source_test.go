@@ -41,7 +41,7 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 		})
 	})
 
-	mux.HandleFunc("/v1/sync/export", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/service-accounts/export", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.queries = append(f.queries, r.URL.Query())
 		f.auths = append(f.auths, r.Header.Get("Authorization"))
