@@ -1,165 +1,14 @@
 package cli
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/sinesync/cli/internal/crypto"
+	"github.com/sinesync/cli/internal/orgkey"
 )
-
-// The credentials file a self-hosted export daemon reads (#104).
-//
-// Modelled on 1Password Connect: a file downloaded once at setup carries the
-// decryption capability, and a separately issued service account token carries
-// API access. Neither is useful alone, and the token can be revoked without
-// touching the file.
-//
-// Unlike Connect's, this file is passphrase-encrypted. Connect relies on
-// filesystem secrecy; here a leaked file would expose every org vault
-// retroactively until the org key is rotated, so the operator supplies a
-// passphrase to the daemon out of band. Storing the key alongside its own
-// ciphertext would be obfuscation rather than encryption, so it is a real
-// passphrase or nothing.
-const orgKeyExportVersion = 1
-
-// Bound into the AEAD so a file cannot be presented as another org's: an
-// attacker who swaps ciphertexts between two exports gets a decryption failure
-// rather than a key that opens the wrong vaults.
-func orgKeyExportAAD(orgID string) string {
-	return fmt.Sprintf("sinesync-org-key-export:v%d:%s", orgKeyExportVersion, orgID)
-}
-
-type orgKeyExportKDF struct {
-	Algorithm string `json:"algorithm"`
-	Salt      string `json:"salt"`
-}
-
-type orgKeyExportFile struct {
-	Version int    `json:"version"`
-	OrgID   string `json:"orgId"`
-	// Recorded so the daemon can verify what it decrypted is the key it expects,
-	// rather than trusting whatever the file happens to contain.
-	OrgPublicKey           string          `json:"orgPublicKey"`
-	KDF                    orgKeyExportKDF `json:"kdf"`
-	EncryptedOrgPrivateKey string          `json:"encryptedOrgPrivateKey"`
-	CreatedAt              string          `json:"createdAt"`
-}
-
-// buildOrgKeyExport encrypts an org private key under a passphrase.
-//
-// Separated from the command so the format can be tested without a session, a
-// server, or a terminal.
-func buildOrgKeyExport(orgID, orgPublicKey string, orgPrivateKey []byte, passphrase string) (*orgKeyExportFile, error) {
-	if orgID == "" {
-		return nil, fmt.Errorf("org id is required")
-	}
-	if len(orgPrivateKey) == 0 {
-		return nil, fmt.Errorf("org private key is empty")
-	}
-	if passphrase == "" {
-		return nil, fmt.Errorf("passphrase is required")
-	}
-
-	salt, err := crypto.GenerateSalt()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate salt: %w", err)
-	}
-
-	// No secret key here: the passphrase is the only secret, so it takes the
-	// whole burden and the second argument stays empty by design.
-	fileKey := crypto.DeriveKey(passphrase, "", salt)
-	defer zeroBytes(fileKey)
-
-	ciphertext, err := crypto.Encrypt(orgPrivateKey, fileKey, orgKeyExportAAD(orgID))
-	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt org private key: %w", err)
-	}
-
-	return &orgKeyExportFile{
-		Version:                orgKeyExportVersion,
-		OrgID:                  orgID,
-		OrgPublicKey:           orgPublicKey,
-		KDF:                    orgKeyExportKDF{Algorithm: "argon2id", Salt: base64.StdEncoding.EncodeToString(salt)},
-		EncryptedOrgPrivateKey: base64.StdEncoding.EncodeToString(ciphertext),
-		CreatedAt:              time.Now().UTC().Format(time.RFC3339),
-	}, nil
-}
-
-// openOrgKeyExport is the daemon's side of the format. It lives here so the two
-// halves cannot drift apart, and so a round trip is testable.
-func openOrgKeyExport(file *orgKeyExportFile, passphrase string) ([]byte, error) {
-	if file.Version != orgKeyExportVersion {
-		return nil, fmt.Errorf("unsupported credentials file version %d (expected %d)", file.Version, orgKeyExportVersion)
-	}
-
-	salt, err := base64.StdEncoding.DecodeString(file.KDF.Salt)
-	if err != nil {
-		return nil, fmt.Errorf("credentials file has an unreadable salt: %w", err)
-	}
-	ciphertext, err := base64.StdEncoding.DecodeString(file.EncryptedOrgPrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("credentials file has an unreadable key: %w", err)
-	}
-
-	fileKey := crypto.DeriveKey(passphrase, "", salt)
-	defer zeroBytes(fileKey)
-
-	plaintext, err := crypto.Decrypt(ciphertext, fileKey, orgKeyExportAAD(file.OrgID))
-	if err != nil {
-		// Wrong passphrase and a tampered file are the same answer on purpose:
-		// distinguishing them tells an attacker which one they got right.
-		return nil, fmt.Errorf("could not decrypt the credentials file — wrong passphrase, or the file has been altered")
-	}
-
-	// The file says which public key this private key belongs to. If they
-	// disagree, the file has been assembled from parts.
-	if file.OrgPublicKey != "" {
-		derived, err := crypto.PublicKeyFromPrivate(string(plaintext))
-		if err != nil {
-			zeroBytes(plaintext)
-			return nil, fmt.Errorf("the credentials file does not contain a usable key: %w", err)
-		}
-		if derived != file.OrgPublicKey {
-			zeroBytes(plaintext)
-			return nil, fmt.Errorf(
-				"the credentials file's key does not match the public key it names (names %s, contains %s)",
-				file.OrgPublicKey, derived)
-		}
-	}
-
-	return plaintext, nil
-}
-
-// writeOrgKeyExport writes the file readable only by its owner. A credentials
-// file left world-readable would undo the passphrase.
-func writeOrgKeyExport(path string, file *orgKeyExportFile) error {
-	encoded, err := json.MarshalIndent(file, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to encode credentials file: %w", err)
-	}
-
-	// O_EXCL: refuse to overwrite. Silently replacing an existing credentials
-	// file would strand a deployed daemon on a key nobody has any more.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("%s already exists — move it aside first, or a deployed daemon may be relying on it", path)
-		}
-		return err
-	}
-	defer f.Close()
-
-	if _, err := f.Write(append(encoded, '\n')); err != nil {
-		return err
-	}
-	return nil
-}
 
 func newOrgExportKeyCmd() *cobra.Command {
 	var out string
@@ -221,12 +70,12 @@ func runOrgExportKey(w io.Writer, out string) error {
 	}
 	defer zeroBytes(passphrase)
 
-	file, err := buildOrgKeyExport(orgInfo.OrgID, keys.publicKey, keys.privateKey, string(passphrase))
+	file, err := orgkey.Build(orgInfo.OrgID, keys.publicKey, keys.privateKey, string(passphrase))
 	if err != nil {
 		return err
 	}
 
-	if err := writeOrgKeyExport(out, file); err != nil {
+	if err := orgkey.Write(out, file); err != nil {
 		return err
 	}
 
