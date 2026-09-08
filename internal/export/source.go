@@ -134,8 +134,11 @@ func (s *APISource) Fetch(ctx context.Context, after Cursor, limit int) ([]Obser
 		q.Add("vaultId", v)
 	}
 
+	// Under /v1/service-accounts, not /v1/sync: these are authenticated by a
+	// service account rather than a user session, and keeping the two routers
+	// apart is what stops a route inheriting the wrong middleware.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		s.base+"/v1/sync/export?"+q.Encode(), nil)
+		s.base+"/v1/service-accounts/export?"+q.Encode(), nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -197,7 +200,7 @@ func (s *APISource) vaultKey(ctx context.Context, vaultID string) ([]byte, error
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		s.base+"/v1/vaults/"+url.PathEscape(vaultID)+"/key", nil)
+		s.base+"/v1/service-accounts/vaults/"+url.PathEscape(vaultID)+"/key", nil)
 	if err != nil {
 		return nil, err
 	}
