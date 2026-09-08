@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.48
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
 	github.com/google/uuid v1.6.0
+	github.com/lib/pq v1.12.3
 	github.com/mutecomm/go-sqlcipher/v4 v4.4.2
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/spf13/cobra v1.10.2
