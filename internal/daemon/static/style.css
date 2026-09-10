@@ -651,6 +651,15 @@ body {
     letter-spacing: 0.05em;
     margin-bottom: 0.5rem;
 }
+/* Sits under a control to say what it does not do. Muted, because it is a
+   caveat rather than an instruction, but not so muted it goes unread. */
+.detail-hint {
+    color: var(--text-secondary);
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    margin: 0.5rem 0 0 0;
+    max-width: 46ch;
+}
 
 .detail-tags {
     display: flex;

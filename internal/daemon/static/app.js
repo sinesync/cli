@@ -1,5 +1,15 @@
 // sine~sync Dashboard
 
+// Classification labels an observation; it does not gate who can read it. The
+// value lives inside the encrypted payload, so the server never sees it and
+// cannot filter on it, and an organization's export reads every observation in
+// the vaults it is scoped to whatever they are marked. This note is the only
+// place a person applying the marking finds that out.
+const CLASSIFICATION_NOTE =
+    'A label for search and filtering, not an access control. ' +
+    'In an organization vault, anyone holding the organization key can read ' +
+    'this whatever it is marked.';
+
 // State
 let currentView = 'overview';
 let observations = [];
@@ -886,7 +896,10 @@ function renderObservationDetail(obs) {
             newTagInput
         ])),
 
-        section('Classification', classificationSelect),
+        section('Classification', frag([
+            classificationSelect,
+            el('p', { class: 'detail-hint', text: CLASSIFICATION_NOTE })
+        ])),
 
         obs.details ? section('Details', el('p', { text: obs.details })) : null,
 
