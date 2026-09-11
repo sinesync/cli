@@ -53,3 +53,61 @@ jobs:
       # releases users install.
       - name: Test
         run: go test ./...
+
+  # #11: ubuntu never compiles the _windows.go files, so openLogFileNoFollow --
+  # which reconstructs O_NOFOLLOW out of FILE_FLAG_OPEN_REPARSE_POINT because
+  # Windows has no equivalent flag -- was written, reviewed and shipped without
+  # its refusal ever being observed working. Its four tests had never run
+  # anywhere.
+  #
+  # Cross-compiling does not reach it: internal/daemon pulls in sqlite-vec and
+  # go-sqlcipher, so a Windows build needs cgo and a Windows toolchain. Hence a
+  # real windows-latest runner with the MSYS2 setup build.yml already uses.
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install Windows toolchain
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-sqlite3
+
+      # Run the reparse point tests on their own first, verbosely. They are the
+      # reason this job exists, and both of them skip rather than fail when the
+      # runner cannot create the link they need -- a silent skip would leave the
+      # refusal exactly as unobserved as before, while the job went green.
+      - name: Test the reparse point refusal
+        shell: bash
+        env:
+          CGO_ENABLED: 1
+          CC: gcc
+        run: |
+          export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
+          go test -v -run OpenLogFileNoFollow ./internal/daemon/ 2>&1 | tee reparse.log
+
+          if ! grep -q -- '--- PASS: TestOpenLogFileNoFollowRefusesASymlink' reparse.log \
+             && ! grep -q -- '--- PASS: TestOpenLogFileNoFollowRefusesAJunction' reparse.log; then
+            echo "::error::Neither refusal test ran -- both skipped for want of a privilege." \
+                 "This job would be proving nothing."
+            exit 1
+          fi
+
+      - name: Test
+        shell: bash
+        env:
+          CGO_ENABLED: 1
+          CC: gcc
+        run: |
+          export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
+          go test ./...
