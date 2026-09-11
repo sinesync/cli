@@ -15,9 +15,11 @@ import (
 // FILE_FLAG_OPEN_REPARSE_POINT plus an inspection of the handle. These check the
 // reconstruction actually refuses.
 //
-// Windows only, so it does not run on the Linux CI runner or on a developer's
-// Mac. It runs in the release build's Windows job and for anyone testing on
-// Windows.
+// Windows only, so it does not run on the Linux CI job or on a developer's Mac.
+// It ran nowhere at all until #11: the release and build workflows compile the
+// Windows binary but never invoke go test, so these were shipped unobserved.
+// The CI workflow's test-windows job runs them now, and fails if both refusal
+// cases skip for want of a privilege rather than passing quietly.
 
 func TestOpenLogFileNoFollowRefusesASymlink(t *testing.T) {
 	dir := t.TempDir()
