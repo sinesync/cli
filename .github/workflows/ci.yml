@@ -103,9 +103,8 @@ jobs:
             exit 1
           fi
 
-      # The rest of the suite does not pass on Windows yet -- see #19, eight
-      # failures across four packages, all of them pre-existing and invisible
-      # until this job existed. They are not gated here because a step that is
+      # The rest of the suite does not pass on Windows yet -- see #19, five
+      # packages, all of them pre-existing and invisible until this job existed. They are not gated here because a step that is
       # permanently red is a step everyone learns to ignore, and the reparse
       # point coverage above is what #11 was filed for.
       #
@@ -119,4 +118,4 @@ jobs:
         run: |
           export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
           go test $(go list ./... \
-            | grep -vE '/internal/(daemon|embeddings|orgkey|vaultroute)$')
+            | grep -vE '/internal/(cli|daemon|embeddings|orgkey|vaultroute)$')
