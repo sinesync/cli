@@ -3,22 +3,8 @@ package cli
 import (
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 )
-
-func inodeOf(t *testing.T, path string) uint64 {
-	t.Helper()
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		t.Skip("no inode information on this platform")
-	}
-	return uint64(st.Ino)
-}
 
 // The update destroyed a real install: copyFile opened the destination with
 // O_TRUNC and then copied, so replacing a running binary — which fails on
