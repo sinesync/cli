@@ -91,6 +91,17 @@ func downloadToTempIn(ctx context.Context, url, dir string, maxBytes int64) (pat
 	}
 	defer tmp.Close()
 
+	// Close before removing. Windows refuses to delete a file that still has an
+	// open handle, and os.CreateTemp does not ask for FILE_SHARE_DELETE -- so
+	// leaving the close to the deferred call above means the remove runs first,
+	// fails, and has its error discarded. Every refused download then leaves its
+	// temp file in the library directory permanently. Unix hides this: unlinking
+	// an open file is allowed there, so the same code cleans up correctly.
+	discard := func() {
+		tmp.Close()
+		os.Remove(tmp.Name())
+	}
+
 	// One byte past the ceiling, so exceeding it is distinguishable from
 	// stopping exactly at it.
 	limited := io.LimitReader(resp.Body, maxBytes+1)
@@ -98,11 +109,11 @@ func downloadToTempIn(ctx context.Context, url, dir string, maxBytes int64) (pat
 	h := sha256.New()
 	written, err := io.Copy(io.MultiWriter(tmp, h), limited)
 	if err != nil {
-		os.Remove(tmp.Name())
+		discard()
 		return "", "", fmt.Errorf("downloading %s: %w", url, err)
 	}
 	if written > maxBytes {
-		os.Remove(tmp.Name())
+		discard()
 		return "", "", fmt.Errorf("%w: %s exceeded %d bytes", errArtifactTooLarge, url, maxBytes)
 	}
 
