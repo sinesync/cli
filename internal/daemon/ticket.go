@@ -158,6 +158,14 @@ func (s *Server) handleAuthRedeem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"token": session})
 }
 
+// sessionEntryLive is a live dashboard session. seq exists because expiry
+// cannot order these: every session gets the same TTL, so equal-instant mints
+// produce equal expiries and no stable oldest.
+type sessionEntryLive struct {
+	expiry time.Time
+	seq    uint64
+}
+
 // mintSession issues a dashboard session token: scoped, expiring, and
 // invalidated by a daemon restart because it is never persisted.
 func (s *Server) mintSession() (string, error) {
@@ -170,11 +178,11 @@ func (s *Server) mintSession() (string, error) {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
 	if s.sessions == nil {
-		s.sessions = make(map[string]time.Time)
+		s.sessions = make(map[string]sessionEntryLive)
 	}
 	now := time.Now()
-	for t, expiry := range s.sessions {
-		if now.After(expiry) {
+	for t, e := range s.sessions {
+		if now.After(e.expiry) {
 			delete(s.sessions, t)
 		}
 	}
@@ -186,12 +194,19 @@ func (s *Server) mintSession() (string, error) {
 	// release it — so refusing at the cap would mean the dashboard simply stops
 	// working after enough ordinary launches. Evicting costs a stale tab its
 	// session; refusing costs the user the feature.
+	// Ordered by seq, not by expiry. Every session gets the same TTL, so expiry
+	// only orders them as finely as the clock does -- and two mints inside one
+	// clock tick produce equal expiries, where Before is false and the winner is
+	// whichever key Go's randomised map iteration reached first. On Windows,
+	// whose granularity is milliseconds rather than nanoseconds, that is the
+	// normal case rather than a rare one: launching the dashboard twice in quick
+	// succession would evict an arbitrary session instead of the oldest.
 	for len(s.sessions) >= maxLiveSession {
 		var oldest string
-		var oldestExpiry time.Time
-		for t, expiry := range s.sessions {
-			if oldest == "" || expiry.Before(oldestExpiry) {
-				oldest, oldestExpiry = t, expiry
+		var oldestSeq uint64
+		for t, e := range s.sessions {
+			if oldest == "" || e.seq < oldestSeq {
+				oldest, oldestSeq = t, e.seq
 			}
 		}
 		if oldest == "" {
@@ -200,7 +215,8 @@ func (s *Server) mintSession() (string, error) {
 		delete(s.sessions, oldest)
 	}
 
-	s.sessions[token] = now.Add(sessionTTL)
+	s.sessionSeq++
+	s.sessions[token] = sessionEntryLive{expiry: now.Add(sessionTTL), seq: s.sessionSeq}
 	return token, nil
 }
 
@@ -212,11 +228,11 @@ func (s *Server) validSession(token string) bool {
 	}
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
-	expiry, ok := s.sessions[token]
+	e, ok := s.sessions[token]
 	if !ok {
 		return false
 	}
-	if time.Now().After(expiry) {
+	if time.Now().After(e.expiry) {
 		delete(s.sessions, token)
 		return false
 	}

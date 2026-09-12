@@ -68,7 +68,8 @@ type Server struct {
 	// Dashboard sessions: read-only, expiring, memory-only. Weaker than the
 	// hook secret on purpose — see internal/daemon/ticket.go.
 	sessionsMu sync.Mutex
-	sessions   map[string]time.Time
+	sessions   map[string]sessionEntryLive
+	sessionSeq uint64
 
 	// Graceful shutdown channel (used by /api/shutdown endpoint)
 	shutdownChan chan struct{}

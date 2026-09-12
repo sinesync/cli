@@ -131,6 +131,53 @@ func TestSessionMintingEvictsRatherThanRefusing(t *testing.T) {
 	}
 }
 
+// The eviction order has to survive a clock that cannot tell two mints apart.
+// Every session gets the same TTL, so ordering by expiry orders them only as
+// finely as the clock ticks: on Windows that is milliseconds, and two dashboard
+// launches inside one tick get equal expiries, where Before is false and the
+// victim is whichever key Go's randomised map iteration reached first.
+//
+// This reproduces that without needing Windows, by flattening every expiry to a
+// single instant. Against expiry-ordered eviction it fails about 63 times in 64;
+// the loop makes "about" into "always".
+func TestSessionEvictionIsOrderedWhenExpiriesTie(t *testing.T) {
+	for attempt := 0; attempt < 8; attempt++ {
+		s := newTicketServer()
+
+		var minted []string
+		for i := 0; i < maxLiveSession; i++ {
+			token, err := s.mintSession()
+			if err != nil {
+				t.Fatalf("mint %d: %v", i, err)
+			}
+			minted = append(minted, token)
+		}
+
+		// One instant for all of them: what a coarse clock produces on its own.
+		same := time.Now().Add(sessionTTL)
+		s.sessionsMu.Lock()
+		for token, e := range s.sessions {
+			e.expiry = same
+			s.sessions[token] = e
+		}
+		s.sessionsMu.Unlock()
+
+		if _, err := s.mintSession(); err != nil {
+			t.Fatalf("mint past cap: %v", err)
+		}
+
+		if s.validSession(minted[0]) {
+			t.Fatalf("attempt %d: the first session survived; eviction fell back to "+
+				"map order when the expiries tied", attempt)
+		}
+		for i := 1; i < len(minted); i++ {
+			if !s.validSession(minted[i]) {
+				t.Fatalf("attempt %d: session %d was evicted instead of the oldest", attempt, i)
+			}
+		}
+	}
+}
+
 func TestSessionExpires(t *testing.T) {
 	s := newTicketServer()
 	token, err := s.mintSession()
@@ -138,7 +185,7 @@ func TestSessionExpires(t *testing.T) {
 		t.Fatalf("mint: %v", err)
 	}
 	s.sessionsMu.Lock()
-	s.sessions[token] = time.Now().Add(-time.Second)
+	s.sessions[token] = sessionEntryLive{expiry: time.Now().Add(-time.Second), seq: s.sessionSeq}
 	s.sessionsMu.Unlock()
 
 	if s.validSession(token) {
