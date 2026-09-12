@@ -118,4 +118,4 @@ jobs:
         run: |
           export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
           go test $(go list ./... \
-            | grep -vE '/internal/(cli|daemon|embeddings|orgkey|vaultroute)$')
+            | grep -vE '/internal/(cli|daemon|embeddings|orgkey)$')

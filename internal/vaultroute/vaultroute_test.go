@@ -9,7 +9,12 @@ import (
 func writeConfig(t *testing.T, body string) {
 	t.Helper()
 	home := t.TempDir()
+	// os.UserHomeDir, which config.ConfigDir calls, reads HOME on unix and
+	// USERPROFILE on Windows. Setting only HOME leaves the override inert
+	// there: the code reads the runner's real profile, finds no vaults.json,
+	// and every assertion here comes back empty.
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 
 	dir := filepath.Join(home, ".sinesync")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
