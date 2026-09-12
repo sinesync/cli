@@ -251,7 +251,11 @@ func setupDevice(t *testing.T, withVaults bool) *commitStore {
 	t.Helper()
 
 	home := t.TempDir()
+	// os.UserHomeDir reads HOME on unix and USERPROFILE on Windows. Setting
+	// only HOME leaves the override inert there, and the test then reads and
+	// writes the real profile of whoever is running it.
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	if err := os.MkdirAll(filepath.Join(home, ".sinesync"), 0700); err != nil {
 		t.Fatal(err)
 	}

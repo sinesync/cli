@@ -57,7 +57,12 @@ func TestNoProjectMeansTheDefault(t *testing.T) {
 // A missing config is a fresh install, not a failure: everything routes to
 // whatever default the caller already resolved.
 func TestAMissingConfigRoutesToTheDefault(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	// Both, or on Windows this reads the real profile instead of the empty temp
+	// dir -- and then passes for the wrong reason whenever that profile happens
+	// to have no vaults.json, which is exactly what it did on the CI runner.
+	empty := t.TempDir()
+	t.Setenv("HOME", empty)
+	t.Setenv("USERPROFILE", empty)
 
 	if got := ForProject("anything", "personal"); got != "personal" {
 		t.Errorf("ForProject with no config = %q, want the default", got)
