@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -148,6 +149,16 @@ func TestIsWritableDistinguishesTheTwoCases(t *testing.T) {
 	writable := t.TempDir()
 	if !isWritable(writable) {
 		t.Error("a temp dir should be writable")
+	}
+
+	if runtime.GOOS == "windows" {
+		// The negative case cannot be set up here. Mkdir's mode is advisory on
+		// Windows -- 0o500 does not remove write access -- so the directory
+		// stays writable and isWritable is right to say so. Establishing it
+		// would need a deny ACL on the directory, which is a different
+		// mechanism from the file DACLs in internal/owneronly and is not worth
+		// building to test a helper the positive case above already covers.
+		t.Skip("a directory cannot be made unwritable by mode on this platform")
 	}
 
 	locked := filepath.Join(t.TempDir(), "locked")

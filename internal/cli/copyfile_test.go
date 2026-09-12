@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -84,6 +85,13 @@ func TestReplacementIsExecutable(t *testing.T) {
 	info, err := os.Stat(dst)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		// Windows decides what is executable from the extension, not from a
+		// permission bit, and Go reports 0666 for every ordinary file. There is
+		// no mode here to assert against; the equivalent guarantee is that the
+		// copy is named .exe, which the caller controls rather than copyFile.
+		t.Skip("no executable bit on this platform")
 	}
 	if info.Mode().Perm()&0o111 == 0 {
 		t.Errorf("mode %v is not executable", info.Mode().Perm())

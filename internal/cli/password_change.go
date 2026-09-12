@@ -14,6 +14,8 @@ import (
 	"github.com/sinesync/cli/internal/httputil"
 	"github.com/sinesync/cli/internal/keychain"
 	"github.com/sinesync/cli/internal/vaultroute"
+
+	"github.com/sinesync/cli/internal/owneronly"
 )
 
 // Changing a password changes the derived key, and the derived key is what wraps
@@ -283,6 +285,14 @@ func writeFileAtomic(path string, data []byte) error {
 	defer os.Remove(tmpName)
 
 	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	// Applied to the temp file rather than after the rename: a DACL travels with
+	// the file, so restricting it here means the destination is never briefly
+	// readable by anyone else. Chmod alone would leave it readable by everyone
+	// on Windows, and this file holds key material.
+	if err := owneronly.Apply(tmpName); err != nil {
 		tmp.Close()
 		return err
 	}

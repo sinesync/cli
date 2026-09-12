@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sinesync/cli/internal/owneronly"
 )
 
 // #1 #2 #3 #5: the model and ONNX runtime are fetched over the network and the
@@ -254,12 +256,12 @@ func TestInstallFileIsOwnerOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	info, err := os.Stat(dest)
+	private, err := owneronly.IsOwnerOnly(dest)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("checking permissions: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("installed mode %o, want 600", perm)
+	if !private {
+		t.Fatal("the installed library is readable by more than its owner")
 	}
 }
 

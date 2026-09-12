@@ -3,12 +3,13 @@ package orgkey
 import (
 	"encoding/base64"
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/sinesync/cli/internal/crypto"
+
+	"github.com/sinesync/cli/internal/owneronly"
 )
 
 // #104: the credentials file carries an organization's whole decryption
@@ -174,14 +175,15 @@ func TestWriteOrgKeyExportIsOwnerOnlyAndRefusesToOverwrite(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
 	// A world-readable credentials file would undo the passphrase for anyone
-	// already on the host.
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("credentials file is mode %o, want 600", perm)
+	// already on the host. Asked of the platform rather than of the mode bits,
+	// because on Windows those say nothing about who can read the file.
+	private, err := owneronly.IsOwnerOnly(path)
+	if err != nil {
+		t.Fatalf("checking permissions: %v", err)
+	}
+	if !private {
+		t.Fatal("the credentials file is readable by more than its owner")
 	}
 
 	// Overwriting would strand a deployed daemon on a key nobody has any more.
