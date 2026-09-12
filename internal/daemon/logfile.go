@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+
+	"github.com/sinesync/cli/internal/owneronly"
 )
 
 // openDaemonLog opens the daemon log for appending, refusing to follow a symlink
@@ -35,6 +37,18 @@ func openDaemonLog(dir, path string) (*os.File, error) {
 	fd, err := openLogFileNoFollow(path)
 	if err != nil {
 		return nil, fmt.Errorf("opening daemon log %s: %w", path, err)
+	}
+
+	// The 0700 and 0600 the creation paths ask for are advisory on Windows, so
+	// without this the daemon's log -- which carries whatever it logs about a
+	// user's data -- is readable by every account on the machine.
+	if err := owneronly.Apply(dir); err != nil {
+		fd.Close()
+		return nil, err
+	}
+	if err := owneronly.Apply(path); err != nil {
+		fd.Close()
+		return nil, err
 	}
 
 	// A FIFO passes O_NOFOLLOW and would block the daemon forever on write, so
