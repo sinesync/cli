@@ -15,6 +15,8 @@ import (
 	"github.com/sinesync/cli/internal/encryption"
 	"github.com/sinesync/cli/internal/keychain"
 	"github.com/sinesync/cli/internal/vaultroute"
+
+	"github.com/sinesync/cli/internal/owneronly"
 )
 
 // The commit is the step with no safe middle. These tests fail every one of its
@@ -538,12 +540,12 @@ func TestAtomicWritesLeaveNoDebrisAndReplaceInPlace(t *testing.T) {
 	if err != nil || string(got) != "replacement" {
 		t.Errorf("file holds %q (err %v)", got, err)
 	}
-	info, err := os.Stat(path)
+	private, err := owneronly.IsOwnerOnly(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("checking permissions: %v", err)
 	}
-	if info.Mode().Perm() != 0600 {
-		t.Errorf("mode = %v, want 0600 — this file holds key material", info.Mode().Perm())
+	if !private {
+		t.Error("readable by more than its owner — this file holds key material")
 	}
 
 	entries, err := os.ReadDir(dir)

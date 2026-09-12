@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/sinesync/cli/internal/owneronly"
 )
 
 // Bounds on fetching model and runtime artifacts.
@@ -171,7 +173,11 @@ func recordInstalledDigest(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(digestSidecarPath(path), []byte(sum+"\n"), 0o600)
+	sidecar := digestSidecarPath(path)
+	if err := os.WriteFile(sidecar, []byte(sum+"\n"), 0o600); err != nil {
+		return err
+	}
+	return owneronly.Apply(sidecar)
 }
 
 func installedDigestMatches(path string) bool {
@@ -189,7 +195,7 @@ func installedDigestMatches(path string) bool {
 // after the rename: if the process dies between them the artifact is treated as
 // unverified and replaced next time, which is the safe direction.
 func installFile(src, dest string) error {
-	if err := os.Chmod(src, 0o600); err != nil {
+	if err := owneronly.Apply(src); err != nil {
 		return fmt.Errorf("securing %s: %w", filepath.Base(dest), err)
 	}
 	if err := os.Rename(src, dest); err != nil {

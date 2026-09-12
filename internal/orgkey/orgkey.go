@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sinesync/cli/internal/crypto"
+	"github.com/sinesync/cli/internal/owneronly"
 )
 
 // The credentials file a self-hosted export daemon reads (#104).
@@ -144,6 +145,16 @@ func Write(path string, file *File) error {
 	// O_EXCL: refuse to overwrite. Silently replacing an existing credentials
 	// file would strand a deployed daemon on a key nobody has any more.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err == nil {
+		// 0o600 is the whole story on unix and none of it on Windows, where
+		// Chmod moves the read-only bit and leaves the file readable by
+		// everyone. This holds key material.
+		if aerr := owneronly.Apply(path); aerr != nil {
+			f.Close()
+			os.Remove(path)
+			return aerr
+		}
+	}
 	if err != nil {
 		if os.IsExist(err) {
 			return fmt.Errorf("%s already exists — move it aside first, or a deployed daemon may be relying on it", path)
