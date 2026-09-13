@@ -1,0 +1,33 @@
+version: 2
+
+updates:
+  # Go is the whole of this repo; there is no package.json here. The npm
+  # ecosystem would be configured and silently match nothing.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Related modules move in one PR. Six separate golang.org/x bumps is how
+      # dependency PRs become something nobody reads.
+      golang-x:
+        patterns:
+          - golang.org/x/*
+      go-dependencies:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - golang.org/x/*
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+    # This repo signs the binaries users install, so the SHA pin is the
+    # security property. Dependabot rewrites the pin and the version comment
+    # together, which is what makes accepting one of these safe to do quickly.
