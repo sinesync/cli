@@ -70,6 +70,16 @@ func (p *S3Provider) Init(ctx context.Context, cfg *config.Backend) error {
 	// Create S3 client with path-style for compatibility
 	p.client = s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		o.UsePathStyle = true // Required for MinIO and some S3-compatible services
+
+		// The SDK's default became WhenSupported, which puts an
+		// X-Amz-Checksum-Crc32 header on every PUT. Real S3 accepts it; older
+		// MinIO and Backblaze B2 deployments reject the request outright, so
+		// the default would break exactly the S3-compatible backends
+		// UsePathStyle above exists to support.
+		//
+		// WhenRequired still sends a checksum where the operation demands one,
+		// so nothing that needs integrity checking loses it.
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	})
 
 	return nil
