@@ -44,4 +44,4 @@ require (
 	github.com/stretchr/testify v1.10.0 // indirect
 )
 
-replace github.com/mutecomm/go-sqlcipher/v4 => github.com/sinesync/go-sqlcipher/v4 v4.4.3-0.20260209183651-988da792235a
+replace github.com/mutecomm/go-sqlcipher/v4 => github.com/sinesync/go-sqlcipher/v4 v4.4.3-0.20260914032728-918acc6b6791
