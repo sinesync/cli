@@ -126,6 +126,23 @@ func (s *LocalStorage) ensureDir(itemType string) (string, error) {
 }
 
 // Save stores an item
+// itemFilename turns an item id into a single filename component.
+//
+// Save, Get, Exists and Delete all build a path as dir + id + ".json", and an
+// id containing a separator would escape the data directory: "../../.ssh/config"
+// reads or writes outside it, and Delete would remove it. Ids here are UUIDs
+// and content hashes, so reducing to the base is lossless for every real one
+// and neutralises the rest.
+//
+// Defence in depth rather than a fix for a live hole. The one path that fed
+// server-supplied ids in here was internal/sync, deleted alongside this; every
+// remaining caller is local. It exists so reconnecting a remote source later
+// cannot quietly reintroduce the traversal -- CodeQL flagged Get and Delete and
+// did not flag Save, which is the one that writes.
+func itemFilename(id string) string {
+	return filepath.Base(id) + ".json"
+}
+
 func (s *LocalStorage) Save(itemType string, id string, data interface{}) error {
 	dir, err := s.ensureDir(itemType)
 	if err != nil {
@@ -146,13 +163,13 @@ func (s *LocalStorage) Save(itemType string, id string, data interface{}) error 
 		return err
 	}
 
-	return writeFilePrivate(filepath.Join(dir, id+".json"), bytes, fileMode)
+	return writeFilePrivate(filepath.Join(dir, itemFilename(id)), bytes, fileMode)
 }
 
 // Get retrieves an item by ID
 func (s *LocalStorage) Get(itemType, id string) (*StoredItem, error) {
 	dir := filepath.Join(s.baseDir, itemType)
-	path := filepath.Join(dir, id+".json")
+	path := filepath.Join(dir, itemFilename(id))
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -170,7 +187,7 @@ func (s *LocalStorage) Get(itemType, id string) (*StoredItem, error) {
 // Exists checks if an item exists by type and ID
 func (s *LocalStorage) Exists(itemType, id string) (bool, error) {
 	dir := filepath.Join(s.baseDir, itemType)
-	path := filepath.Join(dir, id+".json")
+	path := filepath.Join(dir, itemFilename(id))
 	_, err := os.Stat(path)
 	if err == nil {
 		return true, nil
@@ -223,7 +240,7 @@ func (s *LocalStorage) List(itemType string) ([]StoredItem, error) {
 // Delete removes an item
 func (s *LocalStorage) Delete(itemType, id string) error {
 	dir := filepath.Join(s.baseDir, itemType)
-	path := filepath.Join(dir, id+".json")
+	path := filepath.Join(dir, itemFilename(id))
 	return os.Remove(path)
 }
 
