@@ -76,12 +76,10 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      # The same toolchain the release builds with, so these tests exercise the
+      # sqlite that actually ships rather than a different one from MSYS2.
       - name: Install Windows toolchain
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-sqlite3
+        uses: ./.github/actions/windows-cgo
 
       # Run the reparse point tests on their own first, verbosely. They are the
       # reason this job exists, and both of them skip rather than fail when the
@@ -91,9 +89,7 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: 1
-          CC: gcc
         run: |
-          export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
           go test -v -run OpenLogFileNoFollow ./internal/daemon/ 2>&1 | tee reparse.log
 
           if ! grep -q -- '--- PASS: TestOpenLogFileNoFollowRefusesASymlink' reparse.log \
@@ -107,7 +103,5 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: 1
-          CC: gcc
         run: |
-          export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
           go test ./...
