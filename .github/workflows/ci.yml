@@ -76,6 +76,23 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      # Deliberately NOT .github/actions/windows-cgo, which build.yml and
+      # release.yml share.
+      #
+      # That action points CGO_CFLAGS at go-sqlcipher's vendored sqlite and links
+      # statically, which is what ships. Applying it here fails compiling the
+      # test packages:
+      #
+      #   sqlite3.c: fatal error: openssl/crypto.h: No such file or directory
+      #
+      # so the vendored sqlcipher cannot find the OpenSSL headers under that
+      # configuration while building tests, though it finds them building the
+      # binary. Worth understanding rather than working around, and not while
+      # the only thing standing on it is a test job that already works.
+      #
+      # The consequence is real and should not be forgotten: these tests link
+      # MSYS2's sqlite, and users get the vendored one. A sqlite-version-specific
+      # bug would pass here.
       - name: Install Windows toolchain
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
