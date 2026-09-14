@@ -127,7 +127,19 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
             export CC=gcc
-            SQLCIPHER_DIR="$(go env GOMODCACHE)/github.com/sinesync/go-sqlcipher/v4@v4.4.3-0.20260209183651-988da792235a"
+            # Asked of the module graph rather than spelled out. This was a
+            # hardcoded path carrying the pinned pseudo-version, and it did not
+            # move when go.mod's replace directive did — so the Windows build
+            # pointed at a module directory that was no longer in the cache and
+            # failed on a missing sqlite3.h. Nothing catches that until a tag,
+            # because this workflow only runs on one.
+            #
+            # go list follows the replace, so the two cannot disagree again.
+            SQLCIPHER_DIR="$(go list -m -f '{{.Dir}}' github.com/mutecomm/go-sqlcipher/v4)"
+            if [ ! -f "${SQLCIPHER_DIR}/sqlite3.h" ]; then
+              echo "::error::sqlite3.h not found under ${SQLCIPHER_DIR}"
+              exit 1
+            fi
             export CGO_CFLAGS="-I${SQLCIPHER_DIR}"
             export CGO_LDFLAGS="-static -L${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/lib -lws2_32 -lgdi32 -lcrypt32"
           fi
