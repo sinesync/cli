@@ -68,11 +68,7 @@ jobs:
 
       - name: Install Windows toolchain
         if: matrix.os == 'windows'
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-sqlite3
+        uses: ./.github/actions/windows-cgo
 
       - name: Build binary
         shell: bash
@@ -92,9 +88,8 @@ jobs:
           fi
 
           if [ "${{ matrix.os }}" = "windows" ]; then
-            export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
-            export CC=gcc
-            go build -ldflags "${LDFLAGS}" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
+            # Same toolchain and link mode as release.yml, via the shared action.
+            go build -ldflags "${LDFLAGS} ${WINDOWS_LDFLAGS}" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
           else
             go build -ldflags "${LDFLAGS}" -o ${{ env.BINARY_NAME }} ./cmd/sinesync
           fi
