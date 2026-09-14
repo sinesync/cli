@@ -1,6 +1,6 @@
 module github.com/sinesync/cli
 
-go 1.25.13
+go 1.26.0
 
 require (
 	github.com/asg017/sqlite-vec-go-bindings v0.1.6
@@ -15,10 +15,10 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/yalue/onnxruntime_go v1.36.0
 	github.com/zalando/go-keyring v0.2.8
-	golang.org/x/crypto v0.47.0
-	golang.org/x/sys v0.40.0
-	golang.org/x/term v0.39.0
-	golang.org/x/text v0.39.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/term v0.46.0
+	golang.org/x/text v0.42.0
 )
 
 require (
