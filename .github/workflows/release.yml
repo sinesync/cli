@@ -101,11 +101,7 @@ jobs:
 
       - name: Install Windows cross-compilation tools
         if: matrix.os == 'windows'
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
+        uses: ./.github/actions/windows-cgo
 
       - name: Build binary
         shell: bash
@@ -123,29 +119,10 @@ jobs:
             export CC=aarch64-linux-gnu-gcc
           fi
 
-          # Set compiler for Windows (MSYS2 MinGW-w64) — statically link everything
           if [ "${{ matrix.os }}" = "windows" ]; then
-            export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
-            export CC=gcc
-            # Asked of the module graph rather than spelled out. This was a
-            # hardcoded path carrying the pinned pseudo-version, and it did not
-            # move when go.mod's replace directive did — so the Windows build
-            # pointed at a module directory that was no longer in the cache and
-            # failed on a missing sqlite3.h. Nothing catches that until a tag,
-            # because this workflow only runs on one.
-            #
-            # go list follows the replace, so the two cannot disagree again.
-            SQLCIPHER_DIR="$(go list -m -f '{{.Dir}}' github.com/mutecomm/go-sqlcipher/v4)"
-            if [ ! -f "${SQLCIPHER_DIR}/sqlite3.h" ]; then
-              echo "::error::sqlite3.h not found under ${SQLCIPHER_DIR}"
-              exit 1
-            fi
-            export CGO_CFLAGS="-I${SQLCIPHER_DIR}"
-            export CGO_LDFLAGS="-static -L${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/lib -lws2_32 -lgdi32 -lcrypt32"
-          fi
-
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            go build -ldflags "${LDFLAGS} -extldflags '-static -Wl,--allow-multiple-definition'" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
+            # WINDOWS_LDFLAGS comes from .github/actions/windows-cgo, so the
+            # link mode is decided beside the toolchain that requires it.
+            go build -ldflags "${LDFLAGS} ${WINDOWS_LDFLAGS}" -o ${{ env.BINARY_NAME }}.exe ./cmd/sinesync
           else
             go build -ldflags "${LDFLAGS}" -o ${{ env.BINARY_NAME }} ./cmd/sinesync
           fi
