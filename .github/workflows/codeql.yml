@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+# Declared here rather than inline, so this workflow moves with the other three
+# when the toolchain does. It was pinned inline and had already drifted behind.
+env:
+  GO_VERSION: '1.26'
+
 concurrency:
   group: codeql-${{ github.ref }}
   cancel-in-progress: true
@@ -30,7 +35,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.25'
+          go-version: ${{ env.GO_VERSION }}
 
       # CodeQL's Go extractor builds the code, and this build needs cgo:
       # sqlite-vec and go-sqlcipher both link against it. Without this the
