@@ -26,19 +26,30 @@ is suspected.
 
 ## 1. Create a service account
 
-As the organization **owner**:
+As the organization **owner**, on a machine where you are logged in:
 
 ```
-POST /v1/organizations/<org-id>/service-accounts
-{ "label": "warehouse exporter", "vaultIds": ["<vault-id>", "..."] }
+sinesync admin service-account create \
+  --label "warehouse exporter" \
+  --vault <vault-id> --vault <another-vault-id>
 ```
 
-The response contains the `keyId` and the `secret`. **The secret is shown once
-and cannot be retrieved again.**
+`--all-vaults` grants every org vault that exists at that moment, and prints
+which ones so the grant is on the record.
+
+It prints the `keyId` and the `secret`. **The secret is shown once and cannot be
+retrieved again** — put it straight into the secret store the daemon reads.
+
+`sinesync admin service-account list` shows what exists, and
+`sinesync admin service-account revoke <key-id>` retires one.
+
+The underlying API is `POST /v1/organizations/<org-id>/service-accounts` with
+`{ "label": ..., "vaultIds": [...] }`, if you would rather script it.
 
 The vault list is fixed when the account is created. A vault added to your
 organization later is *not* included, which is deliberate: a compromised daemon
-reaches exactly the vaults you named and no others.
+reaches exactly the vaults you named and no others. That applies to
+`--all-vaults` too — it is a snapshot taken at creation, not a standing rule.
 
 ## 2. Export the organization key
 
