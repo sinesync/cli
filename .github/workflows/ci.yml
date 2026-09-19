@@ -111,3 +111,45 @@ jobs:
         run: |
           export PATH="${MSYS2_ROOT:-/d/a/_temp/msys64}/mingw64/bin:$PATH"
           go test ./...
+
+  # The two jobs above pin GO_VERSION by hand, so go.mod's go directive and the
+  # toolchain CI runs on can drift apart without anything noticing: Go's
+  # default GOTOOLCHAIN=auto would quietly download whichever version go.mod
+  # asks for and build with that instead. This job takes the version from
+  # go.mod itself, forbids the switch, and checks the running toolchain is the
+  # one go.mod names before building anything.
+  build-gomod:
+    name: Build (go.mod toolchain)
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # go build ./... reaches the cgo packages (sqlite-vec, go-sqlcipher), so
+      # it needs the same headers the Test job installs.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev
+
+      - name: Assert the toolchain matches go.mod
+        run: |
+          want="go$(awk '$1 == "go" { print $2 }' go.mod)"
+          have="$(go env GOVERSION)"
+          echo "go.mod directive: $want"
+          echo "running:          $have (GOTOOLCHAIN=$(go env GOTOOLCHAIN))"
+          go version
+          if [ "$have" != "$want" ]; then
+            echo "::error::running $have but go.mod requires exactly $want"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
