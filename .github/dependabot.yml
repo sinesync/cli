@@ -8,6 +8,15 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # The Go binding and the ONNX Runtime that embeddings.go downloads are a
+    # matched pair: the binding requests the ORT_API_VERSION of the header it
+    # ships, and a runtime older than that returns no API table, so embedding
+    # fails on every platform. A grouped bump once moved the binding alone.
+    # Upgrade both by hand, together — the binding in go.mod and onnxVersion
+    # with its pinned archive digests — and let
+    # TestBindingAPIMatchesDownloadedRuntime confirm they agree.
+    ignore:
+      - dependency-name: github.com/yalue/onnxruntime_go
     groups:
       # Related modules move in one PR. Six separate golang.org/x bumps is how
       # dependency PRs become something nobody reads.

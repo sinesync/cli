@@ -1,9 +1,13 @@
 package embeddings
 
 import (
+	"encoding/json"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -103,4 +107,73 @@ func TestModelIsPinnedToARevisionNotABranch(t *testing.T) {
 			t.Errorf("%s is not a lowercase 64-character SHA-256: %q", name, sum)
 		}
 	}
+}
+
+// The Go binding and the runtime it loads must speak the same C API. The
+// binding asks the library for ORT_API_VERSION from the header it was built
+// against, and a runtime older than that returns no API table at all, so the
+// daemon fails at startup on every platform. A dependency bump moved the
+// binding to a header for API 29 while onnxVersion still downloaded 1.23.2
+// (API 23), and nothing here noticed. ONNX Runtime numbers its C API after the
+// minor release, so the two sides are compared by deriving each from its
+// source: the runtime from onnxVersion in embeddings.go, the binding from the
+// header of the module version go.mod actually resolves.
+func TestBindingAPIMatchesDownloadedRuntime(t *testing.T) {
+	const bindingModule = "github.com/yalue/onnxruntime_go"
+
+	src, err := os.ReadFile("embeddings.go")
+	if err != nil {
+		t.Fatalf("reading source: %v", err)
+	}
+	versions := regexp.MustCompile(`const onnxVersion = "(\d+)\.(\d+)\.(\d+)"`).FindAllStringSubmatch(string(src), -1)
+	if len(versions) != 1 {
+		t.Fatalf("expected exactly one onnxVersion constant in embeddings.go, found %d; this test cannot tell which runtime is downloaded", len(versions))
+	}
+	runtimeAPI, err := strconv.Atoi(versions[0][2])
+	if err != nil {
+		t.Fatalf("parsing minor version of onnxVersion %q: %v", versions[0][0], err)
+	}
+
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatalf("locating the go command to resolve %s: %v", bindingModule, err)
+	}
+	out, err := exec.Command(goBin, "list", "-m", "-json", bindingModule).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("go list -m %s: %v\n%s", bindingModule, err, ee.Stderr)
+		}
+		t.Fatalf("go list -m %s: %v", bindingModule, err)
+	}
+	var mod struct {
+		Path    string
+		Version string
+		Dir     string
+	}
+	if err := json.Unmarshal(out, &mod); err != nil {
+		t.Fatalf("parsing go list output for %s: %v\n%s", bindingModule, err, out)
+	}
+	if mod.Version == "" || mod.Dir == "" {
+		t.Fatalf("%s resolved to version %q in directory %q; run `go mod download` so its header can be read", bindingModule, mod.Version, mod.Dir)
+	}
+
+	header := filepath.Join(mod.Dir, "onnxruntime_c_api.h")
+	hdr, err := os.ReadFile(header)
+	if err != nil {
+		t.Fatalf("reading the header of %s@%s: %v", bindingModule, mod.Version, err)
+	}
+	defines := regexp.MustCompile(`(?m)^\s*#define\s+ORT_API_VERSION\s+(\d+)\s*$`).FindAllStringSubmatch(string(hdr), -1)
+	if len(defines) != 1 {
+		t.Fatalf("expected exactly one #define ORT_API_VERSION in %s, found %d", header, len(defines))
+	}
+	bindingAPI, err := strconv.Atoi(defines[0][1])
+	if err != nil {
+		t.Fatalf("parsing ORT_API_VERSION %q in %s: %v", defines[0][1], header, err)
+	}
+
+	if bindingAPI != runtimeAPI {
+		t.Fatalf("%s@%s is built against ORT_API_VERSION %d, but embeddings.go downloads ONNX Runtime %s.%s.%s (API %d); move the binding and onnxVersion together",
+			bindingModule, mod.Version, bindingAPI, versions[0][1], versions[0][2], versions[0][3], runtimeAPI)
+	}
+	t.Logf("%s@%s and ONNX Runtime %s.%s.%s both use C API %d", bindingModule, mod.Version, versions[0][1], versions[0][2], versions[0][3], bindingAPI)
 }
