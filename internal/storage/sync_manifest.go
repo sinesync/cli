@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sinesync/cli/internal/config"
+	"github.com/sinesync/cli/internal/writeperm"
 )
 
 // LocalUploadState tracks what we've uploaded for an item
@@ -100,7 +101,8 @@ func (m *SyncManifest) Save() error {
 	// ID the user has and when each was synced. It reveals less than the
 	// observations themselves and more than nothing, and it long predates the
 	// hardening, so existing installs have one sitting at 0644.
-	return writeFilePrivate(syncManifestPath(), data, fileMode)
+	path := syncManifestPath()
+	return writeperm.Explain(path, writeFilePrivate(path, data, fileMode))
 }
 
 // IsSynced checks if an observation is synced with matching checksum
