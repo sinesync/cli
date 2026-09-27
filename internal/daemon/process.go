@@ -15,6 +15,7 @@ import (
 
 	"github.com/sinesync/cli/internal/config"
 	"github.com/sinesync/cli/internal/storage"
+	"github.com/sinesync/cli/internal/writeperm"
 )
 
 // findProcess wraps os.FindProcess for use by platform-specific code
@@ -84,7 +85,8 @@ func WritePIDInfo(info *PIDInfo) error {
 		return err
 	}
 
-	return os.WriteFile(PIDFilePath(), data, 0600)
+	path := PIDFilePath()
+	return writeperm.Explain(path, os.WriteFile(path, data, 0600))
 }
 
 // RemovePIDFile removes the PID file
