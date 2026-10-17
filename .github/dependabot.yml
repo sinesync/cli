@@ -29,6 +29,11 @@ updates:
         exclude-patterns:
           - golang.org/x/*
 
+  # With `directory: /` this scans .github/workflows only. It does not see the
+  # composite action in .github/actions/windows-cgo, so a bump here leaves that
+  # action's pins behind. #48 did exactly that to setup-msys2. Copy each such
+  # bump into the composite action by hand. scripts/check-action-pins.sh, run
+  # by the action-pins job in ci.yml, fails CI until the two match.
   - package-ecosystem: github-actions
     directory: /
     schedule:
