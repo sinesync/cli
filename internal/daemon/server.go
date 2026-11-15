@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sinesync/cli/internal/adapters"
 	"github.com/sinesync/cli/internal/config"
 	"github.com/sinesync/cli/internal/embeddings"
@@ -1254,7 +1255,7 @@ func (s *Server) processSubagentStop(sessionID, agentID, transcriptPath, cwd str
 func (s *Server) extractObservation(toolName string, toolInput map[string]interface{}, toolResponse, project string) *storage.Observation {
 	now := time.Now()
 	obs := &storage.Observation{
-		ID: generateID(),
+		ID: uuid.New().String(),
 		Core: storage.Core{
 			Project:   project,
 			CreatedAt: now,
@@ -1472,13 +1473,6 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-func generateID() string {
-	// Simple UUID-like ID
-	b := make([]byte, 16)
-	rand.Read(b)
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
-}
-
 func (s *Server) handleSummarize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1552,7 +1546,7 @@ func (s *Server) processSummarize(sessionID, project string) {
 	}
 
 	summary := &storage.Observation{
-		ID: generateID(),
+		ID: uuid.New().String(),
 		Core: storage.Core{
 			Type:      "decision",
 			Title:     fmt.Sprintf("Session summary: %s", project),
@@ -1744,7 +1738,7 @@ func (s *Server) processCodexCapture(threadID, turnID, cwd string, inputMessages
 	concepts := extractConceptsFromText(lastAssistantMessage)
 
 	obs := &storage.Observation{
-		ID: generateID(),
+		ID: uuid.New().String(),
 		Core: storage.Core{
 			Type:      obsType,
 			Title:     title,
